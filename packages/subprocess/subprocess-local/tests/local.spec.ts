@@ -59,6 +59,20 @@ function spec(command: string, overrides: Partial<SubprocessSpawnSpec> = {}): Su
 }
 
 describe('LocalSubprocessRuntime', () => {
+  it('applies guarded-read denial before validation and start authorization', async () => {
+    const ctx = new Context()
+    const fiber = await ctx.plugin(LocalSubprocessRuntime, {
+      denyProcessExecution: true,
+      requireStartAuthorization: true,
+    })
+    try {
+      expect(() => ctx.subprocess.spawn({} as never)).toThrow(/subprocess-local: process execution is disabled by guarded-read policy/)
+      await expect(ctx.subprocess.spawnTerminal({} as never)).rejects.toThrow(/subprocess-local: process execution is disabled by guarded-read policy/)
+    } finally {
+      await fiber.dispose()
+    }
+  })
+
   it('denies a guarded spawn before reaching the process launcher', async () => {
     const ctx = new Context()
     const authorize = vi.fn(() => false)

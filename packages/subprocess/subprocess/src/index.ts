@@ -36,6 +36,8 @@ export interface SubprocessStartAuthorizer {
 
 /** Provider policy configuration. */
 export interface Config {
+  /** Deny all ordinary and terminal process launches in a guarded-read composition. */
+  denyProcessExecution?: boolean
   /** Require an active ToolRuntime execution and trusted host authorization for every process launch. */
   requireStartAuthorization?: boolean
 }
@@ -177,15 +179,27 @@ declare module '@deepseek-ai/cordis' {
  *   when the top-level process exits.
  */
 export abstract class SubprocessRuntime extends Service {
-  static Config: schema<Config> = schema.object({ requireStartAuthorization: schema.boolean().default(false) })
+  static Config: schema<Config> = schema.object({
+    denyProcessExecution: schema.boolean().default(false),
+    requireStartAuthorization: schema.boolean().default(false),
+  })
 
+  private readonly denyProcessExecution: boolean
   private readonly requireStartAuthorization: boolean
 
   constructor(ctx: Context, config: Config = {}) {
     super(ctx, 'subprocess')
+    this.denyProcessExecution = config.denyProcessExecution ?? false
     this.requireStartAuthorization = config.requireStartAuthorization ?? false
-    if (this.requireStartAuthorization && ctx.reflect.get('subprocessStartAuthorizer') === undefined) {
+    if (this.requireStartAuthorization && !this.denyProcessExecution && ctx.reflect.get('subprocessStartAuthorizer') === undefined) {
       throw new Error('subprocess: requireStartAuthorization needs a trusted subprocessStartAuthorizer service')
+    }
+  }
+
+  /** Reject starts before provider validation or any launch-related work when globally denied. */
+  protected assertProcessExecutionAllowed(provider: 'subprocess-local' | 'subprocess-ssh'): void {
+    if (this.denyProcessExecution) {
+      throw new Error(`${provider}: process execution is disabled by guarded-read policy`)
     }
   }
 

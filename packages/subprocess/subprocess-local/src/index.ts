@@ -196,6 +196,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   }
 
   spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
+    this.assertProcessExecutionAllowed('subprocess-local')
     validateSubprocessSpec(spec)
     this.authorizeStart({ kind: 'spawn', argv: spec.argv, cwd: spec.cwd })
     const env = targetEnvironment(spec)
@@ -290,6 +291,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   // Local PTY allocation is synchronous, but the provider contract permits remote asynchronous allocation.
   // oxlint-disable-next-line typescript/require-await -- Preserve promise rejection semantics at the async provider contract.
   async spawnTerminal(spec: SubprocessTerminalSpawnSpec): Promise<SubprocessTerminalHandle> {
+    this.assertProcessExecutionAllowed('subprocess-local')
     const file = spec.argv[0]
     if (file === undefined || file.length === 0) {
       throw new Error('subprocess-local: terminal argv must contain a program')

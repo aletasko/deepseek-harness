@@ -272,6 +272,7 @@ export class SshSubprocessRuntime extends SubprocessRuntime {
   }
 
   override spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
+    this.assertProcessExecutionAllowed('subprocess-ssh')
     this.lifetime.signal.throwIfAborted()
     spec.signal?.throwIfAborted()
     this.authorizeStart({ kind: 'spawn', argv: spec.argv, cwd: spec.cwd })
@@ -283,6 +284,7 @@ export class SshSubprocessRuntime extends SubprocessRuntime {
   }
 
   override async spawnTerminal(spec: SubprocessTerminalSpawnSpec): Promise<SubprocessTerminalHandle> {
+    this.assertProcessExecutionAllowed('subprocess-ssh')
     this.lifetime.signal.throwIfAborted()
     const signal = spec.signal === undefined ? this.lifetime.signal : AbortSignal.any([spec.signal, this.lifetime.signal])
     signal.throwIfAborted()
