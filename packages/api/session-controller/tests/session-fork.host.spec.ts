@@ -117,6 +117,32 @@ describe('sessions.fork', () => {
     }
   })
 
+  it('does not attest a fork when its source claim is revoked during Agent creation', async () => {
+    const ctx = await composed()
+    try {
+      const created = await remote(ctx).create({ cwd: '/tmp' })
+      if (!created.ok) throw created.error
+      const source = ctx.sessions.get(created.value.sessionId)!
+      source.append('turn/start', { turn: 1 })
+      source.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+      const createAgent = ctx.agents.create.bind(ctx.agents)
+      vi.spyOn(ctx.agents, 'create').mockImplementation(async options => {
+        const result = await createAgent(options)
+        ctx.sessions.provenance.revoke(source)
+        return result
+      })
+
+      const forked = await remote(ctx).fork({ sessionId: source.id })
+
+      if (!forked.ok) throw forked.error
+      expect(ctx.sessions.provenance.attest(ctx.sessions.get(forked.value.sessionId)!)).toMatchObject({
+        state: 'unknown', reason: 'not_attested',
+      })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('does not infer API provenance from fork lineage or ROOM provenance', async () => {
     const ctx = await composed()
     try {

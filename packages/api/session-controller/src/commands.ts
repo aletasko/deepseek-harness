@@ -266,9 +266,11 @@ export class SessionCommandController {
     const sourceProvenance = liveSource === undefined
       ? undefined
       : this.ctx.sessions.provenance.attest(liveSource)
-    const inheritsApiConversation = sourceProvenance?.state === 'nonroom_verified'
+    const apiSourceRevision = sourceProvenance?.state === 'nonroom_verified'
       && sourceProvenance.source === '@deepseek-ai/dsh-api-session-controller'
       && sourceProvenance.scope.kind === 'conversation'
+      ? sourceProvenance.revision
+      : undefined
     let workspace: Workspace | undefined
     try {
       workspace = await this.forkWorkspace(source.header)
@@ -298,7 +300,17 @@ export class SessionCommandController {
         agentOptions: { provider, model },
         setup: composition.setup,
       })
-      if (inheritsApiConversation) {
+      // Revalidate after all asynchronous creation work. No await may occur
+      // between this exact-object/revision check and issuing the child claim.
+      const currentSource = liveSource === undefined
+        ? undefined
+        : this.ctx.sessions.get(source.header.id) === liveSource
+          ? this.ctx.sessions.provenance.attest(liveSource, apiSourceRevision)
+          : undefined
+      if (apiSourceRevision !== undefined
+        && currentSource?.state === 'nonroom_verified'
+        && currentSource.source === '@deepseek-ai/dsh-api-session-controller'
+        && currentSource.scope.kind === 'conversation') {
         this.ctx.sessions.provenance.issue(agent.session, apiSessionControllerIssuer, {
           kind: 'nonroom', source: '@deepseek-ai/dsh-api-session-controller', sourceVersion: '1',
           scope: { kind: 'conversation' },
