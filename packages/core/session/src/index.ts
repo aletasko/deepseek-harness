@@ -21,6 +21,9 @@ import type { SessionSurface, SessionMessageProjection } from './surface.ts'
 import { foldRequestHeader } from './request-header.ts'
 import { ToolHistoryProjection } from './tool-history.ts'
 import type { ToolHistory } from '@deepseek-ai/dsh-llm'
+import { SessionProvenanceRegistry } from './provenance.ts'
+export { SessionProvenanceRegistry } from './provenance.ts'
+export type { SessionProvenance, SessionProvenanceClaim, UnknownSessionProvenance, VerifiedSessionProvenance } from './provenance.ts'
 
 import { buildForkSeed } from './fork.ts'
 
@@ -1050,6 +1053,8 @@ export class SessionStore extends Service {
   private store = new Map<SessionId, SessionEntry>()
   private counter = 0
   private readonly projections: SessionMessageProjection[] = []
+  /** Runtime-only authority bound to the exact live Session object. */
+  readonly provenance = new SessionProvenanceRegistry<Session>(session => this.get(session.id) === session)
 
   /** Borrowed definitions for detached replay; contributions live until their registering fibers unload. */
   get messageProjections(): readonly SessionMessageProjection[] {
