@@ -13,6 +13,7 @@ import ToolRuntime, {
   TOOL_ABORTED, TOOL_ABORTED_BEFORE_DISPATCH,
   type InferArgs, type ParameterSchemaSpec, type PreToolDecision, type PostToolDecision,
   type JsonSchemaNode, type ToolDefinition, type ToolDispatchExecution, type ToolExecutionResult, type ToolExecutionToken,
+  type ToolRunContext,
 } from '@deepseek-ai/dsh-tools'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 
@@ -160,6 +161,327 @@ describe('ToolRuntime', () => {
     const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c1'), name: 'echo', arguments: { text: 'hi' } })
     expect(result).toEqual({ content: [{ type: 'text', text: 'hi' }], isError: false, value: 'hi' })
     expect(observed).toEqual(result)
+  })
+
+  it('attests only the exact active direct body execution', async () => {
+    const ctx = await setup()
+    expect(ctx.tools.currentActiveExecution()).toBeUndefined()
+    const gates = new Map<string, {
+      release(): void
+      started: Promise<ToolRunContext>
+      markStarted(exec: ToolRunContext): void
+      waiting: Promise<void>
+    }>()
+    for (const id of ['one', 'two']) {
+      let release!: () => void
+      let markStarted!: (exec: ToolRunContext) => void
+      const started = new Promise<ToolRunContext>((resolve) => { markStarted = resolve })
+      const waiting = new Promise<void>((resolve) => { release = resolve })
+      // Keep each body pending independently so both attestations overlap.
+      gates.set(id, { release, started, markStarted, waiting })
+    }
+    ctx.tools.register(defineTool({
+      name: 'attested', description: 'test', parameters: { id: { type: 'string', required: true } },
+      output: { schema: { type: 'string' }, render: () => [] },
+      async execute(args, exec) {
+        const gate = gates.get(args.id)!
+        expect(ctx.tools.currentActiveExecution()).toBe(exec)
+        gate.markStarted(exec)
+        await gate.waiting
+        expect(ctx.tools.currentActiveExecution()).toBe(exec)
+        return args.id
+      },
+    }))
+    const call = (id: string) => ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId(`attested-${id}`), name: 'attested', arguments: { id } })
+    const firstResult = call('one')
+    const firstExec = await gates.get('one')!.started
+    const secondResult = call('two')
+    const secondExec = await gates.get('two')!.started
+    expect(ctx.tools.attestActiveExecution(firstExec)).toEqual({ toolName: 'attested', direct: true })
+    expect(ctx.tools.attestActiveExecution(secondExec)).toEqual({ toolName: 'attested', direct: true })
+    expect(ctx.tools.currentActiveExecution()).toBeUndefined()
+    expect(() => ctx.tools.attestActiveExecution({ ...firstExec })).toThrow(/not an active body execution/)
+    gates.get('one')!.release()
+    gates.get('two')!.release()
+    await Promise.all([firstResult, secondResult])
+    expect(ctx.tools.currentActiveExecution()).toBeUndefined()
+    expect(() => ctx.tools.attestActiveExecution(firstExec)).toThrow(/not an active body execution/)
+    expect(() => ctx.tools.attestActiveExecution(secondExec)).toThrow(/not an active body execution/)
+    await ctx.fiber.dispose()
+  })
+
+  it('does not expose settled ambient executions or child executions', async () => {
+    const ctx = await setup()
+    let markReplay!: (execution: ToolRunContext | undefined) => void
+    const replay = new Promise<ToolRunContext | undefined>((resolve) => { markReplay = resolve })
+    ctx.tools.register(defineTool({
+      name: 'ambient-lifetime', description: '', parameters: {}, output: { schema: { type: 'string' }, render: () => [] },
+      async execute(_args, exec) {
+        if (exec.parent !== undefined) {
+          expect(ctx.tools.currentActiveExecution()).toBeUndefined()
+          expect(() => ctx.tools.attestActiveExecution(exec)).toThrow(/no longer an active direct registration/)
+          return 'child'
+        }
+        expect(ctx.tools.currentActiveExecution()).toBe(exec)
+        expect(() => ctx.tools.attestActiveExecution({ ...exec })).toThrow(/not an active body execution/)
+        // The async callback inherits this ALS context, but runs after the body
+        // has settled and must no longer obtain a live execution.
+        setTimeout(() => { markReplay(ctx.tools.currentActiveExecution()) }, 0)
+        const child = await ctx.tools.execute({
+          signal: exec.signal, callId: ToolCallId('ambient-lifetime-child'), name: 'ambient-lifetime', arguments: {}, parent: exec.token,
+        })
+        expect(child.isError).toBe(false)
+        expect(ctx.tools.currentActiveExecution()).toBe(exec)
+        return 'root'
+      },
+    }))
+    const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('ambient-lifetime'), name: 'ambient-lifetime', arguments: {} })
+    expect(result.isError).toBe(false)
+    expect(await replay).toBeUndefined()
+    expect(ctx.tools.currentActiveExecution()).toBeUndefined()
+    await ctx.fiber.dispose()
+  })
+
+  it('rejects child and replaced executions', async () => {
+    const ctx = await setup()
+    let release!: () => void
+    let started!: (exec: ToolRunContext) => void
+    const active = new Promise<ToolRunContext>((resolve) => { started = resolve })
+    const wait = new Promise<void>((resolve) => { release = resolve })
+    const definition = defineTool({
+      name: 'guarded-attestation', description: '', parameters: {},
+      output: { schema: { type: 'string' }, render: () => [] },
+      async execute(_args, exec) {
+        if (exec.parent !== undefined) {
+          expect(() => ctx.tools.attestActiveExecution(exec)).toThrow(/no longer an active direct registration/)
+          return 'child'
+        }
+        started(exec)
+        await wait
+        return 'ok'
+      },
+    })
+    const dispose = ctx.tools.register(definition)
+    const result = ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('attestation-root'), name: 'guarded-attestation', arguments: {} })
+    const root = await active
+    expect(ctx.tools.attestActiveExecution(root)).toEqual({ toolName: 'guarded-attestation', direct: true })
+    const child = ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('attestation-child'), name: 'guarded-attestation', arguments: {}, parent: root.token })
+    await child
+    expect(ctx.tools.attestActiveExecution(root)).toEqual({ toolName: 'guarded-attestation', direct: true })
+    dispose()
+    const replacement = ctx.tools.register({ ...definition, async execute() { return 'replacement' } })
+    expect(() => ctx.tools.attestActiveExecution(root)).toThrow(/no longer an active direct registration/)
+    replacement()
+    release()
+    await result
+    await ctx.fiber.dispose()
+  })
+
+  it('rejects an active execution after its signal is aborted', async () => {
+    const ctx = await setup()
+    let release!: () => void
+    let started!: (exec: ToolRunContext) => void
+    const active = new Promise<ToolRunContext>((resolve) => { started = resolve })
+    const wait = new Promise<void>((resolve) => { release = resolve })
+    ctx.tools.register(defineTool({
+      name: 'abort-attestation', description: '', parameters: {}, output: { schema: { type: 'string' }, render: () => [] },
+      async execute(_args, exec) { started(exec); await wait; return 'ok' },
+    }))
+    const abort = new AbortController()
+    const result = ctx.tools.execute({ signal: abort.signal, callId: ToolCallId('attestation-abort'), name: 'abort-attestation', arguments: {} })
+    const exec = await active
+    expect(ctx.tools.attestActiveExecution(exec)).toEqual({ toolName: 'abort-attestation', direct: true })
+    abort.abort()
+    expect(() => ctx.tools.attestActiveExecution(exec)).toThrow(/no longer an active direct registration/)
+    release()
+    await result
+    await ctx.fiber.dispose()
+  })
+
+  it('attests the live agent session and rejects a forged agent handle', async () => {
+    const ctx = await setup()
+    await ctx.plugin(AgentRegistry)
+    let attested: ReturnType<typeof ctx.tools.attestActiveExecution> | undefined
+    ctx.tools.register(defineTool({
+      name: 'agent-attestation', description: '', parameters: {}, output: { schema: { type: 'string' }, render: () => [] },
+      async execute(_args, exec) { attested = ctx.tools.attestActiveExecution(exec); return 'ok' },
+    }))
+    const id = SessionId('attested-session')
+    const agent = { id, session: Session.create(id), ctx: new Context() } as unknown as Agent
+    const disposeAgent = ctx.agents.enter(agent, undefined)
+    try {
+      const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('agent-attestation'), name: 'agent-attestation', arguments: {}, agent })
+      expect(result.isError, JSON.stringify(result.content)).toBe(false)
+      expect(result.value).toBe('ok')
+      expect(attested).toEqual({ toolName: 'agent-attestation', sessionId: 'attested-session', direct: true })
+      const forged = await ctx.tools.execute({
+        signal: testToolSignal, callId: ToolCallId('forged-agent-attestation'), name: 'agent-attestation', arguments: {},
+        agent: { id: SessionId('forged-session') },
+      })
+      expect(forged.isError).toBe(true)
+      expect(JSON.stringify(forged.content)).toContain('no longer an active direct registration')
+    } finally {
+      disposeAgent()
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('denies dispatch when the global definition is replaced during pre-execute', async () => {
+    const ctx = await setup()
+    let originalCalls = 0
+    let replacementCalls = 0
+    const original = { ...echoTool, name: 'bound-global', async execute() { originalCalls++; return 'original' } }
+    const replacement = { ...echoTool, name: 'bound-global', async execute() { replacementCalls++; return 'replacement' } }
+    const disposeOriginal = ctx.tools.register(original)
+    let replaced = false
+    ctx.on('tools/pre-execute', async (_exec, next) => {
+      if (!replaced) {
+        replaced = true
+        disposeOriginal()
+        ctx.tools.register(replacement)
+      }
+      return next()
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('bound-global'),
+        name: 'bound-global',
+        arguments: {},
+      })
+      expect(result.isError).toBe(true)
+      expect(result.content).toEqual([{ type: 'text', text: 'Error: unknown tool "bound-global"' }])
+      expect({ originalCalls, replacementCalls }).toEqual({ originalCalls: 0, replacementCalls: 0 })
+    } finally { await ctx.fiber.dispose() }
+  })
+
+  it('keeps the registered execution and schemas detached from producer mutation', async () => {
+    const ctx = await setup()
+    let originalCalls = 0
+    const definition = {
+      ...echoTool,
+      name: 'detached-definition',
+      description: 'original description',
+      parameters: { text: { type: 'string' } },
+      output: { ...echoTool.output, schema: { type: 'string' as const } },
+      async execute() { originalCalls++; return 'original' },
+    }
+    const originalExecute = definition.execute
+    const originalRender = definition.output.render
+    ctx.tools.register(definition)
+    ctx.on('tools/pre-execute', async (_exec, next) => {
+      definition.description = 'mutated description'
+      definition.parameters.text.type = 'number'
+      Reflect.set(definition.output.schema, 'type', 'number')
+      definition.execute = async () => 'replacement'
+      return next()
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('detached-definition'),
+        name: 'detached-definition',
+        arguments: { text: 'ok' },
+      })
+      expect(result.isError).toBe(false)
+      expect(result.value).toBe('original')
+      expect(originalCalls).toBe(1)
+      expect(Object.isFrozen(originalExecute)).toBe(false)
+      expect(Object.isFrozen(originalRender)).toBe(false)
+      expect(ctx.tools.schemas().find(schema => schema.name === 'detached-definition')).toMatchObject({
+        description: 'original description',
+        parameters: { text: { type: 'string' } },
+      })
+    } finally { await ctx.fiber.dispose() }
+  })
+
+  it('binds callbacks to the frozen registered definition snapshot', async () => {
+    const ctx = await setup()
+    const definition: ToolDefinition = {
+      name: 'snapshot-receiver',
+      description: 'reads the registered snapshot through this',
+      parameters: { text: { type: 'string' } },
+      output: {
+        schema: { type: 'object', additionalProperties: true },
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+      },
+      execute() {
+        return { parameters: this.parameters, outputSchema: this.output.schema }
+      },
+    }
+    ctx.tools.register(definition)
+    ctx.on('tools/pre-execute', async (_exec, next) => {
+      Reflect.set(definition.parameters.text, 'type', 'number')
+      Reflect.set(definition.output.schema, 'additionalProperties', false)
+      return next()
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('snapshot-receiver'),
+        name: 'snapshot-receiver',
+        arguments: { text: 'ok' },
+      })
+      expect(result.isError).toBe(false)
+      expect(result.value).toEqual({
+        parameters: { text: { type: 'string' } },
+        outputSchema: { type: 'object', additionalProperties: true },
+      })
+      expect(Object.isFrozen(definition.execute)).toBe(false)
+      expect(Object.isFrozen(definition.output.render)).toBe(false)
+    } finally { await ctx.fiber.dispose() }
+  })
+
+  it('keeps execution identity fixed while around hooks can replace only the signal', async () => {
+    const ctx = await setup()
+    let guardName: string | undefined
+    let bodyName: string | undefined
+    let bodyText: string | undefined
+    let mutationResults: boolean[] = []
+    ctx.tools.register(defineTool({
+      name: 'bound-identity',
+      description: 'bound identity',
+      parameters: { text: { type: 'string' } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      async execute(args, exec) {
+        bodyName = exec.name
+        bodyText = args.text
+        return args.text
+      },
+    }))
+    ctx.tools.guard(exec => {
+      guardName = exec.name
+      return undefined
+    })
+    ctx.on('tools/execute', async (exec, next) => {
+      mutationResults = [
+        Reflect.set(exec, 'name', 'benign'),
+        Reflect.set(exec, 'arguments', { text: 'swapped' }),
+        Reflect.set(exec, 'agent', {}),
+        Reflect.set(exec, 'parent', Symbol('injected-parent')),
+        Reflect.set(exec, 'schema', {}),
+      ]
+      return next()
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('bound-identity'),
+        name: 'bound-identity',
+        arguments: { text: 'original' },
+      })
+      expect(result.isError).toBe(false)
+      expect({ guardName, bodyName, bodyText, mutationResults }).toEqual({
+        guardName: 'bound-identity',
+        bodyName: 'bound-identity',
+        bodyText: 'original',
+        mutationResults: [false, false, false, false, false],
+      })
+    } finally { await ctx.fiber.dispose() }
   })
 
   it('projects presentation metadata from the canonical value', async () => {

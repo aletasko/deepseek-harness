@@ -11,13 +11,14 @@ import { watch } from 'chokidar'
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import z from '@deepseek-ai/schemastery'
-import { FileSystem, FsError, FsVersion } from '@deepseek-ai/dsh-fs'
+import { FileSystem, FsError, FsReadAuthorizer, FsVersion } from '@deepseek-ai/dsh-fs'
 import type {
   FsDirEntry,
   FsEditOutcome,
   FsEditRequest,
   FsInfo,
   FsPathInfo,
+  FsReadAccessContext,
   FsTarget,
   FsWriteIntent,
   FsWriteOutcome,
@@ -50,9 +51,17 @@ export interface Config {
    * runtime's safe allocation/decode maximum. Defaults to 10 MiB.
    */
   diffBasisMaxBytes?: number
+  /** Require a trusted per-call authorizer for every content read. Defaults to false. */
+  requireReadAuthorization?: boolean
 }
 
 type ResolvedConfig = Required<Config>
+/** Minimal optional runtime surface used to bind guarded reads to an exact active tool call. */
+interface ActiveToolRuntime {
+  currentActiveExecution(): object | undefined
+  attestActiveExecution(exec: unknown): unknown
+}
+
 const DEFAULT_DIFF_BASIS_MAX_BYTES = 10 * 1024 * 1024
 const MAX_DIFF_BASIS_BYTES = Math.min(
   bufferConstants.MAX_LENGTH,
@@ -92,10 +101,12 @@ export class LocalFileSystem extends FileSystem {
   static Config: z<Config> = z.object({
     cwd: z.string().default(process.cwd()),
     diffBasisMaxBytes: z.number().default(DEFAULT_DIFF_BASIS_MAX_BYTES),
+    requireReadAuthorization: z.boolean().default(false),
   })
 
   /** Validated config (schemastery applied the defaults before construction). */
   readonly config: ResolvedConfig
+  private readonly readAuthorizer: FsReadAuthorizer | undefined
   /** Test hook forwarded to fsio for atomic-publication boundaries. */
   internals: FsIoInternals = {}
   /** Per-targetKey tail promise: serializes mutating ops so the read→guard→write
@@ -111,6 +122,13 @@ export class LocalFileSystem extends FileSystem {
       || resolved.diffBasisMaxBytes > MAX_DIFF_BASIS_BYTES) {
       throw new Error(`fs-local: diffBasisMaxBytes must be a positive safe integer no greater than ${MAX_DIFF_BASIS_BYTES}`)
     }
+    const readAuthorizer = resolved.requireReadAuthorization
+      ? ctx.get('fsReadAuthorizer')
+      : undefined
+    if (resolved.requireReadAuthorization && readAuthorizer === undefined) {
+      throw new Error('fs-local: requireReadAuthorization needs a mounted fsReadAuthorizer service')
+    }
+    this.readAuthorizer = readAuthorizer
     this.config = resolved
   }
 
@@ -172,20 +190,71 @@ export class LocalFileSystem extends FileSystem {
     return { version: info.version, type: info.type, size: info.size }
   }
 
-  override async readText(target: FsTarget, signal?: AbortSignal): Promise<string> {
-    return readWholeText({ displayPath: target.displayPath, targetKey: target.targetKey }, signal)
+  override async readText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<string> {
+    const authorize = this.readAuthorizerFor(access)
+    return readWholeText({ displayPath: target.displayPath, targetKey: target.targetKey }, signal, authorize, this.internals)
   }
 
-  override streamText(target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>> {
-    return Promise.resolve(streamWholeText({ displayPath: target.displayPath, targetKey: target.targetKey }, signal))
+  override async streamText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<AsyncIterable<string>> {
+    if (this.config.requireReadAuthorization) {
+      throw new FsError('filesystem read denied: streaming is unavailable in guarded mode', 'FS_PERMISSION_DENIED')
+    }
+    const authorize = this.readAuthorizerFor(access)
+    return streamWholeText({ displayPath: target.displayPath, targetKey: target.targetKey }, signal, authorize, this.internals)
   }
 
-  override async readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array> {
-    return readWholeBytes({ displayPath: target.displayPath, targetKey: target.targetKey }, signal, maxBytes, this.internals)
+  override async readBytes(
+    target: FsTarget,
+    signal: AbortSignal | undefined,
+    maxBytes: number,
+    access?: FsReadAccessContext,
+  ): Promise<Uint8Array> {
+    const authorize = this.readAuthorizerFor(access)
+    return readWholeBytes({ displayPath: target.displayPath, targetKey: target.targetKey }, signal, maxBytes, this.internals, authorize)
   }
 
   override async readByteRange(target: FsTarget, range: { offset: number; length: number }, signal?: AbortSignal): Promise<Uint8Array> {
+    if (this.config.requireReadAuthorization) {
+      throw new FsError('filesystem read denied: byte-range reads are unavailable in guarded mode', 'FS_PERMISSION_DENIED')
+    }
     return readByteWindow({ displayPath: target.displayPath, targetKey: target.targetKey }, range, signal)
+  }
+
+  private readAuthorizerFor(
+    access: FsReadAccessContext | undefined,
+  ): (<T>(opened: FsTarget, startRead: () => Promise<T>) => Promise<T>) | undefined {
+    if (!this.config.requireReadAuthorization) return undefined
+    if (access === undefined) {
+      throw new FsError('filesystem read denied: per-call authorization is required', 'FS_PERMISSION_DENIED')
+    }
+    const authorizer = this.readAuthorizer
+    if (authorizer === undefined) {
+      throw new FsError('filesystem read denied: no read authorizer is mounted', 'FS_PERMISSION_DENIED')
+    }
+    // The provider is process-global, so a mounted authorizer cannot infer the
+    // caller from its Cordis context. Bind each guarded read to the exact live
+    // direct tool execution in this async call chain before delegating policy.
+    // This rejects missing, copied, stale, nested, and cross-session actors.
+    const runtime = (this.ctx as Context & { tools?: ActiveToolRuntime }).tools
+    let active: object | undefined
+    try {
+      if (runtime === undefined) throw new Error('tool runtime is not mounted')
+      active = runtime.currentActiveExecution()
+      if (active === undefined || active !== access.actor) {
+        throw new Error('actor is not the active tool execution')
+      }
+      runtime.attestActiveExecution(access.actor)
+    } catch (error: unknown) {
+      throw new FsError('filesystem access denied: active tool execution is required', 'FS_PERMISSION_DENIED', { cause: error })
+    }
+    return async <T>(opened: FsTarget, startRead: () => Promise<T>): Promise<T> => {
+      try {
+        return await authorizer.authorizeAndStart(opened, access, startRead)
+      } catch (error: unknown) {
+        if (error instanceof FsError) throw error
+        throw new FsError('filesystem access denied by provider read authorizer', 'FS_PERMISSION_DENIED', { cause: error })
+      }
+    }
   }
 
   override async listDir(target: FsTarget, signal?: AbortSignal): Promise<FsDirEntry[]> {

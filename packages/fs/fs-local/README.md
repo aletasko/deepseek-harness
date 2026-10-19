@@ -45,12 +45,15 @@ Load the backend with a base directory; relative paths resolve against it, and a
 |---|---|---|
 | `cwd` | `process.cwd()` | Base directory for relative paths |
 | `diffBasisMaxBytes` | `10 MiB` | UTF-8 byte limit per overwrite-diff side; larger overwrites return `before: null` |
+| `requireReadAuthorization` | `false` | Require a mounted provider-owned `fsReadAuthorizer` and per-call access context for text, stream, and raw-byte reads |
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-fs-local) is the exhaustive source for every accepted field and its JSDoc.
 
 ### What you can do
 
-Read any regular UTF-8 text file whole or as a stream, read raw bytes up to a cap you choose or in a byte window, and list one directory level in stable name order. Create or replace a file atomically, and apply a literal text edit atomically; both mutations serialize per file, so concurrent writers never interleave. The version guard is optional: omit it for unconditional create-or-overwrite, or supply it to fail when the file changed since you last observed it.
+Read any regular UTF-8 text file whole or as a stream, read raw bytes up to a cap you choose or in a byte window, and list one directory level in stable name order. Set `requireReadAuthorization: true` to require a mounted trusted `FsReadAuthorizer` service and per-call access context for `readText`, `streamText`, and `readBytes`. The provider opens the file once, identifies the object through that handle, and asks the provider-owned service before returning or yielding bytes. On Linux this binds the check to the opened object, including when a path is swapped to a symlink after `resolve()`. Guarded reads fail closed on other platforms because Node does not expose a portable path for an open file handle. Byte-window reads fail closed in guarded mode until they use the same opened-handle gate. With the default `false` setting, reads retain their existing unrestricted behavior.
+
+Create or replace a file atomically, and apply a literal text edit atomically; both mutations serialize per file, so concurrent writers never interleave. The version guard is optional: omit it for unconditional create-or-overwrite, or supply it to fail when the file changed since you last observed it.
 
 Read, listing, and mutation failures are typed `FsError`s with stable codes — `FS_NOT_FOUND`, `FS_NOT_TEXT` (binary content), `FS_STALE_VERSION` (changed since observation), `FS_EDIT_NOT_FOUND` or `FS_AMBIGUOUS_EDIT` (no unique literal match), and others — so callers branch on the code, never on message text. A missing target on an edit reports `FS_STALE_VERSION` whether or not the version guard is supplied.
 
@@ -135,6 +138,7 @@ These limits define when the local backend is a poor fit or needs special operat
 - **A sub-limit overwrite still buffers a contextual basis** — `writeText` may retain up to just below `config.diffBasisMaxBytes` of prior text in addition to the caller-owned replacement; the bound does not cap the returned `after` value or the whole-file presentation fallback.
 - **Binary detection is asymmetric** — reads NUL-sample only the first 8192 bytes while edits scan the whole buffer, so a file with a late NUL reads fine but rejects edits.
 - **The per-target mutation lock is in-process only** — guarded creation still uses an atomic no-replace publication across processes, but replacement writers in another process are caught only when the optional version guard observes their metadata change; they are never serialized.
+- **Opened-target read authorization is opt-in and Linux-only** — guarded mode requires the provider-owned authorizer and a per-call actor context; callers cannot supply the authorization callback. The byte-window method is denied in guarded mode. Listing remains metadata-only. `writeText` and `editText` are outside this slice.
 - **Guarded creation requires hard-link support** — filesystems or mounts that reject hard-link publication cannot serve `createIfAbsent`; the backend preserves the missing target and reports `FS_IO_ERROR`.
 - **Post-commit cleanup is best effort** — a successful publication remains successful if removal of its owner-only staging directory fails, leaving private residue for later operator cleanup.
 

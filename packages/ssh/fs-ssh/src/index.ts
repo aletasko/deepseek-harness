@@ -1,8 +1,10 @@
 /** Filesystem provider preserving remote identities and helper-owned atomic mutations. */
+import type { Context } from '@deepseek-ai/cordis'
 import { posix } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import schema from '@deepseek-ai/schemastery'
 import { FileSystem, FsError } from '@deepseek-ai/dsh-fs'
-import type { FsDirEntry, FsEditOutcome, FsEditRequest, FsErrorCode, FsInfo, FsPathInfo, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
+import type { FsDirEntry, FsEditOutcome, FsEditRequest, FsErrorCode, FsInfo, FsPathInfo, FsReadAccessContext, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-ssh'
@@ -16,9 +18,23 @@ const errorCodes: Record<FsErrorCode, true> = {
   FS_STALE_VERSION: true, FS_NOT_OBSERVED: true, FS_AMBIGUOUS_EDIT: true, FS_EDIT_NOT_FOUND: true, FS_ABORTED: true,
 }
 
+export interface Config {
+  /** Deny all remote content reads until the helper can attest its opened target. */
+  requireReadAuthorization?: boolean
+}
+type ResolvedConfig = Required<Config>
+
 /** Remote filesystem paired with the SSH subprocess and sandbox providers. */
 export class SshFileSystem extends FileSystem {
   static inject = ['ssh', 'sandboxPolicy']
+  static Config: schema<Config> = schema.object({ requireReadAuthorization: schema.boolean().default(false) })
+
+  private readonly config: ResolvedConfig
+
+  constructor(ctx: Context, config: Config = {}) {
+    super(ctx)
+    this.config = { requireReadAuthorization: config.requireReadAuthorization ?? false }
+  }
 
   override get sandboxMode(): SandboxMode { return this.ctx.sandboxPolicy.defaultMode }
 
@@ -45,11 +61,13 @@ export class SshFileSystem extends FileSystem {
     return await this.call('fs.lstat', { path, cwd: opts?.cwd }, pathInfoSchema.nullable(), signal) as FsPathInfo | null ?? undefined
   }
 
-  override readText(target: FsTarget, signal?: AbortSignal): Promise<string> {
+  override readText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<string> {
+    if (this.config.requireReadAuthorization || access !== undefined) return Promise.reject(this.unsupportedOpenedTargetAuthorization())
     return this.call('fs.readText', { target }, z.string(), signal)
   }
 
-  override async streamText(target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>> {
+  override async streamText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<AsyncIterable<string>> {
+    if (this.config.requireReadAuthorization || access !== undefined) throw this.unsupportedOpenedTargetAuthorization()
     const id = await this.call('fs.stream', { target }, textStreamIdSchema, signal)
     const call = this.call.bind(this)
     return (async function* () {
@@ -67,11 +85,18 @@ export class SshFileSystem extends FileSystem {
     })()
   }
 
-  override async readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array> {
+  override async readBytes(
+    target: FsTarget,
+    signal: AbortSignal | undefined,
+    maxBytes: number,
+    access?: FsReadAccessContext,
+  ): Promise<Uint8Array> {
+    if (this.config.requireReadAuthorization || access !== undefined) throw this.unsupportedOpenedTargetAuthorization()
     return Buffer.from(await this.call('fs.readBytes', { target, maxBytes }, z.base64(), signal), 'base64')
   }
 
   override async readByteRange(target: FsTarget, range: { offset: number; length: number }, signal?: AbortSignal): Promise<Uint8Array> {
+    if (this.config.requireReadAuthorization) throw this.unsupportedOpenedTargetAuthorization()
     return Buffer.from(await this.call('fs.readRange', { target, ...range }, z.base64(), signal), 'base64')
   }
 
@@ -101,6 +126,10 @@ export class SshFileSystem extends FileSystem {
       }
       throw new FsError(error instanceof Error ? error.message : String(error), signal?.aborted ? 'FS_ABORTED' : 'FS_IO_ERROR', { cause: error })
     }
+  }
+
+  private unsupportedOpenedTargetAuthorization(): FsError {
+    return new FsError('SSH filesystem cannot authorize the object opened by the remote provider', 'FS_PERMISSION_DENIED')
   }
 }
 

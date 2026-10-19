@@ -17,6 +17,7 @@ import { assertNever, deepFreeze, snapshotJsonValue, type JsonValue } from '@dee
 import type { PromptSection, ToolProviderResult } from '@deepseek-ai/dsh-system-prompt'
 import type { PtcRuntime } from '@deepseek-ai/dsh-ptc-runtime'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
+import { AsyncLocalStorage } from 'node:async_hooks'
 // Type-only: makes `ctx.get('approval')` resolve to the ApprovalService
 // augmentation. The seam stays optional at runtime — see `serviceAsk`.
 import type {} from '@deepseek-ai/dsh-user-approval'
@@ -396,6 +397,19 @@ export interface ToolExecution extends ToolExecutionInput {
   readonly rootCallId: ToolCallId
   /** Registry-assigned identity shared with nested calls only as their opaque `parent` token. */
   readonly token: ToolExecutionToken
+}
+
+/**
+ * Immutable identity of a direct tool execution while its registered body is
+ * active. Obtain this at the resource access point with
+ * {@link ToolRuntime.attestActiveExecution}; the returned value is descriptive
+ * and does not keep the execution active.
+ */
+export interface ActiveToolExecutionAttestation {
+  readonly toolName: string
+  /** Agent session id, when the call runs for an agent. */
+  readonly sessionId?: string
+  readonly direct: true
 }
 
 /**
@@ -827,6 +841,12 @@ export class ToolRuntime extends Service {
   private concludingExecutions = new WeakSet<ToolExecution>()
   /** Original caller cancellation, kept outside the wrapper-mutable execution object. */
   private cancellationStates = new WeakMap<ToolRunContext, ToolCancellationState>()
+  /** Definition selected before policy runs, keyed by the registry-minted execution. */
+  private executionDefinitions = new WeakMap<ToolRunContext, ToolDefinition | undefined>()
+  /** Exact execution objects whose registered tool bodies have not settled. */
+  private activeBodyExecutions = new WeakSet<ToolRunContext>()
+  /** Ambient execution identity is owned by Core and exists only inside the body callback. */
+  private readonly activeExecution = new AsyncLocalStorage<ToolRunContext>()
   /** Definition-owned final content transform snapshotted before policy begins. */
   private contentFinalizers = new WeakMap<ToolRunContext, ToolDefinition['finalizeContent']>()
   /** Execution-prepared content installed before post-execute policy. */
@@ -1077,6 +1097,12 @@ export class ToolRuntime extends Service {
       throw new TypeError(`tool "${name}" must declare output { schema, render, presentationMeta? }`)
     }
     assertSupportedJsonSchema(output.schema)
+    const parameters = snapshotJsonValue(definition.parameters)
+      ?? cloneRegistrationValue(definition.parameters)
+    const outputSchema = snapshotJsonValue(output.schema)
+    if (outputSchema === undefined) {
+      throw new TypeError(`tool "${name}" output schema must be lossless JSON at registration`)
+    }
     const timeoutMs = definition.timeoutMs
     if (timeoutMs !== undefined
       && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
@@ -1088,9 +1114,39 @@ export class ToolRuntime extends Service {
     if (name === RUN_CODE_NAME) {
       throw new Error(`tool name "${RUN_CODE_NAME}" is reserved for the PTC mode presentation transport and cannot be registered or shadowed`)
     }
+    // Keep registry identity independent from producer-owned mutable fields.
+    const registered = {
+      name,
+      description: definition.description,
+      parameters,
+      ...(definition.deferLoading === true ? { deferLoading: true as const } : {}),
+      output: {
+        schema: outputSchema as JsonSchemaNode,
+        render: output.render,
+        ...(output.presentationMeta !== undefined ? { presentationMeta: output.presentationMeta } : {}),
+      },
+      execute: definition.execute,
+      ...(definition.projectContent !== undefined ? { projectContent: definition.projectContent } : {}),
+      ...(definition.finalizeContent !== undefined ? { finalizeContent: definition.finalizeContent } : {}),
+      ...(definition.timeoutMs !== undefined ? { timeoutMs: definition.timeoutMs } : {}),
+      ...(definition.isConcurrencySafe !== undefined ? { isConcurrencySafe: definition.isConcurrencySafe } : {}),
+      ...(definition.presentCall !== undefined ? { presentCall: definition.presentCall } : {}),
+      ...(definition.presentResult !== undefined ? { presentResult: definition.presentResult } : {}),
+    } satisfies ToolDefinition
+    registered.execute = registered.execute.bind(registered)
+    registered.output.render = registered.output.render.bind(registered.output)
+    if (registered.output.presentationMeta !== undefined) {
+      registered.output.presentationMeta = registered.output.presentationMeta.bind(registered.output)
+    }
+    if (registered.projectContent !== undefined) registered.projectContent = registered.projectContent.bind(registered)
+    if (registered.finalizeContent !== undefined) registered.finalizeContent = registered.finalizeContent.bind(registered)
+    if (registered.isConcurrencySafe !== undefined) registered.isConcurrencySafe = registered.isConcurrencySafe.bind(registered)
+    if (registered.presentCall !== undefined) registered.presentCall = registered.presentCall.bind(registered)
+    if (registered.presentResult !== undefined) registered.presentResult = registered.presentResult.bind(registered)
+    deepFreeze(registered)
     return this.layers.effect(
       this.ctx,
-      layer => layer.tools.insert(name, definition),
+      layer => layer.tools.insert(name, registered),
       { label: 'tools.register()' },
     )
   }
@@ -1378,6 +1434,53 @@ export class ToolRuntime extends Service {
     return this.prepareExecution(exec, prepared => this.completeScheduledExecution(prepared))
   }
 
+  /**
+   * Attest that `exec` is this runtime's exact, currently active, direct tool
+   * body execution. Call this at the protected resource access point. Cloned
+   * objects, nested dispatches, replaced registrations, aborted executions,
+   * and executions that have settled are rejected.
+   *
+   * The immutable return value describes the identity checked at this instant;
+   * it is not a reusable capability and does not extend the body's lifetime.
+   */
+  attestActiveExecution(exec: unknown): ActiveToolExecutionAttestation {
+    if (exec === null || typeof exec !== 'object' || !this.activeBodyExecutions.has(exec as ToolRunContext)) {
+      throw new Error('tool execution is not an active body execution')
+    }
+    const execution = exec as ToolRunContext
+    const definition = this.executionDefinitions.get(execution)
+    const current = this.resolveExecution(execution.name, execution.agent, false)
+    const agentIsLive = execution.agent === undefined || this.ctx.agents?.get(execution.agent.id) === execution.agent
+    if (
+      definition === undefined || current !== definition || execution.parent !== undefined || execution.signal.aborted ||
+      definition.name !== execution.name || !agentIsLive
+    ) {
+      throw new Error('tool execution is no longer an active direct registration')
+    }
+    const sessionId = execution.agent?.id
+    return Object.freeze({
+      toolName: definition.name,
+      ...(sessionId !== undefined ? { sessionId } : {}),
+      direct: true as const,
+    })
+  }
+
+  /**
+   * Return the exact direct tool execution in the current async tool-body
+   * context. The result is descriptive identity only: callers must pass it to
+   * {@link attestActiveExecution} at the protected resource access point.
+   */
+  currentActiveExecution(): ToolExecution | undefined {
+    const execution = this.activeExecution.getStore()
+    if (execution === undefined) return undefined
+    try {
+      this.attestActiveExecution(execution)
+      return execution
+    } catch {
+      return undefined
+    }
+  }
+
   private async completeScheduledExecution(prepared: ScheduledToolPreparation): Promise<ToolExecutionResult> {
     switch (prepared.kind) {
       case 'dispatch': {
@@ -1451,6 +1554,8 @@ export class ToolRuntime extends Service {
         throw new TypeError('tool execution arguments must be losslessly JSON-serializable')
       }
       const execution: MutableToolRunContext = { ...base, arguments: deepFreeze(detached) }
+      lockExecutionIdentity(execution)
+      this.executionDefinitions.set(execution, collapsed ? undefined : visible)
       this.deferredContexts.set(execution, deferredContexts)
       this.contentFinalizers.set(execution, finalizerFor())
       if (!collapsed) this.contentProjectors.set(execution, capturedProjector)
@@ -1483,6 +1588,8 @@ export class ToolRuntime extends Service {
       return { kind: 'ready', exec: execution }
     } catch (error: unknown) {
       const execution: MutableToolRunContext = { ...base, arguments: undefined }
+      lockExecutionIdentity(execution)
+      this.executionDefinitions.set(execution, collapsed ? undefined : visible)
       this.contentFinalizers.set(execution, finalizerFor())
       return { kind: 'final-result', exec: execution, result: toolErrorResult(error) }
     }
@@ -1583,11 +1690,18 @@ export class ToolRuntime extends Service {
     }
     exec.signal = signal
     try {
-      const tool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
-      if (!tool) throw new ToolNotFoundError(exec.name)
+      const boundTool = this.executionDefinitions.get(exec)
+      const currentTool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
+      if (boundTool === undefined || currentTool !== boundTool) throw new ToolNotFoundError(exec.name)
       state.bodyInvoked = true
-      const returned = await tool.execute(exec.arguments, exec)
-      const result = this.createSuccessResult(exec, tool, returned)
+      this.activeBodyExecutions.add(exec)
+      let returned: unknown
+      try {
+        returned = await this.activeExecution.run(exec, () => boundTool.execute(exec.arguments, exec))
+      } finally {
+        this.activeBodyExecutions.delete(exec)
+      }
+      const result = this.createSuccessResult(exec, boundTool, returned)
       return isAborted(signal)
         ? toolAbortedResult(result)
         : result
@@ -1912,6 +2026,38 @@ export class ToolRuntime extends Service {
 /** Mint a same-process correlation token whose identity is its value. */
 function createExecutionToken(): ToolExecutionToken {
   return Symbol('dsh.tool.execution') as ToolExecutionToken
+}
+
+/** Detach a raw schema graph while preserving malformed values for later validation. */
+function cloneRegistrationValue<T>(value: T, seen = new Map<object, object>()): T {
+  if (value === null || typeof value !== 'object') return value
+  const prior = seen.get(value)
+  if (prior !== undefined) return prior as T
+  const clone: object = Array.isArray(value)
+    ? []
+    : Object.create(Object.getPrototypeOf(value)) as object
+  seen.set(value, clone)
+  for (const key of Reflect.ownKeys(value)) {
+    if (Array.isArray(value) && key === 'length') continue
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (descriptor === undefined) continue
+    Object.defineProperty(clone, key, {
+      configurable: true,
+      enumerable: descriptor.enumerable === true,
+      writable: true,
+      value: cloneRegistrationValue(Reflect.get(value, key), seen),
+    })
+  }
+  return clone as T
+}
+
+/** Keep registry identity fixed while leaving the documented wrapper signal writable. */
+function lockExecutionIdentity(exec: MutableToolRunContext): void {
+  for (const field of ['callId', 'rootCallId', 'name', 'schema', 'arguments', 'agent', 'parent', 'token'] as const) {
+    if (Object.hasOwn(exec, field)) Object.defineProperty(exec, field, { configurable: false, writable: false })
+  }
+  Object.defineProperty(exec, 'signal', { configurable: false, writable: true })
+  Object.preventExtensions(exec)
 }
 
 function toolErrorResult(error: unknown): ToolExecutionResult {

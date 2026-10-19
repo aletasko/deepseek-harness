@@ -18,6 +18,7 @@ import type {
   FsInfo,
   FsPathInfo,
   FsObservation,
+  FsReadAccessContext,
   FsTarget,
   FsVersion,
   FsWriteIntent,
@@ -36,6 +37,7 @@ export type {
   FsErrorCode,
   FsInfo,
   FsObservation,
+  FsReadAccessContext,
   FsPathInfo,
   FsTarget,
   FsWriteIntent,
@@ -45,6 +47,7 @@ export type {
 declare module '@deepseek-ai/cordis' {
   interface Context {
     fs: FileSystem
+    fsReadAuthorizer: FsReadAuthorizer
   }
 
   interface Events {
@@ -75,6 +78,38 @@ declare module '@deepseek-ai/cordis' {
      * @mode emit
      */
     'fs/observed'(target: FsTarget, observation: FsObservation, actor: object | undefined): void
+  }
+}
+
+/** Trusted provider-side policy for reads that require per-call authorization. */
+export abstract class FsReadAuthorizer extends Service {
+  constructor(ctx: Context) {
+    super(ctx, 'fsReadAuthorizer')
+  }
+
+  /**
+   * Legacy preflight retained for source compatibility. Guarded providers do
+   * not treat this check as permission to read; implement
+   * {@link authorizeAndStart} to authorize and start protected I/O atomically.
+   */
+  abstract authorizeOpenedTarget(requested: FsTarget, opened: FsTarget, access: FsReadAccessContext): void | Promise<void>
+
+  /**
+   * Authorize a provider-opened target and start its read while authorization
+   * locks are held. The provider callback must synchronously begin I/O and
+   * return its completion promise. Implementations must invoke it once, before
+   * this method settles. Legacy authorizers deny by default in guarded mode.
+   * @param opened - target identity derived from the provider's open handle.
+   * @param access - per-call execution context supplied by trusted code.
+   * @param startRead - provider-owned callback that starts I/O on that handle.
+   * @returns the started read result after authorization has released its locks.
+   */
+  authorizeAndStart<T>(
+    _opened: FsTarget,
+    _access: FsReadAccessContext,
+    _startRead: () => Promise<T>,
+  ): Promise<T> {
+    return Promise.reject(new FsError('provider read authorizer does not support locked read start', 'FS_PERMISSION_DENIED'))
   }
 }
 
@@ -200,9 +235,10 @@ export abstract class FileSystem extends Service {
    * Read the whole regular text file as a single decoded string.
    * @param target - the resolved target to read.
    * @param signal - aborts the read.
+   * @param access - per-call identity for the provider-owned authorizer; required when the backend enables guarded reads.
    * @returns the full decoded UTF-8 content.
    */
-  abstract readText(target: FsTarget, signal?: AbortSignal): Promise<string>
+  abstract readText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<string>
 
   /**
    * Stream the whole regular text file as decoded text chunks (same text
@@ -211,9 +247,10 @@ export abstract class FileSystem extends Service {
    * touches raw bytes.
    * @param target - the resolved target to read.
    * @param signal - aborts the stream, including between chunks.
+   * @param access - per-call identity for the provider-owned authorizer; required when the backend enables guarded reads.
    * @returns the chunk iterable, decoded and validated like {@link readText}.
    */
-  abstract streamText(target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>>
+  abstract streamText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<AsyncIterable<string>>
 
   /**
    * Read the whole regular file as raw bytes with no decoding or binary
@@ -223,9 +260,10 @@ export abstract class FileSystem extends Service {
    * @param target - the resolved target to read.
    * @param signal - aborts the read.
    * @param maxBytes - inclusive byte cap on the complete content.
+   * @param access - per-call identity for the provider-owned authorizer; required when the backend enables guarded reads.
    * @returns the full raw content, at most `maxBytes` long.
    */
-  abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array>
+  abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number, access?: FsReadAccessContext): Promise<Uint8Array>
 
   /**
    * Read one byte window of the regular file as raw bytes with no decoding or

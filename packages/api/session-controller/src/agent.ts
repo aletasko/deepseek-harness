@@ -3,6 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
+import { apiSessionControllerIssuer } from '@deepseek-ai/dsh-session'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type {
   Agent, AgentOptions, AgentSetup, ModelSelection as AgentModelSelection, ModelSelectionRef,
@@ -566,7 +567,7 @@ export class ApiSessionAgentController {
     } catch (error: unknown) {
       throw new Error(`failed to ensure project directory "${cwd}": ${String(error)}`, { cause: error })
     }
-    return (await this.ctx.agents.create({
+    const agent = (await this.ctx.agents.create({
       sessionId,
       agentOptions: this.agentOptions(),
       meta: {
@@ -575,6 +576,13 @@ export class ApiSessionAgentController {
       },
       setup: composition.setup,
     })).agent
+    // This private API-controller path always constructs a new ordinary
+    // Session. Resume and reuse paths do not pass through it.
+    this.ctx.sessions.provenance.issue(agent.session, apiSessionControllerIssuer, {
+      kind: 'nonroom', source: '@deepseek-ai/dsh-api-session-controller', sourceVersion: '1',
+      scope: { kind: 'conversation' },
+    })
+    return agent
   }
 
   private agentOptions(): AgentOptions {

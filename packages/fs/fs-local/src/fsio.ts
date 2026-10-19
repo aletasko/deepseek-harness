@@ -9,9 +9,11 @@ import { randomUUID } from 'node:crypto'
 import { createReadStream, realpath as realpathCallback } from 'node:fs'
 import { chmod, link, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
 import type { BigIntStats, Dirent, Stats } from 'node:fs'
+import type { FileHandle } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { TextDecoder, promisify } from 'node:util'
 import { FsError, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs'
+import type { FsTarget } from '@deepseek-ai/dsh-fs'
 import { copyFileDaclWin32, replaceFileWin32 } from './win32.ts'
 
 const BINARY_SAMPLE_BYTES = 8192
@@ -101,6 +103,8 @@ export interface FsIoInternals {
   inspectTemp?: (paths: { stagingDir: string; tempPath: string }) => void | Promise<void>
   /** Test hook after raw-read stat preflight and before bounded content I/O. */
   inspectReadBytesAfterStat?: (target: LocalTarget) => void | Promise<void>
+  /** Test hook before opening a read target, for deterministic path-swap coverage. */
+  inspectBeforeReadOpen?: (target: LocalTarget) => void | Promise<void>
 }
 
 /** A resolved local path: the absolute path shown to callers and its realpath identity. */
@@ -382,6 +386,105 @@ async function statRegularFile(target: LocalTarget, verb: 'read', signal?: Abort
   return info
 }
 
+interface OpenedReadTarget {
+  readonly handle: FileHandle
+  readonly opened?: FsTarget
+}
+
+type FsReadStarter = <T>(opened: FsTarget, startRead: () => Promise<T>) => Promise<T>
+
+/** Open once and identify the canonical object reached by that exact handle. */
+async function openReadTarget(
+  target: LocalTarget,
+  signal: AbortSignal | undefined,
+  identifyOpenedTarget: boolean,
+  internals: FsIoInternals = {},
+): Promise<OpenedReadTarget> {
+  throwIfAborted(signal, 'read')
+  await internals.inspectBeforeReadOpen?.(target)
+  let handle: FileHandle
+  try {
+    handle = await open(target.targetKey, 'r')
+  } catch (error: unknown) {
+    if (isENOENT(error)) throw new FsError(`cannot read "${target.displayPath}": not found`, 'FS_NOT_FOUND', { cause: error })
+    if (isPermissionError(error)) throw new FsError(`cannot read "${target.displayPath}": permission denied`, 'FS_PERMISSION_DENIED', { cause: error })
+    throw error
+  }
+  try {
+    throwIfAborted(signal, 'read')
+    const info = await handle.stat({ bigint: true })
+    if (!info.isFile()) {
+      throw new FsError(`cannot read "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+    }
+    let opened: FsTarget | undefined
+    if (identifyOpenedTarget) {
+      // Node does not expose a portable FileHandle-to-path operation. Linux
+      // procfs resolves this descriptor to the object actually opened; on
+      // other platforms an authorization-bearing read fails closed.
+      if (process.platform !== 'linux') {
+        throw new FsError('cannot authorize opened filesystem target on this platform', 'FS_PERMISSION_DENIED')
+      }
+      let openedPath: string
+      try {
+        openedPath = await realpath(`/proc/self/fd/${handle.fd}`)
+      } catch (error: unknown) {
+        throw new FsError('cannot identify opened filesystem target', 'FS_PERMISSION_DENIED', { cause: error })
+      }
+      opened = { targetKey: FsTargetKey(openedPath), displayPath: openedPath }
+    }
+    return opened === undefined ? { handle } : { handle, opened }
+  } catch (error: unknown) {
+    await handle.close()
+    throw error
+  }
+}
+
+/** Start protected I/O exactly once through the trusted provider authorizer. */
+async function startRead<T>(
+  openedTarget: OpenedReadTarget,
+  authorizeAndStart: FsReadStarter | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (authorizeAndStart === undefined) {
+    try {
+      return await operation()
+    } catch (error: unknown) {
+      if (isAbortError(error)) throw new FsError('read aborted', 'FS_ABORTED')
+      throw error
+    }
+  }
+  if (openedTarget.opened === undefined) {
+    throw new FsError('cannot identify opened filesystem target', 'FS_PERMISSION_DENIED')
+  }
+  const opened: FsTarget = openedTarget.opened
+  let accepting = true
+  const callbackState = { invoked: false }
+  let started!: Promise<T>
+  const startProtectedRead = (): Promise<T> => {
+    if (!accepting || callbackState.invoked) {
+      throw new FsError('provider read start callback is closed or already used', 'FS_PERMISSION_DENIED')
+    }
+    callbackState.invoked = true
+    started = operation()
+    void started.catch(() => {})
+    return started
+  }
+  try {
+    await authorizeAndStart(opened, startProtectedRead)
+  } finally {
+    accepting = false
+  }
+  if (!callbackState.invoked) {
+    throw new FsError('provider read authorizer did not start the protected read', 'FS_PERMISSION_DENIED')
+  }
+  try {
+    return await started
+  } catch (error: unknown) {
+    if (isAbortError(error)) throw new FsError('read aborted', 'FS_ABORTED')
+    throw error
+  }
+}
+
 /**
  * Read a whole regular UTF-8 text file into a single decoded string. Rejects
  * non-regular files, invalid UTF-8, and NUL-byte binary samples.
@@ -389,14 +492,24 @@ async function statRegularFile(target: LocalTarget, verb: 'read', signal?: Abort
  * @param signal - aborts the read (`FS_ABORTED`).
  * @returns the full decoded text, byte-for-byte (no normalization).
  */
-export async function readWholeText(target: LocalTarget, signal?: AbortSignal): Promise<string> {
-  await statRegularFile(target, 'read', signal)
-  const raw = await readFileAbortable(target.targetKey, 'read', signal)
-  throwIfAborted(signal, 'read')
-  if (raw.subarray(0, BINARY_SAMPLE_BYTES).includes(0)) {
-    throw new FsError(`cannot read "${target.displayPath}": binary file`, 'FS_NOT_TEXT')
+export async function readWholeText(
+  target: LocalTarget,
+  signal?: AbortSignal,
+  authorizeAndStart?: FsReadStarter,
+  internals: FsIoInternals = {},
+): Promise<string> {
+  const openedTarget = await openReadTarget(target, signal, authorizeAndStart !== undefined, internals)
+  const { handle } = openedTarget
+  try {
+    const raw = await startRead(openedTarget, authorizeAndStart, () => handle.readFile(signal ? { signal } : {}))
+    throwIfAborted(signal, 'read')
+    if (raw.subarray(0, BINARY_SAMPLE_BYTES).includes(0)) {
+      throw new FsError(`cannot read "${target.displayPath}": binary file`, 'FS_NOT_TEXT')
+    }
+    return decodeUtf8(raw, 'read', target.displayPath)
+  } finally {
+    await handle.close()
   }
-  return decodeUtf8(raw, 'read', target.displayPath)
 }
 
 /**
@@ -415,32 +528,40 @@ export async function readWholeBytes(
   signal: AbortSignal | undefined,
   maxBytes: number,
   internals: FsIoInternals = {},
+  authorizeAndStart?: FsReadStarter,
 ): Promise<Uint8Array> {
-  const info = await statRegularFile(target, 'read', signal)
-  if (info.size > maxBytes) {
-    throw new FsError(`cannot read "${target.displayPath}": ${info.size} bytes exceeds the ${maxBytes}-byte limit`, 'FS_TOO_LARGE')
-  }
-  await internals.inspectReadBytesAfterStat?.(target)
-  const stream = createReadStream(target.targetKey, {
-    end: maxBytes,
-    ...signal ? { signal } : {},
-  })
-  const chunks: Buffer[] = []
-  let bytes = 0
+  const openedTarget = await openReadTarget(target, signal, authorizeAndStart !== undefined, internals)
+  const { handle } = openedTarget
   try {
-    for await (const chunk of stream as AsyncIterable<Buffer>) {
-      bytes += chunk.length
-      if (bytes > maxBytes) {
-        throw new FsError(`cannot read "${target.displayPath}": content exceeds the ${maxBytes}-byte limit`, 'FS_TOO_LARGE')
-      }
-      chunks.push(chunk)
+    const info = await handle.stat()
+    if (info.size > maxBytes) {
+      throw new FsError(`cannot read "${target.displayPath}": ${info.size} bytes exceeds the ${maxBytes}-byte limit`, 'FS_TOO_LARGE')
     }
-  } catch (error: unknown) {
-    /* v8 ignore next 2 -- a mid-stream abort needs cancellation racing an active read; pre-abort is deterministic. */
-    if (isAbortError(error)) throw new FsError('read aborted', 'FS_ABORTED')
-    throw error
+    await internals.inspectReadBytesAfterStat?.(target)
+    return await startRead(openedTarget, authorizeAndStart, async () => {
+      const chunks: Buffer[] = []
+      let bytes = 0
+      let position = 0
+      const buffer = Buffer.allocUnsafe(64 * 1024)
+      while (bytes <= maxBytes) {
+        throwIfAborted(signal, 'read')
+        const remaining = maxBytes + 1 - bytes
+        const length = Math.min(buffer.length, remaining)
+        if (length <= 0) break
+        const { bytesRead } = await handle.read(buffer, 0, length, position)
+        if (bytesRead === 0) break
+        bytes += bytesRead
+        if (bytes > maxBytes) {
+          throw new FsError(`cannot read "${target.displayPath}": content exceeds the ${maxBytes}-byte limit`, 'FS_TOO_LARGE')
+        }
+        chunks.push(Buffer.from(buffer.subarray(0, bytesRead)))
+        position += bytesRead
+      }
+      return Buffer.concat(chunks, bytes)
+    })
+  } finally {
+    await handle.close()
   }
-  return Buffer.concat(chunks, bytes)
 }
 
 /**
@@ -489,9 +610,32 @@ export async function readByteWindow(
  * @param signal - aborts the stream, including between chunks (`FS_ABORTED`).
  * @returns decoded text chunks in file order; chunk boundaries carry no meaning.
  */
-export async function* streamWholeText(target: LocalTarget, signal?: AbortSignal): AsyncIterable<string> {
-  await statRegularFile(target, 'read', signal)
-  const stream = createReadStream(target.targetKey, signal ? { signal } : {})
+export function streamWholeText(
+  target: LocalTarget,
+  signal?: AbortSignal,
+  authorizeAndStart?: FsReadStarter,
+  internals: FsIoInternals = {},
+): AsyncIterable<string> | Promise<AsyncIterable<string>> {
+  if (authorizeAndStart === undefined) {
+    return (async function* (): AsyncGenerator<string> {
+      const { handle } = await openReadTarget(target, signal, false, internals)
+      yield* decodeTextHandle(target, signal, handle)
+    })()
+  }
+  throw new FsError('filesystem read denied: streaming is unavailable in guarded mode', 'FS_PERMISSION_DENIED')
+}
+
+async function* decodeTextHandle(
+  target: LocalTarget,
+  signal: AbortSignal | undefined,
+  handle: FileHandle,
+  firstChunk?: Buffer,
+): AsyncGenerator<string> {
+  const stream = handle.createReadStream({
+    autoClose: false,
+    start: firstChunk?.length ?? 0,
+    ...signal ? { signal } : {},
+  })
   const decoder = new TextDecoder('utf-8', { fatal: true })
   let sampledBytes = 0
 
@@ -505,6 +649,10 @@ export async function* streamWholeText(target: LocalTarget, signal?: AbortSignal
   }
 
   try {
+    if (firstChunk !== undefined && firstChunk.length > 0) {
+      scanBinarySample(firstChunk)
+      yield decodeUtf8Stream(decoder, firstChunk, 'read', target.displayPath)
+    }
     for await (const chunk of stream as AsyncIterable<Buffer>) {
       scanBinarySample(chunk)
       yield decodeUtf8Stream(decoder, chunk, 'read', target.displayPath)
@@ -514,6 +662,9 @@ export async function* streamWholeText(target: LocalTarget, signal?: AbortSignal
     /* v8 ignore next 4 -- mid-stream errors need an abort/IO fault racing the loop; pre-abort is caught by throwIfAborted. */
     if (isAbortError(error)) throw new FsError('read aborted', 'FS_ABORTED')
     throw error
+  } finally {
+    stream.destroy()
+    await handle.close()
   }
 }
 
