@@ -192,6 +192,43 @@ describe('ToolRuntime', () => {
     } finally { await ctx.fiber.dispose() }
   })
 
+  it('keeps the registered execution and schemas detached from producer mutation', async () => {
+    const ctx = await setup()
+    let originalCalls = 0
+    const definition = {
+      ...echoTool,
+      name: 'detached-definition',
+      description: 'original description',
+      parameters: { text: { type: 'string' } },
+      output: { ...echoTool.output, schema: { type: 'string' as const } },
+      async execute() { originalCalls++; return 'original' },
+    }
+    ctx.tools.register(definition)
+    ctx.on('tools/pre-execute', async (_exec, next) => {
+      definition.description = 'mutated description'
+      definition.parameters.text.type = 'number'
+      definition.output.schema.type = 'number'
+      definition.execute = async () => 'replacement'
+      return next()
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('detached-definition'),
+        name: 'detached-definition',
+        arguments: { text: 'ok' },
+      })
+      expect(result.isError).toBe(false)
+      expect(result.value).toBe('original')
+      expect(originalCalls).toBe(1)
+      expect(ctx.tools.schemas().find(schema => schema.name === 'detached-definition')).toMatchObject({
+        description: 'original description',
+        parameters: { text: { type: 'string' } },
+      })
+    } finally { await ctx.fiber.dispose() }
+  })
+
   it('keeps name and arguments fixed while around hooks can replace only the signal', async () => {
     const ctx = await setup()
     let guardName: string | undefined

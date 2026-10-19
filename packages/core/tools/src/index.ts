@@ -1071,6 +1071,15 @@ export class ToolRuntime extends Service {
       throw new TypeError(`tool "${name}" must declare output { schema, render, presentationMeta? }`)
     }
     assertSupportedJsonSchema(output.schema)
+    // Parameters are validated at projection time for compatibility with raw
+    // registrations. Clone even invalid values so callers cannot mutate the
+    // registered schema before that validation runs.
+    const parameters = snapshotJsonValue(definition.parameters)
+      ?? cloneRegistrationValue(definition.parameters)
+    const outputSchema = snapshotJsonValue(output.schema)
+    if (outputSchema === undefined) {
+      throw new TypeError(`tool "${name}" output schema must be lossless JSON at registration`)
+    }
     const timeoutMs = definition.timeoutMs
     if (timeoutMs !== undefined
       && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
@@ -1082,9 +1091,30 @@ export class ToolRuntime extends Service {
     if (name === RUN_CODE_NAME) {
       throw new Error(`tool name "${RUN_CODE_NAME}" is reserved for the PTC mode presentation transport and cannot be registered or shadowed`)
     }
+    // Registry identity must not be an alias to producer-owned mutable state.
+    // Otherwise a pre-execute listener could rewrite execute/schema after the
+    // guard selected this definition but before dispatch uses it.
+    const registered = deepFreeze({
+      name,
+      description: definition.description,
+      parameters,
+      ...(definition.deferLoading === true ? { deferLoading: true as const } : {}),
+      output: {
+        schema: outputSchema as JsonSchemaNode,
+        render: output.render,
+        ...(output.presentationMeta !== undefined ? { presentationMeta: output.presentationMeta } : {}),
+      },
+      execute: definition.execute,
+      ...(definition.projectContent !== undefined ? { projectContent: definition.projectContent } : {}),
+      ...(definition.finalizeContent !== undefined ? { finalizeContent: definition.finalizeContent } : {}),
+      ...(definition.timeoutMs !== undefined ? { timeoutMs: definition.timeoutMs } : {}),
+      ...(definition.isConcurrencySafe !== undefined ? { isConcurrencySafe: definition.isConcurrencySafe } : {}),
+      ...(definition.presentCall !== undefined ? { presentCall: definition.presentCall } : {}),
+      ...(definition.presentResult !== undefined ? { presentResult: definition.presentResult } : {}),
+    }) satisfies ToolDefinition
     return this.layers.effect(
       this.ctx,
-      layer => layer.tools.insert(name, definition),
+      layer => layer.tools.insert(name, registered),
       { label: 'tools.register()' },
     )
   }
@@ -1814,8 +1844,10 @@ export class ToolRuntime extends Service {
       if (result.isError) {
         throw new TypeError('tools/post-execute cannot replace the value of a failed result')
       }
-      const tool = this.executionDefinitions.get(exec)
-      if (tool === undefined) throw new ToolNotFoundError(exec.name)
+      const tool = this.executionDefinitions.get(exec as ToolRunContext)
+      if (tool === undefined || this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined) !== tool) {
+        throw new ToolNotFoundError(exec.name)
+      }
       const replaced = this.createSuccessResult(exec, tool, decision.value)
       return this.markCanonical(exec, {
         ...replaced,
@@ -1883,8 +1915,10 @@ export class ToolRuntime extends Service {
         ...result.additionalContexts !== undefined ? { additionalContexts: result.additionalContexts } : {},
       })
     }
-    const tool = this.executionDefinitions.get(exec)
-    if (tool === undefined) throw new ToolNotFoundError(exec.name)
+    const tool = this.executionDefinitions.get(exec as ToolRunContext)
+    if (tool === undefined || this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined) !== tool) {
+      throw new ToolNotFoundError(exec.name)
+    }
     const normalized = this.createSuccessResult(exec, tool, result.value)
     return this.markCanonical(exec, {
       ...normalized,
@@ -1914,6 +1948,29 @@ export class ToolRuntime extends Service {
 /** Mint a same-process correlation token whose identity is its value. */
 function createExecutionToken(): ToolExecutionToken {
   return Symbol('dsh.tool.execution') as ToolExecutionToken
+}
+
+/** Detach a raw schema graph while preserving malformed values for later validation. */
+function cloneRegistrationValue<T>(value: T, seen = new Map<object, object>()): T {
+  if (value === null || typeof value !== 'object') return value
+  const prior = seen.get(value)
+  if (prior !== undefined) return prior as T
+  const clone: object = Array.isArray(value)
+    ? []
+    : Object.create(Object.getPrototypeOf(value)) as object
+  seen.set(value, clone)
+  for (const key of Reflect.ownKeys(value)) {
+    if (Array.isArray(value) && key === 'length') continue
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (descriptor === undefined) continue
+    Object.defineProperty(clone, key, {
+      configurable: true,
+      enumerable: descriptor.enumerable === true,
+      writable: true,
+      value: cloneRegistrationValue(Reflect.get(value, key), seen),
+    })
+  }
+  return clone as T
 }
 
 /** Keep registry identity fixed while leaving the documented wrapper signal writable. */
