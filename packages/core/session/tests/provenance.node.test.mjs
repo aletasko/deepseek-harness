@@ -125,3 +125,42 @@ test('ROOM claims require the ROOM lease issuer, bind exact identity, and revoke
   assert.equal(registry.revoke(session).reason, 'revoked')
   assert.equal(registry.attest(session).state, 'unknown')
 })
+
+test('Sveglia provenance consumes a one-use receipt for the exact live AgentRegistry-created session', () => {
+  const live = new Map()
+  const receipts = new WeakMap()
+  const registry = new SessionProvenanceRegistry(session => live.get(session.id) === session, {
+    consumeAgentCreationReceipt(session, receipt) {
+      if (receipts.get(receipt) !== session) return false
+      receipts.delete(receipt)
+      return true
+    },
+  })
+  const created = { id: 'scheduled-session' }
+  const existing = { id: 'already-existing-session' }
+  live.set(created.id, created)
+  live.set(existing.id, existing)
+
+  const receipt = Object.freeze({})
+  receipts.set(receipt, created)
+  const proof = registry.issueSvegliaSession(created, receipt)
+  assert.deepEqual(proof, {
+    state: 'nonroom_verified', sessionId: created.id, scope: { kind: 'conversation' },
+    source: '@myh/dsh-stanze/sveglia', sourceVersion: '1', revision: 1,
+    issuedAt: proof.issuedAt,
+  })
+  assert.equal(registry.attest(created).state, 'nonroom_verified')
+  assert.throws(() => registry.issueSvegliaSession(created, receipt), /exact newly created live session/)
+  assert.throws(() => registry.issueSvegliaSession(existing, receipt), /exact newly created live session/)
+  assert.throws(() => registry.issueSvegliaSession(existing, {}), /exact newly created live session/)
+  assert.equal(registry.revoke(created).reason, 'revoked')
+  assert.equal(registry.attest(created).state, 'unknown')
+
+  const staleReceipt = Object.freeze({})
+  receipts.set(staleReceipt, created)
+  const replacement = { id: created.id }
+  live.set(created.id, replacement)
+  assert.throws(() => registry.issueSvegliaSession(created, staleReceipt), /exact newly created live session/)
+  assert.equal(registry.attest(created).reason, 'not_live')
+  assert.equal(registry.attest(replacement).state, 'unknown')
+})

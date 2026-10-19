@@ -9,7 +9,14 @@
  * boundary against hostile in-process plugins. Never treat its claim alone as
  * a permission grant; effect handlers must recheck their authoritative policy.
  */
-import { apiSessionControllerIssuer, dshRoomLeaseIssuer } from './issuers.ts'
+import { apiSessionControllerIssuer, dshRoomLeaseIssuer, dshSvegliaCreationIssuer } from './issuers.ts'
+
+declare const creationReceiptBrand: unique symbol
+
+/** One-use proof that AgentRegistry created this exact live session. */
+export interface AgentSessionCreationReceipt {
+  readonly [creationReceiptBrand]: true
+}
 
 export type SessionProvenanceClaim =
   | {
@@ -120,12 +127,23 @@ export class SessionProvenanceRegistry<Session extends { readonly id: string }> 
   private readonly claims = new WeakMap<Session, VerifiedSessionProvenance>()
   private revision = 0
   private readonly isLive: (session: Session) => boolean
-  private readonly options: { readonly now?: () => number; readonly ttlMs?: number }
+  private readonly options: {
+    readonly now?: () => number
+    readonly ttlMs?: number
+    readonly consumeAgentCreationReceipt?: (session: Session, receipt: AgentSessionCreationReceipt) => boolean
+  }
 
-  /** @param isLive - exact-object liveness check owned by SessionStore. */
+  /**
+   * @param isLive - exact-object liveness check owned by SessionStore.
+   * @param options - runtime expiry and the Core-owned AgentRegistry receipt consumer.
+   */
   constructor(
     isLive: (session: Session) => boolean,
-    options: { readonly now?: () => number; readonly ttlMs?: number } = {},
+    options: {
+      readonly now?: () => number
+      readonly ttlMs?: number
+      readonly consumeAgentCreationReceipt?: (session: Session, receipt: AgentSessionCreationReceipt) => boolean
+    } = {},
   ) {
     if (options.ttlMs !== undefined && (!Number.isSafeInteger(options.ttlMs) || options.ttlMs <= 0)) {
       throw new RangeError('session provenance ttlMs must be a positive safe integer')
@@ -134,9 +152,28 @@ export class SessionProvenanceRegistry<Session extends { readonly id: string }> 
     this.options = options
   }
 
+  /** Attest a fresh Sveglia root session once, using its AgentRegistry creation receipt. */
+  issueSvegliaSession(session: Session, receipt: AgentSessionCreationReceipt): VerifiedSessionProvenance {
+    const createdHere = this.options.consumeAgentCreationReceipt?.(session, receipt) === true
+    if (!createdHere || !this.isLive(session)) {
+      throw new Error('Sveglia provenance requires a receipt for this exact newly created live session')
+    }
+    return this.issueClaim(session, dshSvegliaCreationIssuer, {
+      kind: 'nonroom', source: '@myh/dsh-stanze/sveglia', sourceVersion: '1',
+      scope: { kind: 'conversation' },
+    })
+  }
+
   /** Issue an immutable, runtime-only claim for one exact live Session. */
   issue(session: Session, issuer: object, rawClaim: SessionProvenanceClaim): VerifiedSessionProvenance {
-    if (issuer !== apiSessionControllerIssuer && issuer !== dshRoomLeaseIssuer) throw new Error('session provenance issuer is not authorized')
+    if (issuer === dshSvegliaCreationIssuer) throw new Error('Sveglia provenance requires an AgentRegistry creation receipt')
+    return this.issueClaim(session, issuer, rawClaim)
+  }
+
+  private issueClaim(session: Session, issuer: object, rawClaim: SessionProvenanceClaim): VerifiedSessionProvenance {
+    if (issuer !== apiSessionControllerIssuer && issuer !== dshRoomLeaseIssuer && issuer !== dshSvegliaCreationIssuer) {
+      throw new Error('session provenance issuer is not authorized')
+    }
     if (!this.isLive(session)) throw new Error(`session "${session.id}" is not live in this store`)
     const claim = validateClaim(rawClaim)
     if (issuer === apiSessionControllerIssuer && (claim.kind !== 'nonroom' || claim.source !== '@deepseek-ai/dsh-api-session-controller')) {
@@ -144,6 +181,10 @@ export class SessionProvenanceRegistry<Session extends { readonly id: string }> 
     }
     if (issuer === dshRoomLeaseIssuer && (claim.kind !== 'room' || claim.source !== '@myh/dsh-stanze')) {
       throw new Error('DSH ROOM lease issuer can only attest DSH ROOM sessions')
+    }
+    if (issuer === dshSvegliaCreationIssuer && (claim.kind !== 'nonroom' || claim.source !== '@myh/dsh-stanze/sveglia'
+      || claim.scope.kind !== 'conversation')) {
+      throw new Error('Sveglia creation can only attest a scheduled conversation')
     }
     const previous = this.claims.get(session)
     if (previous !== undefined && !this.sameClaim(previous, claim)) {

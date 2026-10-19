@@ -17,6 +17,7 @@ import type {
   AgentHandle,
   AgentOptions,
   AgentSetup,
+  AgentSessionCreationAttempt,
   CreateAgentOptions,
   ResumeAgentOptions,
   SessionStartSource,
@@ -502,6 +503,7 @@ export class AgentLoop extends Service implements AgentFactory {
     callerSignal?: AbortSignal,
     handle?: SessionHandle,
     parentAgent?: Agent,
+    creationAttempt?: AgentSessionCreationAttempt,
   ): PreparedAgent {
     assertAgentOptions(options)
     ownerCtx.fiber.assertActive()
@@ -651,7 +653,7 @@ export class AgentLoop extends Service implements AgentFactory {
           publication = Promise.withResolvers<void>()
           try {
             assertLive()
-            detachSession = agent.ctx.sessions.enter(session)
+            detachSession = agent.ctx.sessions.enter(session, creationAttempt)
             // The mounted backend routes announced live events into the active
             // write handle by session id; the loop only owns the handle itself.
             detachAgent = loopCtx.agents.enter(agent, parentAgent)
@@ -747,7 +749,7 @@ export class AgentLoop extends Service implements AgentFactory {
    * @param options - identities, optional live parent, session seed/metadata, loop options, setup, and cancellation.
    * @returns the published handle.
    */
-  async createAgent(ownerCtx: Context, options: CreateAgentOptions): Promise<AgentHandle> {
+  async createAgent(ownerCtx: Context, options: CreateAgentOptions, creationAttempt?: AgentSessionCreationAttempt): Promise<AgentHandle> {
     const preparation = SessionPreparation.create(this.runtime.ctx.sessions.prepare(options.sessionId, {
       ...options.seed === undefined ? {} : { seed: options.seed },
       ...options.meta === undefined ? {} : { meta: options.meta },
@@ -780,6 +782,7 @@ export class AgentLoop extends Service implements AgentFactory {
         'startup',
         stored,
         options.parentAgent,
+        creationAttempt,
       )
     })()
     this.ownership.trackWrapper(published)
@@ -797,12 +800,13 @@ export class AgentLoop extends Service implements AgentFactory {
     source: SessionStartSource,
     stored?: StoredSession,
     parentAgent?: Agent,
+    creationAttempt?: AgentSessionCreationAttempt,
   ): Promise<AgentHandle> {
     using ownedPreparation = preparation
     const session = ownedPreparation.session
     let prepared: PreparedAgent
     try {
-      prepared = this.prepare(ownerCtx, id, agentOptions, session, signal, stored?.handle, parentAgent)
+      prepared = this.prepare(ownerCtx, id, agentOptions, session, signal, stored?.handle, parentAgent, creationAttempt)
     } catch (error: unknown) {
       await stored?.handle.close().catch(() => {})
       throw error

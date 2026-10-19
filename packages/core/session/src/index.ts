@@ -24,7 +24,7 @@ import type { ToolHistory } from '@deepseek-ai/dsh-llm'
 import { SessionProvenanceRegistry } from './provenance.ts'
 export { apiSessionControllerIssuer, dshRoomLeaseIssuer } from './issuers.ts'
 export { SessionProvenanceRegistry } from './provenance.ts'
-export type { SessionProvenance, SessionProvenanceClaim, UnknownSessionProvenance, VerifiedSessionProvenance } from './provenance.ts'
+export type { AgentSessionCreationReceipt, SessionProvenance, SessionProvenanceClaim, UnknownSessionProvenance, VerifiedSessionProvenance } from './provenance.ts'
 
 import { buildForkSeed } from './fork.ts'
 
@@ -1055,7 +1055,7 @@ export class SessionStore extends Service {
   private counter = 0
   private readonly projections: SessionMessageProjection[] = []
   /** Runtime-only authority bound to the exact live Session object. */
-  readonly provenance = new SessionProvenanceRegistry<Session>(session => this.get(session.id) === session)
+  readonly provenance: SessionProvenanceRegistry<Session>
 
   /** Borrowed definitions for detached replay; contributions live until their registering fibers unload. */
   get messageProjections(): readonly SessionMessageProjection[] {
@@ -1081,6 +1081,12 @@ export class SessionStore extends Service {
 
   constructor(ctx: Context) {
     super(ctx, 'sessions')
+    this.provenance = new SessionProvenanceRegistry<Session>(session => this.get(session.id) === session, {
+      consumeAgentCreationReceipt: (session, receipt) => {
+        const agents = this.ctx.get('agents') as { consumeSessionCreationReceipt?: (session: Session, receipt: object) => boolean } | undefined
+        return agents?.consumeSessionCreationReceipt?.(session, receipt) === true
+      },
+    })
     ctx.inject(['typert'], (typeCtx) => {
       typeCtx.typert.lookups.register('session', {
         parameter: 'session',
@@ -1213,7 +1219,7 @@ export class SessionStore extends Service {
    *   that creation dispatch unwinds.
    * @throws if a session with this id is already in the store.
    */
-  enter(session: Session): () => void {
+  enter(session: Session, creationAttempt?: object): () => void {
     const id = session.id
     const carrier = scopeTarget(session, scopeOf(this.ctx))
     // This is the authoritative collision boundary after arbitrary unpublished
@@ -1233,6 +1239,10 @@ export class SessionStore extends Service {
     }
     this.store.set(id, entry)
     attachments.set(session, entry)
+    if (creationAttempt !== undefined) {
+      const agents = this.ctx.get('agents') as { recordSessionCreationPublication?: (session: Session, attempt: object) => void } | undefined
+      agents?.recordSessionCreationPublication?.(session, creationAttempt)
+    }
     let entered = true
     const detach = (): void => {
       if (!entered) return

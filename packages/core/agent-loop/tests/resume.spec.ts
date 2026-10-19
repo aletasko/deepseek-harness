@@ -6,12 +6,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
-import SessionStore, { SessionLogOffset, SessionSeq, Session, SessionId, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionLogOffset, SessionSeq, Session, SessionHeader, SessionId, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineContentToolFixture, TOOL_RUNTIME_SCHEDULER } from '@deepseek-ai/dsh-tools'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
-import type { SessionHandle } from '@deepseek-ai/dsh-session-persistence'
+import { SessionPersistence, type SessionHandle } from '@deepseek-ai/dsh-session-persistence'
 
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
@@ -26,6 +26,57 @@ declare module '@deepseek-ai/dsh-llm' {
 
 const dirs: string[] = []
 afterEach(async () => { for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true }) })
+
+class MemorySessionPersistence extends SessionPersistence {
+  private readonly records = new Map<SessionId, { header: SessionHeader; events: SessionEvent[] }>()
+
+  async create(header: Session['header']): Promise<SessionHandle> {
+    const existing = this.records.get(header.id)
+    if (existing !== undefined) throw new Error(`session "${header.id}" already exists`)
+    const record = { header, events: [] as SessionEvent[] }
+    this.records.set(header.id, record)
+    return this.handle(record, 'write')
+  }
+
+  async open(id: SessionId, access: 'read' | 'write'): Promise<SessionHandle> {
+    const record = this.records.get(id)
+    if (record === undefined) throw new Error(`session "${id}" not found`)
+    return this.handle(record, access)
+  }
+
+  async flush(): Promise<void> {}
+  async stat() { return undefined }
+  async list() { return [] }
+
+  private handle(record: { header: SessionHeader; events: SessionEvent[] }, access: 'read' | 'write'): SessionHandle {
+    const close = async (): Promise<void> => {}
+    return {
+      id: record.header.id,
+      header: record.header,
+      inheritedEventCount: SessionLogOffset(0),
+      access,
+      read: async () => ({ events: [...record.events], eventState: 'detached' }),
+      append: async events => { record.events.push(...events) },
+      flush: async () => {},
+      close,
+      [Symbol.asyncDispose]: close,
+    }
+  }
+}
+
+async function memoryHarness(adapter: MockAdapter): Promise<Context> {
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(AgentRegistry)
+  await ctx.plugin(MemorySessionPersistence)
+  await ctx.plugin(AgentLoop, { agents: [] })
+  ctx.llm.registerAdapter(['mock'], adapter)
+  return ctx
+}
 
 async function persistentHarness(adapter: MockAdapter): Promise<{ ctx: Context; root: string }> {
   const root = await mkdtemp(join(tmpdir(), 'dsh-resume-'))
@@ -146,6 +197,26 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
     const { agent } = await ctx.agents.create({ sessionId: SessionId('custom-session'), meta: { cwd: '/w' } })
     expect(agent.session.id).toBe('custom-session')
     expect(agent.session.header.cwd).toBe('/w')
+    await ctx.fiber.dispose()
+  })
+
+  it('issues Sveglia provenance only for a real fresh AgentLoop startup, never resume', async () => {
+    const ctx = await memoryHarness(new MockAdapter([]))
+    const created = await ctx.agents.create({ sessionId: SessionId('sveglia-integration-created') })
+    expect(created.sessionCreationReceipt).toBeDefined()
+    expect(ctx.sessions.provenance.issueSvegliaSession(
+      created.agent.session,
+      created.sessionCreationReceipt!,
+    ).state).toBe('nonroom_verified')
+    await created.dispose()
+    const sessionId = SessionId('sveglia-integration-resumed')
+    await seedStoredSession(ctx, sessionId, [
+      { type: 'turn/start', seq: SessionSeq(0), time: 1, data: { turn: 1 } },
+      { type: 'turn/end', seq: SessionSeq(1), time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+    ])
+    const resumed = await ctx.agents.resume({ resumeSessionId: sessionId })
+    expect(resumed.sessionCreationReceipt).toBeUndefined()
+    await resumed.dispose()
     await ctx.fiber.dispose()
   })
 

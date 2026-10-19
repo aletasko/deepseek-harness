@@ -1,6 +1,6 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import { Context, Service, symbols } from '@deepseek-ai/cordis'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { Session, SessionId } from '@deepseek-ai/dsh-session'
 import AgentRegistry, { agentEvents } from '@deepseek-ai/dsh-agent'
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
 
@@ -333,6 +333,68 @@ describe('AgentRegistry factory seam', () => {
 
     expect(calls.create[0]?.options.parentAgent).toBe(parent)
     await unregister()
+  })
+
+  it('returns a one-use creation receipt only for a newly published session, never resume', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(AgentRegistry)
+    const existing = stubAgent('scheduled-existing')
+    const detachExisting = ctx.sessions.enter(existing.session)
+    const created = stubAgent('scheduled-created')
+    let detachCreated: (() => void) | undefined
+    const factory: AgentFactory = {
+      createAgent: async (_ownerCtx, options, creationAttempt) => {
+        if (options.sessionId === existing.id) return { agent: existing, dispose: async () => {} }
+        detachCreated = ctx.sessions.enter(created.session, creationAttempt)
+        return { agent: created, dispose: async () => { detachCreated?.() } }
+      },
+      resume: async (_ownerCtx, options) => ({ agent: stubAgent(options.resumeSessionId), dispose: async () => {} }),
+    }
+    ctx.agents.setFactory(factory)
+
+    const reusedExisting = await ctx.agents.create({ sessionId: existing.id })
+    expect(reusedExisting.sessionCreationReceipt).toBeUndefined()
+    expect(() => ctx.sessions.provenance.issueSvegliaSession(existing.session, reusedExisting.sessionCreationReceipt!))
+      .toThrow(/exact newly created live session/)
+    const handle = await ctx.agents.create({ sessionId: created.id })
+    expect(handle.sessionCreationReceipt).toBeDefined()
+    expect(ctx.sessions.provenance.issueSvegliaSession(created.session, handle.sessionCreationReceipt!).state).toBe('nonroom_verified')
+    expect(() => ctx.sessions.provenance.issueSvegliaSession(created.session, handle.sessionCreationReceipt!)).toThrow(/exact newly created live session/)
+
+    const resumed = await ctx.agents.resume({ resumeSessionId: created.id })
+    expect(resumed.sessionCreationReceipt).toBeUndefined()
+    await handle.dispose()
+    detachExisting()
+  })
+
+  it('does not issue a receipt when another caller publishes during factory await', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(AgentRegistry)
+    const duringAwait = stubAgent('scheduled-raced')
+    let releaseFactory!: () => void
+    let factoryStarted!: () => void
+    const started = new Promise<void>(resolve => { factoryStarted = resolve })
+    const gate = new Promise<void>(resolve => { releaseFactory = resolve })
+    ctx.agents.setFactory({
+      createAgent: async () => {
+        factoryStarted()
+        await gate
+        return { agent: duringAwait, dispose: async () => {} }
+      },
+      resume: async (_ownerCtx, options) => ({ agent: stubAgent(options.resumeSessionId), dispose: async () => {} }),
+    })
+    const pending = ctx.agents.create({ sessionId: duringAwait.id })
+    await started
+    const detach = ctx.sessions.enter(duringAwait.session)
+    releaseFactory()
+    const handle = await pending
+    expect(handle.sessionCreationReceipt).toBeUndefined()
+    expect(() => ctx.sessions.provenance.issueSvegliaSession(duringAwait.session, {} as never))
+      .toThrow(/exact newly created live session/)
+    await handle.dispose()
+    detach()
   })
 
   it('rejects a second factory and clears the slot with its owner (HMR)', async () => {
