@@ -6,12 +6,13 @@ import { RemoteOperationError } from '@deepseek-ai/dsh-ssh/protocol'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { z } from 'zod'
 import { SshFileSystem } from '../src/index.ts'
+import type { Config as FsSshConfig } from '../src/index.ts'
 
 type Dispatch = (method: string, params: unknown, signal?: AbortSignal) => Promise<unknown>
 const target: FsTarget = { targetKey: FsTargetKey('/remote/work/file.txt'), displayPath: 'file.txt' }
 const streamId = '00000000-0000-4000-8000-000000000001'
 
-async function setup() {
+async function setup(fsConfig: FsSshConfig = {}) {
   const dispatch = vi.fn<Dispatch>()
   class WireConnection extends Service {
     constructor(ctx: Context) { super(ctx, 'ssh') }
@@ -25,7 +26,7 @@ async function setup() {
     resolve(): SandboxExecutionPolicy { return { mode: 'read-only', workspaceRoot: '/remote/work' } }
   }
   const ctx = new Context()
-  const fibers = [await ctx.plugin(WireConnection), await ctx.plugin(Policy), await ctx.plugin(SshFileSystem)]
+  const fibers = [await ctx.plugin(WireConnection), await ctx.plugin(Policy), await ctx.plugin(SshFileSystem, fsConfig)]
   onTestFinished(async () => { for (const fiber of fibers.reverse()) await fiber.dispose() })
   return { fs: ctx.fs, dispatch }
 }
@@ -108,6 +109,15 @@ describe('SSH filesystem provider', () => {
     await expect(fs.readText(target, undefined, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
     await expect(fs.streamText(target, undefined, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
     await expect(fs.readBytes(target, undefined, 4, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  it('denies every direct content read when guarded mode is enabled', async () => {
+    const { fs, dispatch } = await setup({ requireReadAuthorization: true })
+    await expect(fs.readText(target)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.streamText(target)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.readBytes(target, undefined, 4)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.readByteRange(target, { offset: 0, length: 4 })).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
     expect(dispatch).not.toHaveBeenCalled()
   })
 
