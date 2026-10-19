@@ -14,7 +14,11 @@ provider:
 ```ts
 ctx.provide('subprocessBrokerConfig', {
   socketPath: '/run/dsh-subprocess-broker.sock',
-  assignmentId: 'host-issued-worktree-assignment',
+})
+ctx.provide('subprocessBrokerAssignmentResolver', {
+  // `sessionId` is returned by Core's attestation of the exact active tool body.
+  // Resolve it through a host-owned session-to-worktree registry.
+  resolve(sessionId) { return assignmentForSession(sessionId) },
 })
 ```
 
@@ -23,11 +27,16 @@ missing socket, rejected request, or invalid protocol event fails closed. The
 provider does not fall back to `systemd-run`, `node:child_process.spawn`, or
 `node-pty`. The request carries literal `argv`, `cwd`, effective child `env`,
 stdio dispositions, and the trusted assignment identifier. It never carries
-the requested UID or path authorization policy; the broker must resolve those
-from its own assignment table and must authenticate the local Core peer.
+the requested UID or path authorization policy; Core resolves the assignment
+from the exact active ToolRuntime session through a trusted host resolver. The
+broker must resolve UID and path policy from its own assignment table and
+authenticate the local Core peer. Static assignment IDs are not supported.
 The broker must canonicalize and validate `cwd` beneath the root named by the
 assignment, including symlinks and races. The requested `cwd` is an execution
 parameter, never the authorization rule.
+The broker route rejects explicit `DSH_SESSION_ID` overrides. Other environment
+values are data only; neither the client nor broker may derive session identity
+or assignment selection from child environment variables.
 
 The newline framed v1 client protocol is a draft. Process requests receive an
 `accepted` handle, stdout/stderr and PTY data events, one `outcome`, and an

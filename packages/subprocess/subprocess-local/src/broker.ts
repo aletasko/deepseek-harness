@@ -17,13 +17,18 @@ import { bindManagedProcess } from './spawn.ts'
 export interface SubprocessBrokerConfig {
   /** Trusted local Unix socket path. Never supplied by the model-facing request. */
   socketPath: string
-  /** Opaque Core-issued assignment identifier. The broker resolves UID and path policy itself. */
-  assignmentId: string
+}
+
+/** Host-owned mapping from Core-attested session identity to broker policy. */
+export interface SubprocessBrokerAssignmentResolver {
+  /** Return the opaque broker assignment for this session, or deny with undefined. */
+  resolve(sessionId: string): string | undefined
 }
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
     subprocessBrokerConfig?: SubprocessBrokerConfig
+    subprocessBrokerAssignmentResolver?: SubprocessBrokerAssignmentResolver
   }
 }
 
@@ -132,6 +137,7 @@ export function launchBrokerProcess(
   spec: SubprocessSpawnSpec,
   env: NodeJS.ProcessEnv,
   config: SubprocessBrokerConfig,
+  assignmentId: string,
   signal?: AbortSignal,
 ): ManagedProcessLaunch {
   const connection = new BrokerConnection(config.socketPath, signal)
@@ -184,6 +190,9 @@ export function launchBrokerProcess(
         control?.on('end', () => connection.send({ type: 'control-eof', handle: message.handle }))
         return
       }
+      if (message.type === 'error') {
+        throw new Error(typeof message.message === 'string' ? message.message : 'broker rejected request')
+      }
       if (!accepted) throw new Error('event arrived before accepted')
       if (message.handle !== handleId) throw new Error('event handle does not match accepted request')
       if (message.type === 'stdout' || message.type === 'stderr') {
@@ -213,8 +222,6 @@ export function launchBrokerProcess(
         empty.resolve()
         dispose()
         connection.socket.end()
-      } else if (message.type === 'error') {
-        throw new Error(typeof message.message === 'string' ? message.message : 'broker rejected request')
       } else throw new Error('unknown event type')
     } catch (error) {
       fail(error instanceof Error ? error : new Error(String(error)))
@@ -224,7 +231,7 @@ export function launchBrokerProcess(
   try {
     connection.send({
       type: 'start', version: 1, requestId: randomUUID(), mode: 'process',
-      assignmentId: config.assignmentId, argv: [...spec.argv], cwd: spec.cwd, env,
+      assignmentId, argv: [...spec.argv], cwd: spec.cwd, env,
       stdio: stdioRequest(spec), graceMs: spec.graceMs,
     })
     startupTimer = setTimeout(() => fail(new Error('subprocess-local broker: start acceptance timed out')), 10_000)
@@ -259,7 +266,7 @@ export class BrokerTerminalHandle implements SubprocessTerminalHandle {
   private nextId = 0
   private closed = false
 
-  constructor(config: SubprocessBrokerConfig, spec: SubprocessTerminalSpawnSpec, env: Record<string, string>) {
+  constructor(config: SubprocessBrokerConfig, assignmentId: string, spec: SubprocessTerminalSpawnSpec, env: Record<string, string>) {
     this.connection = new BrokerConnection(config.socketPath, spec.signal)
     this.done = this.doneResult.promise
     void this.done.catch(() => {})
@@ -321,7 +328,7 @@ export class BrokerTerminalHandle implements SubprocessTerminalHandle {
     })
     this.connection.send({
       type: 'start', version: 1, requestId: randomUUID(), mode: 'terminal',
-      assignmentId: config.assignmentId, argv: [...spec.argv], cwd: spec.cwd, env,
+      assignmentId, argv: [...spec.argv], cwd: spec.cwd, env,
       stdio: { stdin: { mode: 'pty' }, stdout: { mode: 'pty' }, stderr: { mode: 'pty' } },
       rows: spec.rows, cols: spec.cols, terminalType: spec.terminalType,
       graceMs: spec.graceMs, shellActivity: spec.shellActivity === true,
@@ -409,12 +416,34 @@ export function bindBrokerProcess(
 
 export function assertBrokerConfig(config: SubprocessBrokerConfig | undefined): SubprocessBrokerConfig | undefined {
   if (config === undefined) return undefined
-  if (typeof config.socketPath !== 'string' || !isAbsolute(config.socketPath) || typeof config.assignmentId !== 'string' || config.assignmentId.length === 0) {
+  if (typeof config.socketPath !== 'string' || !isAbsolute(config.socketPath)) {
     throw new Error('subprocess-local: invalid trusted broker configuration')
   }
   return config
 }
 
+export function resolveBrokerAssignment(
+  resolver: SubprocessBrokerAssignmentResolver | undefined,
+  sessionId: string | undefined,
+): string {
+  if (resolver === undefined) throw new Error('subprocess-local: broker assignment resolver is unavailable')
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    throw new Error('subprocess-local: broker launch requires a Core-attested agent session')
+  }
+  const assignmentId = resolver.resolve(sessionId)
+  if (typeof assignmentId !== 'string' || assignmentId.length === 0) {
+    throw new Error('subprocess-local: no broker assignment for the active session')
+  }
+  return assignmentId
+}
+
 export function terminalEnv(spec: SubprocessTerminalSpawnSpec, env: Record<string, string>): Record<string, string> {
   return { ...env, PWD: spec.cwd, TERM: spec.terminalType }
+}
+
+/** Prevent caller environment from spoofing the identity used for assignment resolution. */
+export function assertNoBrokerIdentityOverride(env: Record<string, string>): void {
+  if (Object.keys(env).some(key => key.toUpperCase() === 'DSH_SESSION_ID')) {
+    throw new Error('subprocess-local: DSH_SESSION_ID cannot be set for broker launches')
+  }
 }

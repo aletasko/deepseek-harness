@@ -54,12 +54,15 @@ import { LocalTerminalHandle } from './terminal.ts'
 import { prepareShellActivity } from './shell-activity.ts'
 import {
   assertBrokerConfig,
+  assertNoBrokerIdentityOverride,
   bindBrokerProcess,
   BrokerTerminalHandle,
   launchBrokerProcess,
+  resolveBrokerAssignment,
   terminalEnv,
 } from './broker.ts'
-import type { SubprocessBrokerConfig } from './broker.ts'
+import type { SubprocessBrokerAssignmentResolver, SubprocessBrokerConfig } from './broker.ts'
+import { attestSubprocessExecution } from '@deepseek-ai/dsh-subprocess'
 
 const requireNodePty = createLazyRequire<typeof NodePty>('node-pty', import.meta.url)
 
@@ -97,10 +100,12 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   /** Test hook for platform process inspection; production resolves lazily on terminal spawn. */
   terminalInspector: ProcessInspector | undefined
   private readonly brokerConfig: SubprocessBrokerConfig | undefined
+  private readonly brokerAssignmentResolver: SubprocessBrokerAssignmentResolver | undefined
 
   constructor(ctx: Context, config: SubprocessConfig = {}) {
     super(ctx, config)
     this.brokerConfig = assertBrokerConfig(ctx.reflect.get('subprocessBrokerConfig') as SubprocessBrokerConfig | undefined)
+    this.brokerAssignmentResolver = ctx.reflect.get('subprocessBrokerAssignmentResolver') as SubprocessBrokerAssignmentResolver | undefined
     ctx.effect(() => {
       const onHostExit = (): void => { this.terminateForHostExit() }
       process.prependListener('exit', onHostExit)
@@ -113,6 +118,12 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
 
   /** Spill failures reach the plugin logger; the log line is the only trace of why a result has no spill path. */
   private readonly reportSpillFailure = logSpillFailure(this.ctx.logger, 'subprocess-local')
+
+  /** Resolve the assignment only from the exact Core-attested active session. */
+  private brokerAssignment(): string {
+    const { attestation } = attestSubprocessExecution(this.ctx)
+    return resolveBrokerAssignment(this.brokerAssignmentResolver, attestation.sessionId)
+  }
 
   private terminateForHostExit(): void {
     for (const handle of this.live) {
@@ -219,8 +230,10 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     let handle: LocalSubprocessHandle
     const internals: SpawnInternals = { ...this.internals, onSpillFailure: this.reportSpillFailure }
     if (this.brokerConfig !== undefined) {
+      const assignmentId = this.brokerAssignment()
+      assertNoBrokerIdentityOverride(env)
       const binding = prepareManagedProcessBinding(internals)
-      handle = bindBrokerProcess(spec, launchBrokerProcess(spec, env, this.brokerConfig, spec.signal), binding)
+      handle = bindBrokerProcess(spec, launchBrokerProcess(spec, env, this.brokerConfig, assignmentId, spec.signal), binding)
     } else if (containmentMode === 'fallback') {
       handle = spawnSubprocess(spec, internals)
     } else {
@@ -317,8 +330,10 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     spec.signal?.throwIfAborted()
     this.authorizeStart({ kind: 'terminal', argv: spec.argv, cwd: spec.cwd })
     if (this.brokerConfig !== undefined) {
+      const assignmentId = this.brokerAssignment()
       const env = targetEnvironment(spec)
-      const handle = new BrokerTerminalHandle(this.brokerConfig, spec, terminalEnv(spec, env))
+      assertNoBrokerIdentityOverride(env)
+      const handle = new BrokerTerminalHandle(this.brokerConfig, assignmentId, spec, terminalEnv(spec, env))
       this.brokerTerminals.add(handle)
       try {
         await handle.ready
@@ -411,4 +426,4 @@ function environmentValue(env: NodeJS.ProcessEnv, name: 'PATH' | 'PATHEXT'): str
 }
 
 export default LocalSubprocessRuntime
-export type { SubprocessBrokerConfig } from './broker.ts'
+export type { SubprocessBrokerAssignmentResolver, SubprocessBrokerConfig } from './broker.ts'

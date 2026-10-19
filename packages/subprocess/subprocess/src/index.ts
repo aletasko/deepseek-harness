@@ -25,7 +25,13 @@ export interface SubprocessStartRequest {
 /** Narrow structural view of the Core-owned ToolRuntime identity API. */
 export interface SubprocessToolExecutionRuntime {
   currentActiveExecution(): unknown
-  attestActiveExecution(execution: unknown): unknown
+  attestActiveExecution(execution: unknown): SubprocessExecutionAttestation
+}
+
+/** Session identity attested by Core for the exact active tool body. */
+export interface SubprocessExecutionAttestation {
+  readonly direct: true
+  readonly sessionId?: string
 }
 
 /** Trusted host adapter for per-execution subprocess policy. Methods must be synchronous. */
@@ -63,18 +69,25 @@ export function authorizeSubprocessStart(ctx: Context, required: boolean, reques
 
   // ToolRuntime is owned by Core and is looked up at the effect point. Do not
   // accept identity copied into the request or captured by a provider scope.
+  const { execution } = attestSubprocessExecution(ctx)
+  if (authorizer.authorize(execution, request) !== true) {
+    throw new Error('subprocess: guarded process launch denied by host policy')
+  }
+}
+
+/** Obtain Core-attested identity at the effect point. Caller-supplied ids are never accepted. */
+export function attestSubprocessExecution(ctx: Context): { execution: unknown; attestation: SubprocessExecutionAttestation } {
   const tools = ctx.reflect.get('tools') as SubprocessToolExecutionRuntime | undefined
   const execution = tools?.currentActiveExecution()
   if (execution === undefined || tools === undefined) {
-    throw new Error('subprocess: guarded process launch requires an active ToolRuntime execution')
+    throw new Error('subprocess: operation requires an active ToolRuntime execution')
   }
   try {
-    tools.attestActiveExecution(execution)
+    const attestation = tools.attestActiveExecution(execution)
+    if (attestation?.direct !== true) throw new Error('ToolRuntime returned a non-direct attestation')
+    return { execution, attestation }
   } catch (cause) {
-    throw new Error('subprocess: guarded process launch has no valid active ToolRuntime execution', { cause })
-  }
-  if (authorizer.authorize(execution, request) !== true) {
-    throw new Error('subprocess: guarded process launch denied by host policy')
+    throw new Error('subprocess: operation has no valid active ToolRuntime execution', { cause })
   }
 }
 

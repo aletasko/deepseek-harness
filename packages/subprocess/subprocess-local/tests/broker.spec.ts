@@ -73,9 +73,17 @@ function processSpec(overrides: Partial<SubprocessSpawnSpec> = {}): SubprocessSp
   }
 }
 
-async function withRuntime<T>(socketPath: string, run: (ctx: Context, fiber: Awaited<ReturnType<Context['plugin']>>) => Promise<T>): Promise<T> {
+async function withRuntime<T>(socketPath: string, run: (ctx: Context, fiber: Awaited<ReturnType<Context['plugin']>>) => Promise<T>, sessionId: string | null = 'session-7'): Promise<T> {
   const ctx = new Context()
-  ctx.provide('subprocessBrokerConfig', { socketPath, assignmentId: 'trusted-assignment-7' })
+  ctx.provide('subprocessBrokerConfig', { socketPath })
+  const execution = sessionId === null ? undefined : { active: true }
+  ctx.provide('tools', {
+    currentActiveExecution: () => execution,
+    attestActiveExecution: () => ({ direct: true, sessionId }),
+  })
+  ctx.provide('subprocessBrokerAssignmentResolver', {
+    resolve: (id: string) => id === 'session-7' ? 'trusted-assignment-7' : id === 'session-8' ? 'trusted-assignment-8' : undefined,
+  })
   const fiber = await ctx.plugin(LocalSubprocessRuntime)
   try { return await run(ctx, fiber) } finally { await fiber.dispose() }
 }
@@ -235,6 +243,90 @@ describe('local subprocess broker route', () => {
       await broker.close()
     }
   }, 15_000)
+
+  it('resolves distinct broker assignments from the active Core session for process and PTY', async () => {
+    const processBroker = await fakeBroker((message, peer) => {
+      if (message.type === 'start') {
+        peer.send({ type: 'accepted', handle: 'session-8-process' })
+        peer.send({ type: 'outcome', handle: 'session-8-process', exitCode: 0, signal: null })
+        peer.send({ type: 'empty', handle: 'session-8-process' })
+      }
+    })
+    const terminalBroker = await fakeBroker((message, peer) => {
+      if (message.type === 'start') {
+        peer.send({ type: 'accepted', handle: 'session-7-terminal', pid: 781 })
+        peer.send({ type: 'outcome', handle: 'session-7-terminal', exitCode: 0, signal: null })
+        peer.send({ type: 'empty', handle: 'session-7-terminal' })
+      }
+    })
+    try {
+      await withRuntime(processBroker.socketPath, async ctx => {
+        const handle = ctx.subprocess.spawn(processSpec({ cwd: '/work/session-8' }))
+        await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
+        await expect(handle.waitForExit()).resolves.toBe(true)
+        expect(await processBroker.peer.waitFor('start')).toMatchObject({ assignmentId: 'trusted-assignment-8', cwd: '/work/session-8' })
+      }, 'session-8')
+      await withRuntime(terminalBroker.socketPath, async ctx => {
+        const handle = await ctx.subprocess.spawnTerminal({
+          argv: ['/bin/sh'], cwd: '/work/session-7', rows: 24, cols: 80,
+          terminalType: 'xterm', graceMs: 100,
+        })
+        await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
+        await handle.terminate()
+        expect(await terminalBroker.peer.waitFor('start')).toMatchObject({ assignmentId: 'trusted-assignment-7', cwd: '/work/session-7' })
+      }, 'session-7')
+    } finally {
+      await processBroker.close()
+      await terminalBroker.close()
+    }
+  })
+
+  it('denies missing active identity and rejects a cwd outside the selected assignment without fallback', async () => {
+    const broker = await fakeBroker((message, peer) => {
+      if (message.type === 'start') {
+        if (message.assignmentId !== 'trusted-assignment-7' || message.cwd !== '/work/session-7') {
+          peer.send({ type: 'error', message: 'cwd is outside the broker assignment' })
+          return
+        }
+        peer.send({ type: 'accepted', handle: 'scoped-process' })
+        peer.send({ type: 'outcome', handle: 'scoped-process', exitCode: 0, signal: null })
+        peer.send({ type: 'empty', handle: 'scoped-process' })
+      }
+    })
+    try {
+      await withRuntime(broker.socketPath, async ctx => {
+        const runtime = ctx.subprocess as LocalSubprocessRuntime
+        const localSpawn = vi.fn(); runtime.internals.spawn = localSpawn as never
+        expect(() => ctx.subprocess.spawn(processSpec())).toThrow(/requires an active ToolRuntime execution/)
+        await expect(ctx.subprocess.spawnTerminal({
+          argv: ['/bin/sh'], cwd: '/work/session-7', rows: 24, cols: 80,
+          terminalType: 'xterm', graceMs: 100,
+        })).rejects.toThrow(/requires an active ToolRuntime execution/)
+        expect(localSpawn).not.toHaveBeenCalled()
+        expect(broker.peer.messages).toHaveLength(0)
+      }, null)
+      await withRuntime(broker.socketPath, async ctx => {
+        const runtime = ctx.subprocess as LocalSubprocessRuntime
+        const localSpawn = vi.fn(); runtime.internals.spawn = localSpawn as never
+        const handle = ctx.subprocess.spawn(processSpec({ cwd: '/work/session-8' }))
+        await expect(handle.done).rejects.toThrow(/cwd is outside the broker assignment/)
+        expect(await broker.peer.waitFor('start')).toMatchObject({
+          assignmentId: 'trusted-assignment-7', cwd: '/work/session-8',
+        })
+        expect(() => ctx.subprocess.spawn(processSpec({ env: { DSH_SESSION_ID: 'session-8' } })))
+          .toThrow(/DSH_SESSION_ID cannot be set for broker launches/)
+        await expect(ctx.subprocess.spawnTerminal({
+          argv: ['/bin/sh'], cwd: '/work/session-8', rows: 24, cols: 80,
+          terminalType: 'xterm', graceMs: 100,
+        })).rejects.toThrow(/cwd is outside the broker assignment/)
+        await expect(ctx.subprocess.spawnTerminal({
+          argv: ['/bin/sh'], cwd: '/work/session-7', env: { DSH_SESSION_ID: 'session-8' },
+          rows: 24, cols: 80, terminalType: 'xterm', graceMs: 100,
+        })).rejects.toThrow(/DSH_SESSION_ID cannot be set for broker launches/)
+        expect(localSpawn).not.toHaveBeenCalled()
+      }, 'session-7')
+    } finally { await broker.close() }
+  })
 
   it('fails closed when the broker socket is unavailable and never invokes local spawn', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'dsh-broker-missing-'))
