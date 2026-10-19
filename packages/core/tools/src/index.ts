@@ -17,6 +17,7 @@ import { assertNever, deepFreeze, snapshotJsonValue, type JsonValue } from '@dee
 import type { PromptSection, ToolProviderResult } from '@deepseek-ai/dsh-system-prompt'
 import type { PtcRuntime } from '@deepseek-ai/dsh-ptc-runtime'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
+import { AsyncLocalStorage } from 'node:async_hooks'
 // Type-only: makes `ctx.get('approval')` resolve to the ApprovalService
 // augmentation. The seam stays optional at runtime — see `serviceAsk`.
 import type {} from '@deepseek-ai/dsh-user-approval'
@@ -844,6 +845,8 @@ export class ToolRuntime extends Service {
   private executionDefinitions = new WeakMap<ToolRunContext, ToolDefinition | undefined>()
   /** Exact execution objects whose registered tool bodies have not settled. */
   private activeBodyExecutions = new WeakSet<ToolRunContext>()
+  /** Ambient execution identity is owned by Core and exists only inside the body callback. */
+  private readonly activeExecution = new AsyncLocalStorage<ToolRunContext>()
   /** Definition-owned final content transform snapshotted before policy begins. */
   private contentFinalizers = new WeakMap<ToolRunContext, ToolDefinition['finalizeContent']>()
   /** Execution-prepared content installed before post-execute policy. */
@@ -1462,6 +1465,22 @@ export class ToolRuntime extends Service {
     })
   }
 
+  /**
+   * Return the exact direct tool execution in the current async tool-body
+   * context. The result is descriptive identity only: callers must pass it to
+   * {@link attestActiveExecution} at the protected resource access point.
+   */
+  currentActiveExecution(): ToolExecution | undefined {
+    const execution = this.activeExecution.getStore()
+    if (execution === undefined) return undefined
+    try {
+      this.attestActiveExecution(execution)
+      return execution
+    } catch {
+      return undefined
+    }
+  }
+
   private async completeScheduledExecution(prepared: ScheduledToolPreparation): Promise<ToolExecutionResult> {
     switch (prepared.kind) {
       case 'dispatch': {
@@ -1678,7 +1697,7 @@ export class ToolRuntime extends Service {
       this.activeBodyExecutions.add(exec)
       let returned: unknown
       try {
-        returned = await boundTool.execute(exec.arguments, exec)
+        returned = await this.activeExecution.run(exec, () => boundTool.execute(exec.arguments, exec))
       } finally {
         this.activeBodyExecutions.delete(exec)
       }

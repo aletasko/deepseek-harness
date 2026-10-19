@@ -165,6 +165,7 @@ describe('ToolRuntime', () => {
 
   it('attests only the exact active direct body execution', async () => {
     const ctx = await setup()
+    expect(ctx.tools.currentActiveExecution()).toBeUndefined()
     const gates = new Map<string, {
       release(): void
       started: Promise<ToolRunContext>
@@ -184,8 +185,10 @@ describe('ToolRuntime', () => {
       output: { schema: { type: 'string' }, render: () => [] },
       async execute(args, exec) {
         const gate = gates.get(args.id)!
+        expect(ctx.tools.currentActiveExecution()).toBe(exec)
         gate.markStarted(exec)
         await gate.waiting
+        expect(ctx.tools.currentActiveExecution()).toBe(exec)
         return args.id
       },
     }))
@@ -196,12 +199,46 @@ describe('ToolRuntime', () => {
     const secondExec = await gates.get('two')!.started
     expect(ctx.tools.attestActiveExecution(firstExec)).toEqual({ toolName: 'attested', direct: true })
     expect(ctx.tools.attestActiveExecution(secondExec)).toEqual({ toolName: 'attested', direct: true })
+    expect(ctx.tools.currentActiveExecution()).toBeUndefined()
     expect(() => ctx.tools.attestActiveExecution({ ...firstExec })).toThrow(/not an active body execution/)
     gates.get('one')!.release()
     gates.get('two')!.release()
     await Promise.all([firstResult, secondResult])
+    expect(ctx.tools.currentActiveExecution()).toBeUndefined()
     expect(() => ctx.tools.attestActiveExecution(firstExec)).toThrow(/not an active body execution/)
     expect(() => ctx.tools.attestActiveExecution(secondExec)).toThrow(/not an active body execution/)
+    await ctx.fiber.dispose()
+  })
+
+  it('does not expose settled ambient executions or child executions', async () => {
+    const ctx = await setup()
+    let markReplay!: (execution: ToolRunContext | undefined) => void
+    const replay = new Promise<ToolRunContext | undefined>((resolve) => { markReplay = resolve })
+    ctx.tools.register(defineTool({
+      name: 'ambient-lifetime', description: '', parameters: {}, output: { schema: { type: 'string' }, render: () => [] },
+      async execute(_args, exec) {
+        if (exec.parent !== undefined) {
+          expect(ctx.tools.currentActiveExecution()).toBeUndefined()
+          expect(() => ctx.tools.attestActiveExecution(exec)).toThrow(/no longer an active direct registration/)
+          return 'child'
+        }
+        expect(ctx.tools.currentActiveExecution()).toBe(exec)
+        expect(() => ctx.tools.attestActiveExecution({ ...exec })).toThrow(/not an active body execution/)
+        // The async callback inherits this ALS context, but runs after the body
+        // has settled and must no longer obtain a live execution.
+        setTimeout(() => { markReplay(ctx.tools.currentActiveExecution()) }, 0)
+        const child = await ctx.tools.execute({
+          signal: exec.signal, callId: ToolCallId('ambient-lifetime-child'), name: 'ambient-lifetime', arguments: {}, parent: exec.token,
+        })
+        expect(child.isError).toBe(false)
+        expect(ctx.tools.currentActiveExecution()).toBe(exec)
+        return 'root'
+      },
+    }))
+    const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('ambient-lifetime'), name: 'ambient-lifetime', arguments: {} })
+    expect(result.isError).toBe(false)
+    expect(await replay).toBeUndefined()
+    expect(ctx.tools.currentActiveExecution()).toBeUndefined()
     await ctx.fiber.dispose()
   })
 
