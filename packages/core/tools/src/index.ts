@@ -826,6 +826,8 @@ export class ToolRuntime extends Service {
   private concludingExecutions = new WeakSet<ToolExecution>()
   /** Original caller cancellation, kept outside the wrapper-mutable execution object. */
   private cancellationStates = new WeakMap<ToolRunContext, ToolCancellationState>()
+  /** Definition selected before policy runs, keyed by the registry-minted execution. */
+  private executionDefinitions = new WeakMap<ToolRunContext, ToolDefinition | undefined>()
   /** Definition-owned final content transform snapshotted before policy begins. */
   private contentFinalizers = new WeakMap<ToolRunContext, ToolDefinition['finalizeContent']>()
   /** Execution-prepared content installed before post-execute policy. */
@@ -1364,6 +1366,8 @@ export class ToolRuntime extends Service {
    * drained and may retain a tool-owned structured error.
    * @param exec - the typed same-process call input. The registry assigns its
    *   correlation token before policy begins.
+   *   The visible definition is bound to that execution before policy begins,
+   *   so registry changes during policy cannot redirect its dispatch.
    * @returns the materialized final result.
    */
   async execute(exec: ToolExecutionInput): Promise<ToolExecutionResult> {
@@ -1443,6 +1447,7 @@ export class ToolRuntime extends Service {
         throw new TypeError('tool execution arguments must be losslessly JSON-serializable')
       }
       const execution: MutableToolRunContext = { ...base, arguments: deepFreeze(detached) }
+      this.executionDefinitions.set(execution, collapsed ? undefined : visible)
       this.deferredContexts.set(execution, deferredContexts)
       this.contentFinalizers.set(execution, finalizerFor())
       if (!collapsed) this.contentProjectors.set(execution, capturedProjector)
@@ -1475,6 +1480,7 @@ export class ToolRuntime extends Service {
       return { kind: 'ready', exec: execution }
     } catch (error: unknown) {
       const execution: MutableToolRunContext = { ...base, arguments: undefined }
+      this.executionDefinitions.set(execution, collapsed ? undefined : visible)
       this.contentFinalizers.set(execution, finalizerFor())
       return { kind: 'final-result', exec: execution, result: toolErrorResult(error) }
     }
@@ -1575,7 +1581,7 @@ export class ToolRuntime extends Service {
     }
     exec.signal = signal
     try {
-      const tool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
+      const tool = this.executionDefinitions.get(exec)
       if (!tool) throw new ToolNotFoundError(exec.name)
       state.bodyInvoked = true
       const returned = await tool.execute(exec.arguments, exec)
@@ -1804,7 +1810,7 @@ export class ToolRuntime extends Service {
       if (result.isError) {
         throw new TypeError('tools/post-execute cannot replace the value of a failed result')
       }
-      const tool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
+      const tool = this.executionDefinitions.get(exec)
       if (tool === undefined) throw new ToolNotFoundError(exec.name)
       const replaced = this.createSuccessResult(exec, tool, decision.value)
       return this.markCanonical(exec, {
@@ -1873,7 +1879,7 @@ export class ToolRuntime extends Service {
         ...result.additionalContexts !== undefined ? { additionalContexts: result.additionalContexts } : {},
       })
     }
-    const tool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
+    const tool = this.executionDefinitions.get(exec)
     if (tool === undefined) throw new ToolNotFoundError(exec.name)
     const normalized = this.createSuccessResult(exec, tool, result.value)
     return this.markCanonical(exec, {

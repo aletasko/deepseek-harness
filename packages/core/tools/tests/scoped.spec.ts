@@ -263,6 +263,25 @@ describe('restrict() over an inherited scope layer', () => {
 })
 
 describe('scoped execution dispatch', () => {
+  it('dispatches the scoped definition selected before pre-execute after its registration is disposed', async () => {
+    const ctx = await mount()
+    const { scope, key } = await mintAgentScope(ctx, 'a')
+    const dispose = scope.ctx.tools.register(tool('scoped-bound', 'original scoped'))
+    let replaced = false
+    scope.ctx.on('tools/pre-execute', async (_exec, next) => {
+      if (!replaced) {
+        replaced = true
+        dispose()
+        scope.ctx.tools.register(tool('scoped-bound', 'replacement scoped'))
+      }
+      return next()
+    })
+
+    try {
+      expect(await run(ctx, 'scoped-bound', key)).toBe('original scoped')
+    } finally { await ctx.fiber.dispose() }
+  })
+
   it('an agent.ctx pre-execute listener gates only its own agent (and never subject-less calls)', async () => {
     const ctx = await mount()
     const { scope, key } = await mintAgentScope(ctx, 'a')

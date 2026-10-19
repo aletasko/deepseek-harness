@@ -162,6 +162,32 @@ describe('ToolRuntime', () => {
     expect(observed).toEqual(result)
   })
 
+  it('dispatches the definition selected before pre-execute even if the global registration is replaced', async () => {
+    const ctx = await setup()
+    const original = { ...echoTool, name: 'bound-global', async execute() { return 'original' } }
+    const replacement = { ...echoTool, name: 'bound-global', async execute() { return 'replacement' } }
+    const disposeOriginal = ctx.tools.register(original)
+    let replaced = false
+    ctx.on('tools/pre-execute', async (_exec, next) => {
+      if (!replaced) {
+        replaced = true
+        disposeOriginal()
+        ctx.tools.register(replacement)
+      }
+      return next()
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('bound-global'),
+        name: 'bound-global',
+        arguments: {},
+      })
+      expect(result).toEqual({ content: [{ type: 'text', text: 'original' }], isError: false, value: 'original' })
+    } finally { await ctx.fiber.dispose() }
+  })
+
   it('projects presentation metadata from the canonical value', async () => {
     const ctx = await setup()
     ctx.tools.register({
