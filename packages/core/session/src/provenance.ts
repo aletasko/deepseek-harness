@@ -9,6 +9,7 @@
  * boundary against hostile in-process plugins. Never treat its claim alone as
  * a permission grant; effect handlers must recheck their authoritative policy.
  */
+import { apiSessionControllerIssuer, dshRoomLeaseIssuer } from './issuers.ts'
 
 export type SessionProvenanceClaim =
   | {
@@ -56,11 +57,6 @@ export interface UnknownSessionProvenance {
 }
 
 export type SessionProvenance = VerifiedSessionProvenance | UnknownSessionProvenance
-
-/** Internal capability consumed only by the API Session controller. Not re-exported by the package barrel. */
-export const apiSessionControllerIssuer = Object.freeze({})
-/** Runtime capability used by the DSH ROOM plugin after its one-shot ROOM lease verifies. */
-export const dshRoomLeaseIssuer = Object.freeze({})
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)

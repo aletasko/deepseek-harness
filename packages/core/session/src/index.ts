@@ -22,6 +22,7 @@ import { foldRequestHeader } from './request-header.ts'
 import { ToolHistoryProjection } from './tool-history.ts'
 import type { ToolHistory } from '@deepseek-ai/dsh-llm'
 import { SessionProvenanceRegistry } from './provenance.ts'
+export { apiSessionControllerIssuer, dshRoomLeaseIssuer } from './issuers.ts'
 export { SessionProvenanceRegistry } from './provenance.ts'
 export type { SessionProvenance, SessionProvenanceClaim, UnknownSessionProvenance, VerifiedSessionProvenance } from './provenance.ts'
 

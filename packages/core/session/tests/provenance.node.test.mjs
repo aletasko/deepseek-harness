@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { apiSessionControllerIssuer, dshRoomLeaseIssuer, SessionProvenanceRegistry } from '../src/provenance.ts'
+import { SessionProvenanceRegistry } from '../src/provenance.ts'
+import { apiSessionControllerIssuer, dshRoomLeaseIssuer } from '../src/issuers.ts'
 
 test('provenance is exact-object bound and ordinary API claims are per session', () => {
   const live = new Map()
