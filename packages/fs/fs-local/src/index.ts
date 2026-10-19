@@ -53,6 +53,8 @@ export interface Config {
   diffBasisMaxBytes?: number
   /** Require a trusted per-call authorizer for every content read. Defaults to false. */
   requireReadAuthorization?: boolean
+  /** Deny all writes and edits until a provider-side mutation authorizer exists. Defaults to false. */
+  requireMutationAuthorization?: boolean
 }
 
 type ResolvedConfig = Required<Config>
@@ -96,6 +98,7 @@ export class LocalFileSystem extends FileSystem {
     cwd: z.string().default(process.cwd()),
     diffBasisMaxBytes: z.number().default(DEFAULT_DIFF_BASIS_MAX_BYTES),
     requireReadAuthorization: z.boolean().default(false),
+    requireMutationAuthorization: z.boolean().default(false),
   })
 
   /** Validated config (schemastery applied the defaults before construction). */
@@ -252,6 +255,9 @@ export class LocalFileSystem extends FileSystem {
     expected?: FsWriteIntent,
     signal?: AbortSignal,
   ): Promise<FsWriteOutcome> {
+    if (this.config.requireMutationAuthorization) {
+      throw new FsError('filesystem mutation denied: provider-side write authorization is unavailable', 'FS_PERMISSION_DENIED')
+    }
     return this.withLock(target.targetKey, async () => {
       const existing = await probe(target.targetKey)
       if (existing && existing.type !== 'file') {
@@ -307,6 +313,9 @@ export class LocalFileSystem extends FileSystem {
     expected?: { version: FsVersion },
     signal?: AbortSignal,
   ): Promise<FsEditOutcome> {
+    if (this.config.requireMutationAuthorization) {
+      throw new FsError('filesystem mutation denied: provider-side edit authorization is unavailable', 'FS_PERMISSION_DENIED')
+    }
     return this.withLock(target.targetKey, async () => {
       const existing = await probe(target.targetKey)
       // Stale guard before literal matching: an edit based on an old read reports

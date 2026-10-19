@@ -97,6 +97,12 @@ async function remountWithReadAuthorizationRequired(): Promise<void> {
   fs = ctx.fs as LocalFileSystem
 }
 
+async function remountWithMutationAuthorizationRequired(): Promise<void> {
+  await fiber.dispose()
+  fiber = await ctx.plugin(LocalFileSystem, { cwd: dir, requireMutationAuthorization: true })
+  fs = ctx.fs as LocalFileSystem
+}
+
 describe('registration', () => {
   it('registers LocalFileSystem as ctx.fs with a default cwd', async () => {
     const bare = new Context()
@@ -637,6 +643,32 @@ describe('listDir', () => {
 })
 
 describe('writeText', () => {
+  it('denies direct creates, overwrites, and edits before provider effects in guarded mutation mode', async () => {
+    const existingPath = join(dir, 'existing.txt')
+    await writeFile(existingPath, 'original')
+    await remountWithMutationAuthorizationRequired()
+    const existing = await fs.resolve('existing.txt')
+    const missing = await fs.resolve('new.txt')
+    let stagedWrites = 0
+    fs.internals.inspectTemp = () => { stagedWrites++ }
+
+    await expect(fs.writeText(missing, 'created', { kind: 'createIfAbsent' }))
+      .rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.writeText(existing, 'overwritten'))
+      .rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.writeText(existing, 'overwritten', {
+      kind: 'replaceIfVersion',
+      version: await versionOf(existing),
+    })).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.editText(existing, { oldString: 'original', newString: 'edited', replaceAll: false }))
+      .rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+
+    expect(await readFile(existingPath, 'utf8')).toBe('original')
+    await expect(readFile(join(dir, 'new.txt'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(stagedWrites).toBe(0)
+    expect(lockCount(fs)).toBe(0)
+  })
+
   it('createIfAbsent creates a new file', async () => {
     const target = await fs.resolve('new.txt')
     const outcome = await fs.writeText(target, 'fresh', { kind: 'createIfAbsent' })
