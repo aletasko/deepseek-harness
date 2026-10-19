@@ -190,6 +190,9 @@ export class LocalFileSystem extends FileSystem {
   }
 
   override async streamText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<AsyncIterable<string>> {
+    if (this.config.requireReadAuthorization) {
+      throw new FsError('filesystem read denied: streaming is unavailable in guarded mode', 'FS_PERMISSION_DENIED')
+    }
     const authorize = this.readAuthorizerFor(access)
     return streamWholeText({ displayPath: target.displayPath, targetKey: target.targetKey }, signal, authorize, this.internals)
   }

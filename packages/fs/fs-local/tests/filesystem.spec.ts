@@ -324,7 +324,7 @@ describe('readText / streamText', () => {
     expect(streamed).toBe('one\ntwo\nthree')
   })
 
-  it('starts readText, streamText, and readBytes under opened-target authorization', async () => {
+  it('starts readText and readBytes under opened-target authorization', async () => {
     await writeFile(join(dir, 'authorized.txt'), 'secret')
     await remountWithReadAuthorizationRequired()
     const target = await fs.resolve('authorized.txt')
@@ -334,12 +334,10 @@ describe('readText / streamText', () => {
     const access: FsReadAccessContext = { actor }
 
     expect(await fs.readText(target, undefined, access)).toBe('secret')
-    let streamed = ''
-    for await (const chunk of await fs.streamText(target, undefined, access)) streamed += chunk
-    expect(streamed).toBe('secret')
+    await expect(fs.streamText(target, undefined, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
     expect(Buffer.from(await fs.readBytes(target, undefined, 16, access)).toString()).toBe('secret')
-    expect(openedReadTargets).toHaveLength(3)
-    expect(readStartCount).toBe(3)
+    expect(openedReadTargets).toHaveLength(2)
+    expect(readStartCount).toBe(2)
     expect(openedReadTargets.every(actual => actual.targetKey === target.targetKey)).toBe(true)
   })
 
@@ -355,7 +353,20 @@ describe('readText / streamText', () => {
     await expect(fs.readText(target, undefined, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
     await expect(fs.streamText(target, undefined, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
     await expect(fs.readBytes(target, undefined, 16, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
-    expect(openedReadTargets).toHaveLength(3)
+    expect(openedReadTargets).toHaveLength(2)
+    expect(readStartCount).toBe(0)
+  })
+
+  it('denies guarded streams before opening a handle that an unconsumed stream could retain', async () => {
+    await writeFile(join(dir, 'unconsumed.txt'), 'secret')
+    await remountWithReadAuthorizationRequired()
+    const target = await fs.resolve('unconsumed.txt')
+    let openAttempts = 0
+    fs.internals.inspectBeforeReadOpen = () => { openAttempts++ }
+
+    await expect(fs.streamText(target, undefined, { actor: {} })).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    expect(openAttempts).toBe(0)
+    expect(openedReadTargets).toHaveLength(0)
     expect(readStartCount).toBe(0)
   })
 

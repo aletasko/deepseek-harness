@@ -622,25 +622,7 @@ export function streamWholeText(
       yield* decodeTextHandle(target, signal, handle)
     })()
   }
-  return (async (): Promise<AsyncIterable<string>> => {
-    const openedTarget = await openReadTarget(target, signal, true, internals)
-    const { handle, opened } = openedTarget
-    if (opened === undefined) {
-      await handle.close()
-      throw new FsError('cannot identify opened filesystem target', 'FS_PERMISSION_DENIED')
-    }
-    try {
-      const buffer = Buffer.allocUnsafe(64 * 1024)
-      const first = await startRead(openedTarget, authorizeAndStart, () => {
-        throwIfAborted(signal, 'read')
-        return handle.read(buffer, 0, buffer.length, 0)
-      })
-      return decodeTextHandle(target, signal, handle, buffer.subarray(0, first.bytesRead))
-    } catch (error: unknown) {
-      await handle.close()
-      throw error
-    }
-  })()
+  throw new FsError('filesystem read denied: streaming is unavailable in guarded mode', 'FS_PERMISSION_DENIED')
 }
 
 async function* decodeTextHandle(
