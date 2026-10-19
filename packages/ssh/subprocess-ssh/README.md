@@ -25,7 +25,7 @@ English | [中文](README.zh.md)
 <a id="use-this-package"></a>
 ## Use this package
 
-Mount this provider with [`dsh-ssh`](../ssh/README.md) and its filesystem provider. It has no deployment configuration of its own. `resolveExecutable()` checks the remote executable namespace; fully specified spawn requests supply the remote cwd, environment, stream dispositions and cleanup grace.
+Mount this provider with [`dsh-ssh`](../ssh/README.md) and its filesystem provider. `denyProcessExecution` defaults to `false`. Set it to `true` when guarded filesystem reads must prevent subprocess-based reads: the provider rejects ordinary process and terminal launches before sending `process.prepare`. This disables process consumers such as bash, glob, and grep. `requireStartAuthorization` also defaults to `false`; when enabled, every launch requires the exact active ToolRuntime execution and a trusted `subprocessStartAuthorizer` service. These options can be combined; the global deny runs first. `resolveExecutable()` checks the remote executable namespace; fully specified spawn requests supply the remote cwd, environment, stream dispositions and cleanup grace.
 
 Ordinary spawn returns a handle while remote allocation proceeds. Piped stdin and the optional duplex control endpoint accept writes during allocation. Terminal allocation, writes, foreground inspection, signals and termination retain their asynchronous interfaces.
 

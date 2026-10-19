@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-在任何于宿主机上运行子进程的组合中挂载 `dsh-subprocess-local`。它解析本地可执行文件，为普通 Linux 与 Windows 命令以及受支持的 Linux 终端会话提供由 OS 所有的受管范围，并通过 `node-pty` 提供真实终端会话；不受支持的宿主使用明确披露的较弱 fallback。它没有任何配置，因此每项处置方式、限制、终端尺寸与宽限期都随 spawn 请求来自调用方能力 seam。输出收集在内存中保留一段有界尾部，并可选地用 spill 文件恢复完整流；子进程从清理后的环境起步；dispose（资源释放）会终止并等待每个选定范围或会话完全停稳。
+在任何于宿主机上运行子进程的组合中挂载 `dsh-subprocess-local`。它解析本地可执行文件，为普通 Linux 与 Windows 命令以及受支持的 Linux 终端会话提供由 OS 所有的受管范围，并通过 `node-pty` 提供真实终端会话；不受支持的宿主使用明确披露的较弱 fallback。输出收集在内存中保留一段有界尾部，并可选地用 spill 文件恢复完整流；子进程从清理后的环境起步；dispose（资源释放）会终止并等待每个选定范围或会话完全停稳。
 
 ## 目录
 
@@ -29,7 +29,7 @@ kind: "package-reference"
 
 ### 挂载提供方
 
-在与消费方相同的组合中加载本提供方。它没有任何配置字段：每项选择都随 spawn 请求到达，因此随部署变化的决策留在调用方的配置里。 `terminalEnvironment()` 在 POSIX 读取非空的 `SHELL`，缺失时使用账户登录 shell；在 Windows 读取非空的 `ComSpec`。空值会被省略，由消费者选择平台回退。
+在与消费方相同的组合中加载本提供方。`denyProcessExecution` 默认为 `false`。当受保护的文件读取必须阻止基于子进程的读取时，将其设为 `true`；提供方会在校验或创建子进程前拒绝普通进程与终端启动。这会禁用 bash、glob 和 grep 等进程消费方。`requireStartAuthorization` 也默认为 `false`；启用后，每次启动都需要精确的活动 ToolRuntime 执行和可信的 `subprocessStartAuthorizer` 服务。这些选项可以组合使用；全局拒绝会先执行。`terminalEnvironment()` 在 POSIX 读取非空的 `SHELL`，缺失时使用账户登录 shell；在 Windows 读取非空的 `ComSpec`。空值会被省略，由消费者选择平台回退。
 
 ```yaml
 - name: '@deepseek-ai/dsh-subprocess-local'

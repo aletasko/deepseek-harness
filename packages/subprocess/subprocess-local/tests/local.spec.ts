@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { Context } from '@deepseek-ai/cordis'
 import type { IPtyForkOptions, IWindowsPtyForkOptions } from 'node-pty'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
-import type { SubprocessSpawnSpec, SubprocessTerminalHandle, SubprocessTerminalSpawnSpec } from '@deepseek-ai/dsh-subprocess'
+import type { SubprocessStartAuthorizer, SubprocessSpawnSpec, SubprocessTerminalHandle, SubprocessTerminalSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import { childEnv } from '../src/spawn.ts'
 import { LinuxScopeNotStartedError, signalLinuxDirectProcess } from '../src/linux-scope.ts'
 
@@ -59,6 +59,55 @@ function spec(command: string, overrides: Partial<SubprocessSpawnSpec> = {}): Su
 }
 
 describe('LocalSubprocessRuntime', () => {
+  it('applies guarded-read denial before validation and start authorization', async () => {
+    const ctx = new Context()
+    const fiber = await ctx.plugin(LocalSubprocessRuntime, {
+      denyProcessExecution: true,
+      requireStartAuthorization: true,
+    })
+    try {
+      expect(() => ctx.subprocess.spawn({} as never)).toThrow(/subprocess-local: process execution is disabled by guarded-read policy/)
+      await expect(ctx.subprocess.spawnTerminal({} as never)).rejects.toThrow(/subprocess-local: process execution is disabled by guarded-read policy/)
+    } finally {
+      await fiber.dispose()
+    }
+  })
+
+  it('denies a guarded spawn before reaching the process launcher', async () => {
+    const ctx = new Context()
+    const authorize = vi.fn(() => false)
+    ctx.provide('tools', {
+      currentActiveExecution: () => Object.freeze({ name: 'guarded-read' }),
+      attestActiveExecution: () => ({ direct: true }),
+    } as never)
+    ctx.provide('subprocessStartAuthorizer', {
+      authorize,
+    } satisfies SubprocessStartAuthorizer)
+    const fiber = await ctx.plugin(LocalSubprocessRuntime, { requireStartAuthorization: true })
+    expect(() => ctx.subprocess.spawn(spec('true'))).toThrow(/denied by host policy/)
+    await expect(ctx.subprocess.spawnTerminal({
+      argv: ['bash'], cwd: process.cwd(), rows: 24, cols: 80, terminalType: 'dumb', graceMs: 100,
+    })).rejects.toThrow(/denied by host policy/)
+    expect(authorize).toHaveBeenCalledTimes(2)
+    await fiber.dispose()
+  })
+
+  it('fails provider startup when required authorization has no trusted adapter', async () => {
+    const ctx = new Context()
+    await expect(ctx.plugin(LocalSubprocessRuntime, { requireStartAuthorization: true }))
+      .rejects.toThrow(/needs a trusted subprocessStartAuthorizer service/)
+  })
+
+  it('denies direct provider calls with an adapter but no active ToolRuntime execution', async () => {
+    const ctx = new Context()
+    const authorize = vi.fn(() => true)
+    ctx.provide('subprocessStartAuthorizer', { authorize })
+    const fiber = await ctx.plugin(LocalSubprocessRuntime, { requireStartAuthorization: true })
+    expect(() => ctx.subprocess.spawn(spec('true'))).toThrow(/requires an active ToolRuntime execution/)
+    expect(authorize).not.toHaveBeenCalled()
+    await fiber.dispose()
+  })
+
   it('discovers the platform shell without inventing a missing default and honors cancellation', async () => {
     let loginShell: string | null = '/account/shell'
     const userInfo = vi.spyOn(os, 'userInfo').mockImplementation(() => ({

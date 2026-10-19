@@ -8,6 +8,45 @@ const id = 'a7b17d9c-5ebf-40d8-9e82-3d1ddae8517b'
 const spec = { terminalType: 'dumb', argv: ['bash'], cwd: '/workspace', rows: 24, cols: 80, graceMs: 100 }
 
 describe('SSH terminal allocation lifecycle', () => {
+  it('applies guarded-read denial before validation, authorization, or SSH requests', async () => {
+    const ctx = new Context()
+    const request = vi.fn()
+    ctx.provide('ssh', { request, connectStream: vi.fn(), dispose: vi.fn() } as never)
+    const fiber = await ctx.plugin(SshSubprocessRuntime, {
+      denyProcessExecution: true,
+      requireStartAuthorization: true,
+    })
+    try {
+      expect(() => ctx.subprocess.spawn({} as never)).toThrow(/subprocess-ssh: process execution is disabled by guarded-read policy/)
+      await expect(ctx.subprocess.spawnTerminal({} as never)).rejects.toThrow(/subprocess-ssh: process execution is disabled by guarded-read policy/)
+      expect(request).not.toHaveBeenCalled()
+    } finally {
+      await fiber.dispose()
+    }
+  })
+
+  it('denies a guarded spawn before sending an SSH process request', async () => {
+    const ctx = new Context()
+    const request = vi.fn()
+    ctx.provide('ssh', { request, connectStream: vi.fn(), dispose: vi.fn() } as never)
+    const authorize = vi.fn(() => false)
+    ctx.provide('tools', {
+      currentActiveExecution: () => Object.freeze({ name: 'guarded-read' }),
+      attestActiveExecution: () => ({ direct: true }),
+    } as never)
+    ctx.provide('subprocessStartAuthorizer', { authorize })
+    const fiber = await ctx.plugin(SshSubprocessRuntime, { requireStartAuthorization: true })
+
+    expect(() => ctx.subprocess.spawn({
+      argv: ['echo', 'blocked'], cwd: '/workspace', graceMs: 100,
+      stdio: { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
+    })).toThrow(/denied by host policy/)
+    await expect(ctx.subprocess.spawnTerminal(spec)).rejects.toThrow(/denied by host policy/)
+    expect(authorize).toHaveBeenCalledTimes(2)
+    expect(request).not.toHaveBeenCalled()
+    await fiber.dispose()
+  })
+
   it.each(['prepare', 'connect', 'start'])('joins a pending %s before completing provider disposal', async (stage) => {
     const ctx = new Context()
     const entered = Promise.withResolvers<undefined>()
