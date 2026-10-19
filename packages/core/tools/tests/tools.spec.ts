@@ -13,6 +13,7 @@ import ToolRuntime, {
   TOOL_ABORTED, TOOL_ABORTED_BEFORE_DISPATCH,
   type InferArgs, type ParameterSchemaSpec, type PreToolDecision, type PostToolDecision,
   type JsonSchemaNode, type ToolDefinition, type ToolDispatchExecution, type ToolExecutionResult, type ToolExecutionToken,
+  type ToolRunContext,
 } from '@deepseek-ai/dsh-tools'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 
@@ -160,6 +161,132 @@ describe('ToolRuntime', () => {
     const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c1'), name: 'echo', arguments: { text: 'hi' } })
     expect(result).toEqual({ content: [{ type: 'text', text: 'hi' }], isError: false, value: 'hi' })
     expect(observed).toEqual(result)
+  })
+
+  it('attests only the exact active direct body execution', async () => {
+    const ctx = await setup()
+    const gates = new Map<string, {
+      release(): void
+      started: Promise<ToolRunContext>
+      markStarted(exec: ToolRunContext): void
+      waiting: Promise<void>
+    }>()
+    for (const id of ['one', 'two']) {
+      let release!: () => void
+      let markStarted!: (exec: ToolRunContext) => void
+      const started = new Promise<ToolRunContext>((resolve) => { markStarted = resolve })
+      const waiting = new Promise<void>((resolve) => { release = resolve })
+      // Keep each body pending independently so both attestations overlap.
+      gates.set(id, { release, started, markStarted, waiting })
+    }
+    ctx.tools.register(defineTool({
+      name: 'attested', description: 'test', parameters: { id: { type: 'string', required: true } },
+      output: { schema: { type: 'string' }, render: () => [] },
+      async execute(args, exec) {
+        const gate = gates.get(args.id)!
+        gate.markStarted(exec)
+        await gate.waiting
+        return args.id
+      },
+    }))
+    const call = (id: string) => ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId(`attested-${id}`), name: 'attested', arguments: { id } })
+    const firstResult = call('one')
+    const firstExec = await gates.get('one')!.started
+    const secondResult = call('two')
+    const secondExec = await gates.get('two')!.started
+    expect(ctx.tools.attestActiveExecution(firstExec)).toEqual({ toolName: 'attested', direct: true })
+    expect(ctx.tools.attestActiveExecution(secondExec)).toEqual({ toolName: 'attested', direct: true })
+    expect(() => ctx.tools.attestActiveExecution({ ...firstExec })).toThrow(/not an active body execution/)
+    gates.get('one')!.release()
+    gates.get('two')!.release()
+    await Promise.all([firstResult, secondResult])
+    expect(() => ctx.tools.attestActiveExecution(firstExec)).toThrow(/not an active body execution/)
+    expect(() => ctx.tools.attestActiveExecution(secondExec)).toThrow(/not an active body execution/)
+    await ctx.fiber.dispose()
+  })
+
+  it('rejects child and replaced executions', async () => {
+    const ctx = await setup()
+    let release!: () => void
+    let started!: (exec: ToolRunContext) => void
+    const active = new Promise<ToolRunContext>((resolve) => { started = resolve })
+    const wait = new Promise<void>((resolve) => { release = resolve })
+    const definition = defineTool({
+      name: 'guarded-attestation', description: '', parameters: {},
+      output: { schema: { type: 'string' }, render: () => [] },
+      async execute(_args, exec) {
+        if (exec.parent !== undefined) {
+          expect(() => ctx.tools.attestActiveExecution(exec)).toThrow(/no longer an active direct registration/)
+          return 'child'
+        }
+        started(exec)
+        await wait
+        return 'ok'
+      },
+    })
+    const dispose = ctx.tools.register(definition)
+    const result = ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('attestation-root'), name: 'guarded-attestation', arguments: {} })
+    const root = await active
+    expect(ctx.tools.attestActiveExecution(root)).toEqual({ toolName: 'guarded-attestation', direct: true })
+    const child = ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('attestation-child'), name: 'guarded-attestation', arguments: {}, parent: root.token })
+    await child
+    expect(ctx.tools.attestActiveExecution(root)).toEqual({ toolName: 'guarded-attestation', direct: true })
+    dispose()
+    const replacement = ctx.tools.register({ ...definition, async execute() { return 'replacement' } })
+    expect(() => ctx.tools.attestActiveExecution(root)).toThrow(/no longer an active direct registration/)
+    replacement()
+    release()
+    await result
+    await ctx.fiber.dispose()
+  })
+
+  it('rejects an active execution after its signal is aborted', async () => {
+    const ctx = await setup()
+    let release!: () => void
+    let started!: (exec: ToolRunContext) => void
+    const active = new Promise<ToolRunContext>((resolve) => { started = resolve })
+    const wait = new Promise<void>((resolve) => { release = resolve })
+    ctx.tools.register(defineTool({
+      name: 'abort-attestation', description: '', parameters: {}, output: { schema: { type: 'string' }, render: () => [] },
+      async execute(_args, exec) { started(exec); await wait; return 'ok' },
+    }))
+    const abort = new AbortController()
+    const result = ctx.tools.execute({ signal: abort.signal, callId: ToolCallId('attestation-abort'), name: 'abort-attestation', arguments: {} })
+    const exec = await active
+    expect(ctx.tools.attestActiveExecution(exec)).toEqual({ toolName: 'abort-attestation', direct: true })
+    abort.abort()
+    expect(() => ctx.tools.attestActiveExecution(exec)).toThrow(/no longer an active direct registration/)
+    release()
+    await result
+    await ctx.fiber.dispose()
+  })
+
+  it('attests the live agent session and rejects a forged agent handle', async () => {
+    const ctx = await setup()
+    await ctx.plugin(AgentRegistry)
+    let attested: ReturnType<typeof ctx.tools.attestActiveExecution> | undefined
+    ctx.tools.register(defineTool({
+      name: 'agent-attestation', description: '', parameters: {}, output: { schema: { type: 'string' }, render: () => [] },
+      async execute(_args, exec) { attested = ctx.tools.attestActiveExecution(exec); return 'ok' },
+    }))
+    const id = SessionId('attested-session')
+    const agent = { id, session: Session.create(id), ctx: new Context() } as unknown as Agent
+    const disposeAgent = ctx.agents.enter(agent, undefined)
+    try {
+      const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('agent-attestation'), name: 'agent-attestation', arguments: {}, agent })
+      expect(result.isError, JSON.stringify(result.content)).toBe(false)
+      expect(result.value).toBe('ok')
+      expect(attested).toEqual({ toolName: 'agent-attestation', sessionId: 'attested-session', direct: true })
+      const forged = await ctx.tools.execute({
+        signal: testToolSignal, callId: ToolCallId('forged-agent-attestation'), name: 'agent-attestation', arguments: {},
+        agent: { id: SessionId('forged-session') },
+      })
+      expect(forged.isError).toBe(true)
+      expect(JSON.stringify(forged.content)).toContain('no longer an active direct registration')
+    } finally {
+      disposeAgent()
+      await ctx.fiber.dispose()
+    }
   })
 
   it('denies dispatch when the global definition is replaced during pre-execute', async () => {

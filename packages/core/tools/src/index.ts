@@ -399,6 +399,19 @@ export interface ToolExecution extends ToolExecutionInput {
 }
 
 /**
+ * Immutable identity of a direct tool execution while its registered body is
+ * active. Obtain this at the resource access point with
+ * {@link ToolRuntime.attestActiveExecution}; the returned value is descriptive
+ * and does not keep the execution active.
+ */
+export interface ActiveToolExecutionAttestation {
+  readonly toolName: string
+  /** Agent session id, when the call runs for an agent. */
+  readonly sessionId?: string
+  readonly direct: true
+}
+
+/**
  * Around-dispatch view of a {@link ToolExecution}. A `tools/execute` wrapper
  * may replace the signal for its delegated lifetime, but it cannot remove it.
  * The registry fuses every replacement with the captured caller signal.
@@ -829,6 +842,8 @@ export class ToolRuntime extends Service {
   private cancellationStates = new WeakMap<ToolRunContext, ToolCancellationState>()
   /** Definition selected before policy runs, keyed by the registry-minted execution. */
   private executionDefinitions = new WeakMap<ToolRunContext, ToolDefinition | undefined>()
+  /** Exact execution objects whose registered tool bodies have not settled. */
+  private activeBodyExecutions = new WeakSet<ToolRunContext>()
   /** Definition-owned final content transform snapshotted before policy begins. */
   private contentFinalizers = new WeakMap<ToolRunContext, ToolDefinition['finalizeContent']>()
   /** Execution-prepared content installed before post-execute policy. */
@@ -1416,6 +1431,37 @@ export class ToolRuntime extends Service {
     return this.prepareExecution(exec, prepared => this.completeScheduledExecution(prepared))
   }
 
+  /**
+   * Attest that `exec` is this runtime's exact, currently active, direct tool
+   * body execution. Call this at the protected resource access point. Cloned
+   * objects, nested dispatches, replaced registrations, aborted executions,
+   * and executions that have settled are rejected.
+   *
+   * The immutable return value describes the identity checked at this instant;
+   * it is not a reusable capability and does not extend the body's lifetime.
+   */
+  attestActiveExecution(exec: unknown): ActiveToolExecutionAttestation {
+    if (exec === null || typeof exec !== 'object' || !this.activeBodyExecutions.has(exec as ToolRunContext)) {
+      throw new Error('tool execution is not an active body execution')
+    }
+    const execution = exec as ToolRunContext
+    const definition = this.executionDefinitions.get(execution)
+    const current = this.resolveExecution(execution.name, execution.agent, false)
+    const agentIsLive = execution.agent === undefined || this.ctx.agents?.get(execution.agent.id) === execution.agent
+    if (
+      definition === undefined || current !== definition || execution.parent !== undefined || execution.signal.aborted ||
+      definition.name !== execution.name || !agentIsLive
+    ) {
+      throw new Error('tool execution is no longer an active direct registration')
+    }
+    const sessionId = execution.agent?.id
+    return Object.freeze({
+      toolName: definition.name,
+      ...(sessionId !== undefined ? { sessionId } : {}),
+      direct: true as const,
+    })
+  }
+
   private async completeScheduledExecution(prepared: ScheduledToolPreparation): Promise<ToolExecutionResult> {
     switch (prepared.kind) {
       case 'dispatch': {
@@ -1629,7 +1675,13 @@ export class ToolRuntime extends Service {
       const currentTool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
       if (boundTool === undefined || currentTool !== boundTool) throw new ToolNotFoundError(exec.name)
       state.bodyInvoked = true
-      const returned = await boundTool.execute(exec.arguments, exec)
+      this.activeBodyExecutions.add(exec)
+      let returned: unknown
+      try {
+        returned = await boundTool.execute(exec.arguments, exec)
+      } finally {
+        this.activeBodyExecutions.delete(exec)
+      }
       const result = this.createSuccessResult(exec, boundTool, returned)
       return isAborted(signal)
         ? toolAbortedResult(result)
