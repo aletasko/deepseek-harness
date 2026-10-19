@@ -56,6 +56,12 @@ export interface Config {
 }
 
 type ResolvedConfig = Required<Config>
+/** Minimal optional runtime surface used to bind guarded reads to an exact active tool call. */
+interface ActiveToolRuntime {
+  currentActiveExecution(): object | undefined
+  attestActiveExecution(exec: unknown): unknown
+}
+
 const DEFAULT_DIFF_BASIS_MAX_BYTES = 10 * 1024 * 1024
 const MAX_DIFF_BASIS_BYTES = Math.min(
   bufferConstants.MAX_LENGTH,
@@ -224,6 +230,22 @@ export class LocalFileSystem extends FileSystem {
     const authorizer = this.readAuthorizer
     if (authorizer === undefined) {
       throw new FsError('filesystem read denied: no read authorizer is mounted', 'FS_PERMISSION_DENIED')
+    }
+    // The provider is process-global, so a mounted authorizer cannot infer the
+    // caller from its Cordis context. Bind each guarded read to the exact live
+    // direct tool execution in this async call chain before delegating policy.
+    // This rejects missing, copied, stale, nested, and cross-session actors.
+    const runtime = (this.ctx as Context & { tools?: ActiveToolRuntime }).tools
+    let active: object | undefined
+    try {
+      if (runtime === undefined) throw new Error('tool runtime is not mounted')
+      active = runtime.currentActiveExecution()
+      if (active === undefined || active !== access.actor) {
+        throw new Error('actor is not the active tool execution')
+      }
+      runtime.attestActiveExecution(access.actor)
+    } catch (error: unknown) {
+      throw new FsError('filesystem access denied: active tool execution is required', 'FS_PERMISSION_DENIED', { cause: error })
     }
     return async <T>(opened: FsTarget, startRead: () => Promise<T>): Promise<T> => {
       try {

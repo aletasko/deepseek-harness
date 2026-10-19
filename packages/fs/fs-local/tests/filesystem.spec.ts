@@ -12,17 +12,22 @@ import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, utimes, 
 import { tmpdir } from 'node:os'
 import { join, parse, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, Service } from '@deepseek-ai/cordis'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import { FsError, FsReadAuthorizer, FsVersion } from '@deepseek-ai/dsh-fs'
 import type { FsReadAccessContext, FsTarget } from '@deepseek-ai/dsh-fs'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 
 let dir: string
 let ctx: Context
 let fs: LocalFileSystem
 let fiber: Awaited<ReturnType<Context['plugin']>>
 let authorizerFiber: Awaited<ReturnType<Context['plugin']>> | undefined
-let trustedReadActor: object | undefined
+let trustedReadActor: string | undefined
+let testAgents: Map<string, { readonly id: string }> | undefined
+let testCallId = 0
 let allowedOpenedTargetKeys: Set<string> | undefined
 let openedReadTargets: FsTarget[]
 let beforeReadStart: (() => Promise<void>) | undefined
@@ -33,7 +38,8 @@ let readGrantExpiresAt: number | undefined
 class TestReadAuthorizer extends FsReadAuthorizer {
   authorizeOpenedTarget(_requested: FsTarget, opened: FsTarget, access: FsReadAccessContext): void {
     openedReadTargets.push(opened)
-    if (trustedReadActor === undefined || access.actor !== trustedReadActor) {
+    const sessionId = this.ctx.tools.attestActiveExecution(access.actor).sessionId
+    if (trustedReadActor === undefined || sessionId !== trustedReadActor) {
       throw new FsError('untrusted read actor', 'FS_PERMISSION_DENIED')
     }
     if (allowedOpenedTargetKeys !== undefined && !allowedOpenedTargetKeys.has(String(opened.targetKey))) {
@@ -92,9 +98,48 @@ async function remountWithDiffLimit(diffBasisMaxBytes: number): Promise<void> {
 
 async function remountWithReadAuthorizationRequired(): Promise<void> {
   await fiber.dispose()
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
+  testAgents = new Map()
+  await ctx.plugin(class TestAgents extends Service {
+    constructor(pluginCtx: Context, agents: Map<string, { readonly id: string }>) {
+      super(pluginCtx, 'agents')
+      testAgents = agents
+    }
+    get(id: string) { return testAgents?.get(id) }
+  }, testAgents)
   authorizerFiber = await ctx.plugin(TestReadAuthorizer)
   fiber = await ctx.plugin(LocalFileSystem, { cwd: dir, requireReadAuthorization: true })
   fs = ctx.fs as LocalFileSystem
+}
+
+/** Run one provider call from a real active ToolRuntime body in a named session. */
+async function readViaTool<T>(agentId: string, operation: (exec: { signal: AbortSignal; agent?: { id: string } }) => Promise<T>): Promise<T> {
+  if (testAgents === undefined) throw new Error('guarded-read test runtime is not mounted')
+  let agent = testAgents.get(agentId)
+  if (agent === undefined) {
+    agent = { id: agentId }
+    testAgents.set(agentId, agent)
+  }
+  let value: T
+  const name = `test-fs-read-${testCallId}`
+  ctx.tools.register(defineTool({
+    name, description: 'run one filesystem provider call', parameters: {},
+    output: { schema: { type: 'string' }, render: () => [] },
+    async execute(_args, exec) {
+      value = await operation(exec)
+      return 'completed'
+    },
+  }))
+  const result = await ctx.tools.execute({
+    signal: new AbortController().signal,
+    callId: ToolCallId(`fs-local-test-${testCallId++}`),
+    name,
+    arguments: {},
+    agent: agent as never,
+  })
+  if (result.isError) throw new FsError(JSON.stringify(result.content), 'FS_PERMISSION_DENIED')
+  return value!
 }
 
 describe('registration', () => {
@@ -328,14 +373,12 @@ describe('readText / streamText', () => {
     await writeFile(join(dir, 'authorized.txt'), 'secret')
     await remountWithReadAuthorizationRequired()
     const target = await fs.resolve('authorized.txt')
-    const actor = {}
-    trustedReadActor = actor
+    trustedReadActor = 'trusted-reader'
     allowedOpenedTargetKeys = new Set([String(target.targetKey)])
-    const access: FsReadAccessContext = { actor }
 
-    expect(await fs.readText(target, undefined, access)).toBe('secret')
-    await expect(fs.streamText(target, undefined, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
-    expect(Buffer.from(await fs.readBytes(target, undefined, 16, access)).toString()).toBe('secret')
+    expect(await readViaTool(trustedReadActor, exec => fs.readText(target, exec.signal, { actor: exec }))).toBe('secret')
+    await expect(fs.streamText(target, undefined, { actor: {} })).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    expect(Buffer.from(await readViaTool(trustedReadActor, exec => fs.readBytes(target, exec.signal, 16, { actor: exec }))).toString()).toBe('secret')
     expect(openedReadTargets).toHaveLength(2)
     expect(readStartCount).toBe(2)
     expect(openedReadTargets.every(actual => actual.targetKey === target.targetKey)).toBe(true)
@@ -345,14 +388,12 @@ describe('readText / streamText', () => {
     await writeFile(join(dir, 'denied.txt'), 'secret')
     await remountWithReadAuthorizationRequired()
     const target = await fs.resolve('denied.txt')
-    const actor = {}
-    trustedReadActor = actor
+    trustedReadActor = 'trusted-reader'
     allowedOpenedTargetKeys = new Set()
-    const access: FsReadAccessContext = { actor }
 
-    await expect(fs.readText(target, undefined, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
-    await expect(fs.streamText(target, undefined, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
-    await expect(fs.readBytes(target, undefined, 16, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(readViaTool(trustedReadActor, exec => fs.readText(target, exec.signal, { actor: exec }))).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.streamText(target, undefined, { actor: {} })).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(readViaTool(trustedReadActor, exec => fs.readBytes(target, exec.signal, 16, { actor: exec }))).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
     expect(openedReadTargets).toHaveLength(2)
     expect(readStartCount).toBe(0)
   })
@@ -374,8 +415,7 @@ describe('readText / streamText', () => {
     await writeFile(join(dir, 'revoked.txt'), 'secret')
     await remountWithReadAuthorizationRequired()
     const target = await fs.resolve('revoked.txt')
-    const actor = {}
-    trustedReadActor = actor
+    trustedReadActor = 'trusted-reader'
     allowedOpenedTargetKeys = new Set([String(target.targetKey)])
     let entered!: () => void
     let release!: () => void
@@ -383,7 +423,7 @@ describe('readText / streamText', () => {
     const leaseCheck = new Promise<void>((resolve) => { release = resolve })
     beforeReadStart = async () => { entered(); await leaseCheck }
 
-    const read = fs.readText(target, undefined, { actor })
+    const read = readViaTool(trustedReadActor, exec => fs.readText(target, exec.signal, { actor: exec }))
     await authorizerEntered
     expect(readStartCount).toBe(0)
     // Simulate grant revocation during the async ROOM lease recheck. The
@@ -398,8 +438,7 @@ describe('readText / streamText', () => {
     await writeFile(join(dir, 'expired.txt'), 'secret')
     await remountWithReadAuthorizationRequired()
     const target = await fs.resolve('expired.txt')
-    const actor = {}
-    trustedReadActor = actor
+    trustedReadActor = 'trusted-reader'
     allowedOpenedTargetKeys = new Set([String(target.targetKey)])
     let entered!: () => void
     let release!: () => void
@@ -408,7 +447,7 @@ describe('readText / streamText', () => {
     readGrantExpiresAt = 5
     beforeReadStart = async () => { entered(); await leaseCheck }
 
-    const read = fs.readText(target, undefined, { actor })
+    const read = readViaTool(trustedReadActor, exec => fs.readText(target, exec.signal, { actor: exec }))
     await authorizerEntered
     expect(readStartCount).toBe(0)
     readPolicyNow = 5
@@ -422,8 +461,7 @@ describe('readText / streamText', () => {
     await writeFile(path, 'before')
     await remountWithReadAuthorizationRequired()
     const target = await fs.resolve('delayed-start.txt')
-    const actor = {}
-    trustedReadActor = actor
+    trustedReadActor = 'trusted-reader'
     allowedOpenedTargetKeys = new Set([String(target.targetKey)])
     let entered!: () => void
     let release!: () => void
@@ -431,7 +469,7 @@ describe('readText / streamText', () => {
     const leaseCheck = new Promise<void>((resolve) => { release = resolve })
     beforeReadStart = async () => { entered(); await leaseCheck }
 
-    const read = fs.readText(target, undefined, { actor })
+    const read = readViaTool(trustedReadActor, exec => fs.readText(target, exec.signal, { actor: exec }))
     await authorizerEntered
     expect(readStartCount).toBe(0)
     await writeFile(path, 'after')
@@ -490,14 +528,14 @@ describe('readText / streamText', () => {
       await writeFile(outsideFile, 'outside secret')
       await remountWithReadAuthorizationRequired()
       const target = await fs.resolve('replace.txt')
-      trustedReadActor = {}
+    trustedReadActor = 'trusted-reader'
       allowedOpenedTargetKeys = new Set([String(target.targetKey)])
       fs.internals.inspectBeforeReadOpen = async () => {
         await unlink(inWorkspace)
         await symlink(outsideFile, inWorkspace)
       }
 
-      await expect(fs.readText(target, undefined, { actor: trustedReadActor })).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+      await expect(readViaTool(trustedReadActor, exec => fs.readText(target, exec.signal, { actor: exec }))).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
       expect(String(openedReadTargets.at(-1)?.targetKey)).toBe(await realpath(outsideFile))
     } finally {
       await rm(outside, { recursive: true, force: true })
