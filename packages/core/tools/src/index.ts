@@ -1367,7 +1367,8 @@ export class ToolRuntime extends Service {
    * @param exec - the typed same-process call input. The registry assigns its
    *   correlation token before policy begins.
    *   The visible definition is bound to that execution before policy begins,
-   *   so registry changes during policy cannot redirect its dispatch.
+   *   and its identity is rechecked before the body starts. A removed or
+   *   replaced definition fails as unknown; it cannot redirect dispatch.
    * @returns the materialized final result.
    */
   async execute(exec: ToolExecutionInput): Promise<ToolExecutionResult> {
@@ -1583,11 +1584,12 @@ export class ToolRuntime extends Service {
     }
     exec.signal = signal
     try {
-      const tool = this.executionDefinitions.get(exec)
-      if (!tool) throw new ToolNotFoundError(exec.name)
+      const boundTool = this.executionDefinitions.get(exec)
+      const currentTool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
+      if (boundTool === undefined || currentTool !== boundTool) throw new ToolNotFoundError(exec.name)
       state.bodyInvoked = true
-      const returned = await tool.execute(exec.arguments, exec)
-      const result = this.createSuccessResult(exec, tool, returned)
+      const returned = await boundTool.execute(exec.arguments, exec)
+      const result = this.createSuccessResult(exec, boundTool, returned)
       return isAborted(signal)
         ? toolAbortedResult(result)
         : result
@@ -1917,9 +1919,10 @@ function createExecutionToken(): ToolExecutionToken {
 /** Keep registry identity fixed while leaving the documented wrapper signal writable. */
 function lockExecutionIdentity(exec: MutableToolRunContext): void {
   for (const field of ['callId', 'rootCallId', 'name', 'schema', 'arguments', 'agent', 'parent', 'token'] as const) {
-    Object.defineProperty(exec, field, { configurable: false, writable: false })
+    if (Object.hasOwn(exec, field)) Object.defineProperty(exec, field, { configurable: false, writable: false })
   }
   Object.defineProperty(exec, 'signal', { configurable: false, writable: true })
+  Object.preventExtensions(exec)
 }
 
 function toolErrorResult(error: unknown): ToolExecutionResult {

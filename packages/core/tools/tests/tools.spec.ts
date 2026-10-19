@@ -162,10 +162,12 @@ describe('ToolRuntime', () => {
     expect(observed).toEqual(result)
   })
 
-  it('dispatches the definition selected before pre-execute even if the global registration is replaced', async () => {
+  it('denies dispatch when the global definition is replaced during pre-execute', async () => {
     const ctx = await setup()
-    const original = { ...echoTool, name: 'bound-global', async execute() { return 'original' } }
-    const replacement = { ...echoTool, name: 'bound-global', async execute() { return 'replacement' } }
+    let originalCalls = 0
+    let replacementCalls = 0
+    const original = { ...echoTool, name: 'bound-global', async execute() { originalCalls++; return 'original' } }
+    const replacement = { ...echoTool, name: 'bound-global', async execute() { replacementCalls++; return 'replacement' } }
     const disposeOriginal = ctx.tools.register(original)
     let replaced = false
     ctx.on('tools/pre-execute', async (_exec, next) => {
@@ -184,7 +186,9 @@ describe('ToolRuntime', () => {
         name: 'bound-global',
         arguments: {},
       })
-      expect(result).toEqual({ content: [{ type: 'text', text: 'original' }], isError: false, value: 'original' })
+      expect(result.isError).toBe(true)
+      expect(result.content).toEqual([{ type: 'text', text: 'Error: unknown tool "bound-global"' }])
+      expect({ originalCalls, replacementCalls }).toEqual({ originalCalls: 0, replacementCalls: 0 })
     } finally { await ctx.fiber.dispose() }
   })
 
@@ -194,6 +198,7 @@ describe('ToolRuntime', () => {
     let bodyName: string | undefined
     let bodyText: string | undefined
     let mutationResults: boolean[] = []
+    let optionalPropertiesPresent: boolean[] = []
     ctx.tools.register(defineTool({
       name: 'bound-identity',
       description: 'bound identity',
@@ -213,7 +218,11 @@ describe('ToolRuntime', () => {
       mutationResults = [
         Reflect.set(exec, 'name', 'benign'),
         Reflect.set(exec, 'arguments', { text: 'swapped' }),
+        Reflect.set(exec, 'agent', {}),
+        Reflect.set(exec, 'parent', Symbol('injected-parent')),
+        Reflect.set(exec, 'schema', {}),
       ]
+      optionalPropertiesPresent = ['agent', 'parent', 'schema'].map(field => Object.hasOwn(exec, field))
       return next()
     })
 
@@ -225,11 +234,12 @@ describe('ToolRuntime', () => {
         arguments: { text: 'original' },
       })
       expect(result.isError).toBe(false)
-      expect({ guardName, bodyName, bodyText, mutationResults }).toEqual({
+      expect({ guardName, bodyName, bodyText, mutationResults, optionalPropertiesPresent }).toEqual({
         guardName: 'bound-identity',
         bodyName: 'bound-identity',
         bodyText: 'original',
-        mutationResults: [false, false],
+        mutationResults: [false, false, false, false, false],
+        optionalPropertiesPresent: [false, false, false],
       })
     } finally { await ctx.fiber.dispose() }
   })
