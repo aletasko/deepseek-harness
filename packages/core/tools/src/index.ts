@@ -827,6 +827,8 @@ export class ToolRuntime extends Service {
   private concludingExecutions = new WeakSet<ToolExecution>()
   /** Original caller cancellation, kept outside the wrapper-mutable execution object. */
   private cancellationStates = new WeakMap<ToolRunContext, ToolCancellationState>()
+  /** Definition selected before policy runs, keyed by the registry-minted execution. */
+  private executionDefinitions = new WeakMap<ToolRunContext, ToolDefinition | undefined>()
   /** Definition-owned final content transform snapshotted before policy begins. */
   private contentFinalizers = new WeakMap<ToolRunContext, ToolDefinition['finalizeContent']>()
   /** Execution-prepared content installed before post-execute policy. */
@@ -1077,6 +1079,12 @@ export class ToolRuntime extends Service {
       throw new TypeError(`tool "${name}" must declare output { schema, render, presentationMeta? }`)
     }
     assertSupportedJsonSchema(output.schema)
+    const parameters = snapshotJsonValue(definition.parameters)
+      ?? cloneRegistrationValue(definition.parameters)
+    const outputSchema = snapshotJsonValue(output.schema)
+    if (outputSchema === undefined) {
+      throw new TypeError(`tool "${name}" output schema must be lossless JSON at registration`)
+    }
     const timeoutMs = definition.timeoutMs
     if (timeoutMs !== undefined
       && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
@@ -1088,9 +1096,39 @@ export class ToolRuntime extends Service {
     if (name === RUN_CODE_NAME) {
       throw new Error(`tool name "${RUN_CODE_NAME}" is reserved for the PTC mode presentation transport and cannot be registered or shadowed`)
     }
+    // Keep registry identity independent from producer-owned mutable fields.
+    const registered = {
+      name,
+      description: definition.description,
+      parameters,
+      ...(definition.deferLoading === true ? { deferLoading: true as const } : {}),
+      output: {
+        schema: outputSchema as JsonSchemaNode,
+        render: output.render,
+        ...(output.presentationMeta !== undefined ? { presentationMeta: output.presentationMeta } : {}),
+      },
+      execute: definition.execute,
+      ...(definition.projectContent !== undefined ? { projectContent: definition.projectContent } : {}),
+      ...(definition.finalizeContent !== undefined ? { finalizeContent: definition.finalizeContent } : {}),
+      ...(definition.timeoutMs !== undefined ? { timeoutMs: definition.timeoutMs } : {}),
+      ...(definition.isConcurrencySafe !== undefined ? { isConcurrencySafe: definition.isConcurrencySafe } : {}),
+      ...(definition.presentCall !== undefined ? { presentCall: definition.presentCall } : {}),
+      ...(definition.presentResult !== undefined ? { presentResult: definition.presentResult } : {}),
+    } satisfies ToolDefinition
+    registered.execute = registered.execute.bind(registered)
+    registered.output.render = registered.output.render.bind(registered.output)
+    if (registered.output.presentationMeta !== undefined) {
+      registered.output.presentationMeta = registered.output.presentationMeta.bind(registered.output)
+    }
+    if (registered.projectContent !== undefined) registered.projectContent = registered.projectContent.bind(registered)
+    if (registered.finalizeContent !== undefined) registered.finalizeContent = registered.finalizeContent.bind(registered)
+    if (registered.isConcurrencySafe !== undefined) registered.isConcurrencySafe = registered.isConcurrencySafe.bind(registered)
+    if (registered.presentCall !== undefined) registered.presentCall = registered.presentCall.bind(registered)
+    if (registered.presentResult !== undefined) registered.presentResult = registered.presentResult.bind(registered)
+    deepFreeze(registered)
     return this.layers.effect(
       this.ctx,
-      layer => layer.tools.insert(name, definition),
+      layer => layer.tools.insert(name, registered),
       { label: 'tools.register()' },
     )
   }
@@ -1451,6 +1489,8 @@ export class ToolRuntime extends Service {
         throw new TypeError('tool execution arguments must be losslessly JSON-serializable')
       }
       const execution: MutableToolRunContext = { ...base, arguments: deepFreeze(detached) }
+      lockExecutionIdentity(execution)
+      this.executionDefinitions.set(execution, collapsed ? undefined : visible)
       this.deferredContexts.set(execution, deferredContexts)
       this.contentFinalizers.set(execution, finalizerFor())
       if (!collapsed) this.contentProjectors.set(execution, capturedProjector)
@@ -1483,6 +1523,8 @@ export class ToolRuntime extends Service {
       return { kind: 'ready', exec: execution }
     } catch (error: unknown) {
       const execution: MutableToolRunContext = { ...base, arguments: undefined }
+      lockExecutionIdentity(execution)
+      this.executionDefinitions.set(execution, collapsed ? undefined : visible)
       this.contentFinalizers.set(execution, finalizerFor())
       return { kind: 'final-result', exec: execution, result: toolErrorResult(error) }
     }
@@ -1583,11 +1625,12 @@ export class ToolRuntime extends Service {
     }
     exec.signal = signal
     try {
-      const tool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
-      if (!tool) throw new ToolNotFoundError(exec.name)
+      const boundTool = this.executionDefinitions.get(exec)
+      const currentTool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
+      if (boundTool === undefined || currentTool !== boundTool) throw new ToolNotFoundError(exec.name)
       state.bodyInvoked = true
-      const returned = await tool.execute(exec.arguments, exec)
-      const result = this.createSuccessResult(exec, tool, returned)
+      const returned = await boundTool.execute(exec.arguments, exec)
+      const result = this.createSuccessResult(exec, boundTool, returned)
       return isAborted(signal)
         ? toolAbortedResult(result)
         : result
@@ -1912,6 +1955,38 @@ export class ToolRuntime extends Service {
 /** Mint a same-process correlation token whose identity is its value. */
 function createExecutionToken(): ToolExecutionToken {
   return Symbol('dsh.tool.execution') as ToolExecutionToken
+}
+
+/** Detach a raw schema graph while preserving malformed values for later validation. */
+function cloneRegistrationValue<T>(value: T, seen = new Map<object, object>()): T {
+  if (value === null || typeof value !== 'object') return value
+  const prior = seen.get(value)
+  if (prior !== undefined) return prior as T
+  const clone: object = Array.isArray(value)
+    ? []
+    : Object.create(Object.getPrototypeOf(value)) as object
+  seen.set(value, clone)
+  for (const key of Reflect.ownKeys(value)) {
+    if (Array.isArray(value) && key === 'length') continue
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (descriptor === undefined) continue
+    Object.defineProperty(clone, key, {
+      configurable: true,
+      enumerable: descriptor.enumerable === true,
+      writable: true,
+      value: cloneRegistrationValue(Reflect.get(value, key), seen),
+    })
+  }
+  return clone as T
+}
+
+/** Keep registry identity fixed while leaving the documented wrapper signal writable. */
+function lockExecutionIdentity(exec: MutableToolRunContext): void {
+  for (const field of ['callId', 'rootCallId', 'name', 'schema', 'arguments', 'agent', 'parent', 'token'] as const) {
+    if (Object.hasOwn(exec, field)) Object.defineProperty(exec, field, { configurable: false, writable: false })
+  }
+  Object.defineProperty(exec, 'signal', { configurable: false, writable: true })
+  Object.preventExtensions(exec)
 }
 
 function toolErrorResult(error: unknown): ToolExecutionResult {
