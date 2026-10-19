@@ -88,14 +88,29 @@ export abstract class FsReadAuthorizer extends Service {
   }
 
   /**
-   * Authorize the object attached to the open handle before its bytes are read.
-   * Implementations must use target identity, never `displayPath` or raw input.
-   * @param requested - the target selected by the caller before opening.
-   * @param opened - the target identified from the provider's already-open file handle.
-   * @param access - per-call execution context supplied by trusted code.
-   * @throws when this call is not authorized.
+   * Legacy preflight retained for source compatibility. Guarded providers do
+   * not treat this check as permission to read; implement
+   * {@link authorizeAndStart} to authorize and start protected I/O atomically.
    */
   abstract authorizeOpenedTarget(requested: FsTarget, opened: FsTarget, access: FsReadAccessContext): void | Promise<void>
+
+  /**
+   * Authorize a provider-opened target and start its read while authorization
+   * locks are held. The provider callback must synchronously begin I/O and
+   * return its completion promise. Implementations must invoke it once, before
+   * this method settles. Legacy authorizers deny by default in guarded mode.
+   * @param opened - target identity derived from the provider's open handle.
+   * @param access - per-call execution context supplied by trusted code.
+   * @param startRead - provider-owned callback that starts I/O on that handle.
+   * @returns the started read result after authorization has released its locks.
+   */
+  authorizeAndStart<T>(
+    _opened: FsTarget,
+    _access: FsReadAccessContext,
+    _startRead: () => Promise<T>,
+  ): Promise<T> {
+    return Promise.reject(new FsError('provider read authorizer does not support locked read start', 'FS_PERMISSION_DENIED'))
+  }
 }
 
 /**

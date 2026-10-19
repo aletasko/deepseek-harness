@@ -51,7 +51,7 @@ export interface Config {
    * runtime's safe allocation/decode maximum. Defaults to 10 MiB.
    */
   diffBasisMaxBytes?: number
-  /** Require a trusted per-call authorizer for text, stream, and raw-byte reads. Defaults to false. */
+  /** Require a trusted per-call authorizer for every content read. Defaults to false. */
   requireReadAuthorization?: boolean
 }
 
@@ -117,7 +117,7 @@ export class LocalFileSystem extends FileSystem {
       throw new Error(`fs-local: diffBasisMaxBytes must be a positive safe integer no greater than ${MAX_DIFF_BASIS_BYTES}`)
     }
     const readAuthorizer = resolved.requireReadAuthorization
-      ? ctx.get('fsReadAuthorizer') as FsReadAuthorizer | undefined
+      ? ctx.get('fsReadAuthorizer')
       : undefined
     if (resolved.requireReadAuthorization && readAuthorizer === undefined) {
       throw new Error('fs-local: requireReadAuthorization needs a mounted fsReadAuthorizer service')
@@ -194,7 +194,12 @@ export class LocalFileSystem extends FileSystem {
     return streamWholeText({ displayPath: target.displayPath, targetKey: target.targetKey }, signal, authorize, this.internals)
   }
 
-  override async readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number, access?: FsReadAccessContext): Promise<Uint8Array> {
+  override async readBytes(
+    target: FsTarget,
+    signal: AbortSignal | undefined,
+    maxBytes: number,
+    access?: FsReadAccessContext,
+  ): Promise<Uint8Array> {
     const authorize = this.readAuthorizerFor(access)
     return readWholeBytes({ displayPath: target.displayPath, targetKey: target.targetKey }, signal, maxBytes, this.internals, authorize)
   }
@@ -206,7 +211,9 @@ export class LocalFileSystem extends FileSystem {
     return readByteWindow({ displayPath: target.displayPath, targetKey: target.targetKey }, range, signal)
   }
 
-  private readAuthorizerFor(access: FsReadAccessContext | undefined): ((requested: FsTarget, opened: FsTarget) => void | Promise<void>) | undefined {
+  private readAuthorizerFor(
+    access: FsReadAccessContext | undefined,
+  ): (<T>(opened: FsTarget, startRead: () => Promise<T>) => Promise<T>) | undefined {
     if (!this.config.requireReadAuthorization) return undefined
     if (access === undefined) {
       throw new FsError('filesystem read denied: per-call authorization is required', 'FS_PERMISSION_DENIED')
@@ -215,9 +222,9 @@ export class LocalFileSystem extends FileSystem {
     if (authorizer === undefined) {
       throw new FsError('filesystem read denied: no read authorizer is mounted', 'FS_PERMISSION_DENIED')
     }
-    return async (requested, opened) => {
+    return async <T>(opened: FsTarget, startRead: () => Promise<T>): Promise<T> => {
       try {
-        await authorizer.authorizeOpenedTarget(requested, opened, access)
+        return await authorizer.authorizeAndStart(opened, access, startRead)
       } catch (error: unknown) {
         if (error instanceof FsError) throw error
         throw new FsError('filesystem access denied by provider read authorizer', 'FS_PERMISSION_DENIED', { cause: error })
