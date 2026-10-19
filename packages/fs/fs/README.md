@@ -33,7 +33,7 @@ Pick [`fs-local`](../fs-local/README.md) for ordinary host files or [`fs-sandbox
 
 ### What the service lets you do
 
-Through `ctx.fs` you can resolve any path to a stable target identity, read a whole text file or stream it in chunks, read raw bytes up to an explicit cap, list one directory level, atomically create or replace a file, and apply a literal text edit atomically. The version guard on both mutations is optional: omit it for unconditional create-or-overwrite, or supply it to fail when the file changed since you last observed it. Read, listing, and mutation failures are typed `FsError`s with stable codes such as `FS_NOT_FOUND`, `FS_STALE_VERSION`, or `FS_AMBIGUOUS_EDIT`, so callers branch on the code, never on message text.
+Through `ctx.fs` you can resolve any path to a stable target identity, read a whole text file or stream it in chunks, read raw bytes up to an explicit cap, list one directory level, atomically create or replace a file, and apply a literal text edit atomically. A provider can enable guarded reads and require a per-call `FsReadAccessContext`; the trusted provider-owned `FsReadAuthorizer` then checks the requested and actually opened target before exposing bytes. Authorization uses backend-issued `targetKey` values, never raw arguments or display paths. Providers that cannot identify the opened object must reject guarded reads. With guarded mode disabled, providers retain their existing read policy. The version guard on both mutations is optional: omit it for unconditional create-or-overwrite, or supply it to fail when the file changed since you last observed it. Read, listing, and mutation failures are typed `FsError`s with stable codes such as `FS_NOT_FOUND`, `FS_PERMISSION_DENIED`, `FS_STALE_VERSION`, or `FS_AMBIGUOUS_EDIT`, so callers branch on the code, never on message text.
 
 `watch(target, changed, signal)` reports invalidations for one file or a directory's direct entries. It resolves once observation is ready with an asynchronous close function that the caller must await. The signal cancels initialization; unsupported providers reject without polling.
 
@@ -115,6 +115,7 @@ These limits define when the contract is a poor fit or needs special operational
 - **No delete, rename, or copy** — `listDir` lists a single level, with recursion, globbing, pagination, and search out of scope ([directory-listing note](../../../.agents/notes/archived/architecture/2026-07-03-filesystem-directory-listing-seam.md)).
 - **No I/O deadline** — the seam arms no timeout; cancellation is a best-effort optional `AbortSignal` per primitive ([fs family stance](../README.md)).
 - **Resolve-then-operate costs a remote backend two round-trips per tool call** — folding or caching resolution is left to such a backend.
+- **Opened-target authorization is provider-configured and opt-in** — guarded providers require a per-call actor context and invoke their own trusted authorizer; callers cannot provide an allow callback. `fs-local` implements handle-bound authorization on Linux. `fs-ssh` rejects guarded reads until its remote helper can validate the actual opened object. Byte-window reads are denied by guarded `fs-local`; directory listings are metadata-only. `writeText` and `editText` remain outside this first slice.
 
 <a id="dev-note"></a>
 ### Dev Note

@@ -67,6 +67,12 @@ export interface FsTarget {
   displayPath: string
 }
 
+/** Per-call caller identity passed to the provider-owned read authorizer. */
+export interface FsReadAccessContext {
+  /** Opaque trusted execution identity, typically the current tool execution. */
+  actor: object
+}
+
 /**
  * Metadata about a target — what {@link FileSystem.stat} returns. Lets the
  * policy layer reject directories/special files before reading and choose

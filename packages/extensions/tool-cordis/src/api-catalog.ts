@@ -1162,21 +1162,21 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'metadata only, never content; undefined for an absent path.',
       },
       {
-        signature: 'abstract readText(target: FsTarget, signal?: AbortSignal): Promise<string>',
+        signature: 'abstract readText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<string>',
         description: 'Read the whole regular text file as a single decoded string.',
-        parameters: [{ name: 'target', description: 'the resolved target to read.' }, { name: 'signal', description: 'aborts the read.' }],
+        parameters: [{ name: 'target', description: 'the resolved target to read.' }, { name: 'signal', description: 'aborts the read.' }, { name: 'access', description: 'per-call identity for the provider-owned authorizer; required when guarded reads are enabled.' }],
         returns: 'the full decoded UTF-8 content.',
       },
       {
-        signature: 'abstract streamText(target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>>',
+        signature: 'abstract streamText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<AsyncIterable<string>>',
         description: 'Stream the whole regular text file as decoded text chunks (same text semantics as readText, for large files). The backend owns cross-chunk UTF-8 decoding and binary rejection so the policy layer never touches raw bytes.',
-        parameters: [{ name: 'target', description: 'the resolved target to read.' }, { name: 'signal', description: 'aborts the stream, including between chunks.' }],
+        parameters: [{ name: 'target', description: 'the resolved target to read.' }, { name: 'signal', description: 'aborts the stream, including between chunks.' }, { name: 'access', description: 'per-call identity for the provider-owned authorizer; required when guarded reads are enabled.' }],
         returns: 'the chunk iterable, decoded and validated like {@link readText}.',
       },
       {
-        signature: 'abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array>',
+        signature: 'abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number, access?: FsReadAccessContext): Promise<Uint8Array>',
         description: 'Read the whole regular file as raw bytes with no decoding or binary rejection. The bound lives at this seam so a backend can never buffer an unbounded file: a target known or discovered to exceed `maxBytes` fails with `FS_TOO_LARGE` instead of returning a truncated result.',
-        parameters: [{ name: 'target', description: 'the resolved target to read.' }, { name: 'signal', description: 'aborts the read.' }, { name: 'maxBytes', description: 'inclusive byte cap on the complete content.' }],
+        parameters: [{ name: 'target', description: 'the resolved target to read.' }, { name: 'signal', description: 'aborts the read.' }, { name: 'maxBytes', description: 'inclusive byte cap on the complete content.' }, { name: 'access', description: 'per-call identity for the provider-owned authorizer; required when guarded reads are enabled.' }],
         returns: 'the full raw content, at most `maxBytes` long.',
       },
       {

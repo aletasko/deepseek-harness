@@ -1376,7 +1376,7 @@ export interface Config {
 
 ## `@deepseek-ai/dsh-fs-local`
 
-- `source`: [`packages/fs/fs-local/src/index.ts:45`](../packages/fs/fs-local/src/index.ts)
+- `source`: [`packages/fs/fs-local/src/index.ts:46`](../packages/fs/fs-local/src/index.ts)
 
 ```ts config-catalog
 /** Configuration for the local filesystem backend. */
@@ -1388,6 +1388,8 @@ export interface Config {
    * runtime's safe allocation/decode maximum. Defaults to 10 MiB.
    */
   diffBasisMaxBytes?: number
+  /** Require a trusted per-call authorizer for text, stream, and raw-byte reads. Defaults to false. */
+  requireReadAuthorization?: boolean
 }
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-fs-local -->

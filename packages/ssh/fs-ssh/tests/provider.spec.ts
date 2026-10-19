@@ -1,6 +1,6 @@
 import { Context, Service } from '@deepseek-ai/cordis'
 import { fileURLToPath } from 'node:url'
-import { FsError, FsTargetKey, FsVersion, type FsTarget } from '@deepseek-ai/dsh-fs'
+import { FsError, FsTargetKey, FsVersion, type FsReadAccessContext, type FsTarget } from '@deepseek-ai/dsh-fs'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import { RemoteOperationError } from '@deepseek-ai/dsh-ssh/protocol'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
@@ -100,6 +100,15 @@ describe('SSH filesystem provider', () => {
     expect(await fs.readByteRange(target, { offset: 1, length: 2 })).toEqual(bytes.subarray(1, 3))
     expect(dispatch.mock.calls[1]).toEqual(['fs.readBytes', { target, maxBytes: 64 }, undefined])
     expect(dispatch.mock.calls[2]).toEqual(['fs.readRange', { target, offset: 1, length: 2 }, undefined])
+  })
+
+  it('fails closed for opened-target authorization until the remote helper supports it', async () => {
+    const { fs, dispatch } = await setup()
+    const access: FsReadAccessContext = { actor: {} }
+    await expect(fs.readText(target, undefined, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.streamText(target, undefined, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.readBytes(target, undefined, 4, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    expect(dispatch).not.toHaveBeenCalled()
   })
 
   it('forwards mutation guards and explicit per-call policy without normalizing remote roots', async () => {
