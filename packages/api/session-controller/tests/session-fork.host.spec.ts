@@ -9,7 +9,7 @@ import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
 import { MockAdapter, textResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
 import { ToolCallId, createMessage, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
-import SessionStore, { TOOL_OUTCOME_UNKNOWN, SESSION_FORMAT_VERSION, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
+import SessionStore, { dshRoomLeaseIssuer, TOOL_OUTCOME_UNKNOWN, SESSION_FORMAT_VERSION, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceRevision, type SessionPersistenceSnapshot } from '@deepseek-ai/dsh-session-persistence'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -96,6 +96,82 @@ const remote = (ctx: Context) => createSessionTestRemote(ctx, {
 })
 
 describe('sessions.fork', () => {
+  it('attests an ordinary API fork from its exact API-issued live conversation', async () => {
+    const ctx = await composed()
+    try {
+      const created = await remote(ctx).create({ cwd: '/tmp' })
+      if (!created.ok) throw created.error
+      const source = ctx.sessions.get(created.value.sessionId)!
+      source.append('turn/start', { turn: 1 })
+      source.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+
+      const forked = await remote(ctx).fork({ sessionId: source.id })
+
+      if (!forked.ok) throw forked.error
+      expect(ctx.sessions.provenance.attest(ctx.sessions.get(forked.value.sessionId)!)).toMatchObject({
+        state: 'nonroom_verified', source: '@deepseek-ai/dsh-api-session-controller',
+        scope: { kind: 'conversation' },
+      })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('does not attest a fork when its source claim is revoked during Agent creation', async () => {
+    const ctx = await composed()
+    try {
+      const created = await remote(ctx).create({ cwd: '/tmp' })
+      if (!created.ok) throw created.error
+      const source = ctx.sessions.get(created.value.sessionId)!
+      source.append('turn/start', { turn: 1 })
+      source.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+      const createAgent = ctx.agents.create.bind(ctx.agents)
+      vi.spyOn(ctx.agents, 'create').mockImplementation(async options => {
+        const result = await createAgent(options)
+        ctx.sessions.provenance.revoke(source)
+        return result
+      })
+
+      const forked = await remote(ctx).fork({ sessionId: source.id })
+
+      if (!forked.ok) throw forked.error
+      expect(ctx.sessions.provenance.attest(ctx.sessions.get(forked.value.sessionId)!)).toMatchObject({
+        state: 'unknown', reason: 'not_attested',
+      })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('does not infer API provenance from fork lineage or ROOM provenance', async () => {
+    const ctx = await composed()
+    try {
+      const forged = await liveAgent(ctx, 'forged-lineage-source', 1, 'none', {
+        parentSession: sid('untrusted-parent'), origin: 'subagent',
+      })
+      const room = await liveAgent(ctx, 'room-source', 1)
+      ctx.sessions.provenance.issue(room, dshRoomLeaseIssuer, {
+        kind: 'room', source: '@myh/dsh-stanze', sourceVersion: '1',
+        roomId: 1, orgId: '9', agent: 'agent_1',
+      })
+
+      const forgedRequest = Object.assign({ sessionId: forged.id }, { parentSession: sid('request-parent') })
+      const forgedFork = await remote(ctx).fork(forgedRequest)
+      const roomFork = await remote(ctx).fork({ sessionId: room.id })
+
+      if (!forgedFork.ok) throw forgedFork.error
+      if (!roomFork.ok) throw roomFork.error
+      expect(ctx.sessions.provenance.attest(ctx.sessions.get(forgedFork.value.sessionId)!)).toMatchObject({
+        state: 'unknown', reason: 'not_attested',
+      })
+      expect(ctx.sessions.provenance.attest(ctx.sessions.get(roomFork.value.sessionId)!)).toMatchObject({
+        state: 'unknown', reason: 'not_attested',
+      })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it.each([
     { allowMigration: undefined, status: 'current' },
     { allowMigration: false, status: 'current' },

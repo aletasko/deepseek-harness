@@ -16,7 +16,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type { MessageSource } from '@deepseek-ai/dsh-llm'
 import { buildForkSeed } from '@deepseek-ai/dsh-session/fork'
-import { SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
+import { apiSessionControllerIssuer, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionHeader, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
 import { SessionQueryError, type SessionObservation } from '@deepseek-ai/dsh-session-query'
 import { SessionTitleInvalidError } from '@deepseek-ai/dsh-session-title'
@@ -259,6 +259,18 @@ export class SessionCommandController {
       )
     }
     const seed = buildForkSeed(source.events, boundary)
+    // A fork inherits API provenance only from the exact live source Session
+    // when that source already has an API-issued conversation claim. Header
+    // lineage and request data never establish this authority.
+    const liveSource = this.ctx.sessions.get(source.header.id)
+    const sourceProvenance = liveSource === undefined
+      ? undefined
+      : this.ctx.sessions.provenance.attest(liveSource)
+    const apiSourceRevision = sourceProvenance?.state === 'nonroom_verified'
+      && sourceProvenance.source === '@deepseek-ai/dsh-api-session-controller'
+      && sourceProvenance.scope.kind === 'conversation'
+      ? sourceProvenance.revision
+      : undefined
     let workspace: Workspace | undefined
     try {
       workspace = await this.forkWorkspace(source.header)
@@ -273,7 +285,7 @@ export class SessionCommandController {
     const composition = await this.agents.composeAgent(this.agents.presetForObservation(source))
     try {
       const { provider, model } = this.ctx.agentDefaultModel.currentSelection()
-      await this.ctx.agents.create({
+      const { agent } = await this.ctx.agents.create({
         sessionId: childId,
         seed,
         inheritedEventCount: SessionLogOffset(boundary + 1),
@@ -288,6 +300,22 @@ export class SessionCommandController {
         agentOptions: { provider, model },
         setup: composition.setup,
       })
+      // Revalidate after all asynchronous creation work. No await may occur
+      // between this exact-object/revision check and issuing the child claim.
+      const currentSource = liveSource === undefined
+        ? undefined
+        : this.ctx.sessions.get(source.header.id) === liveSource
+          ? this.ctx.sessions.provenance.attest(liveSource, apiSourceRevision)
+          : undefined
+      if (apiSourceRevision !== undefined
+        && currentSource?.state === 'nonroom_verified'
+        && currentSource.source === '@deepseek-ai/dsh-api-session-controller'
+        && currentSource.scope.kind === 'conversation') {
+        this.ctx.sessions.provenance.issue(agent.session, apiSessionControllerIssuer, {
+          kind: 'nonroom', source: '@deepseek-ai/dsh-api-session-controller', sourceVersion: '1',
+          scope: { kind: 'conversation' },
+        })
+      }
     } catch (error) {
       throw new RemoteError(
         'gateway/internal',
