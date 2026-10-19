@@ -52,6 +52,14 @@ import { createProcessInspector } from './process-inspector.ts'
 import type { ProcessInspector } from './process-inspector.ts'
 import { LocalTerminalHandle } from './terminal.ts'
 import { prepareShellActivity } from './shell-activity.ts'
+import {
+  assertBrokerConfig,
+  bindBrokerProcess,
+  BrokerTerminalHandle,
+  launchBrokerProcess,
+  terminalEnv,
+} from './broker.ts'
+import type { SubprocessBrokerConfig } from './broker.ts'
 
 const requireNodePty = createLazyRequire<typeof NodePty>('node-pty', import.meta.url)
 
@@ -67,6 +75,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   private live = new Set<LocalSubprocessHandle>()
   /** Live terminals retained through normal quiescence or host-exit finalization. */
   private terminals = new Set<LocalTerminalHandle>()
+  private brokerTerminals = new Set<BrokerTerminalHandle>()
   /** Caller endpoints retained until close, independently of managed process lifetime. */
   private controlChannels = new Set<Duplex>()
   /** Test hook: process, spill, and platform operations forwarded to spawnSubprocess. */
@@ -87,9 +96,11 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   private linuxScopeDecision: Extract<LinuxScopeDecision, { kind: 'scope' }> | undefined
   /** Test hook for platform process inspection; production resolves lazily on terminal spawn. */
   terminalInspector: ProcessInspector | undefined
+  private readonly brokerConfig: SubprocessBrokerConfig | undefined
 
   constructor(ctx: Context, config: SubprocessConfig = {}) {
     super(ctx, config)
+    this.brokerConfig = assertBrokerConfig(ctx.reflect.get('subprocessBrokerConfig') as SubprocessBrokerConfig | undefined)
     ctx.effect(() => {
       const onHostExit = (): void => { this.terminateForHostExit() }
       process.prependListener('exit', onHostExit)
@@ -118,6 +129,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
         // One terminal must not prevent final termination of another target.
       }
     }
+    for (const terminal of this.brokerTerminals) terminal.terminateForHostExit()
   }
 
   private async disposeManagedProcesses(): Promise<void> {
@@ -137,6 +149,9 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     }
     for (const terminal of this.terminals) {
       pending.push(terminal.terminate().then(() => { this.terminals.delete(terminal) }))
+    }
+    for (const terminal of this.brokerTerminals) {
+      pending.push(terminal.terminate().then(() => { this.brokerTerminals.delete(terminal) }))
     }
     const outcomes = await Promise.allSettled(pending)
     await Promise.all([...this.controlChannels].map(control => new Promise<void>((resolveClose) => {
@@ -200,10 +215,13 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     validateSubprocessSpec(spec)
     this.authorizeStart({ kind: 'spawn', argv: spec.argv, cwd: spec.cwd })
     const env = targetEnvironment(spec)
-    const containmentMode = this.selectContainmentMode('ordinary')
+    const containmentMode = this.brokerConfig === undefined ? this.selectContainmentMode('ordinary') : undefined
     let handle: LocalSubprocessHandle
     const internals: SpawnInternals = { ...this.internals, onSpillFailure: this.reportSpillFailure }
-    if (containmentMode === 'fallback') {
+    if (this.brokerConfig !== undefined) {
+      const binding = prepareManagedProcessBinding(internals)
+      handle = bindBrokerProcess(spec, launchBrokerProcess(spec, env, this.brokerConfig, spec.signal), binding)
+    } else if (containmentMode === 'fallback') {
       handle = spawnSubprocess(spec, internals)
     } else {
       const binding = prepareManagedProcessBinding(internals)
@@ -298,6 +316,22 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     }
     spec.signal?.throwIfAborted()
     this.authorizeStart({ kind: 'terminal', argv: spec.argv, cwd: spec.cwd })
+    if (this.brokerConfig !== undefined) {
+      const env = targetEnvironment(spec)
+      const handle = new BrokerTerminalHandle(this.brokerConfig, spec, terminalEnv(spec, env))
+      this.brokerTerminals.add(handle)
+      try {
+        await handle.ready
+      } catch (error) {
+        this.brokerTerminals.delete(handle)
+        throw error
+      }
+      const release = async (): Promise<void> => {
+        try { await handle.terminate() } finally { this.brokerTerminals.delete(handle) }
+      }
+      void handle.done.then(release, release).catch(() => {})
+      return handle
+    }
     const inspector = this.terminalInspector ?? createProcessInspector()
     const containmentMode = this.selectContainmentMode('terminal')
     const env = targetEnvironment(spec)
@@ -377,3 +411,4 @@ function environmentValue(env: NodeJS.ProcessEnv, name: 'PATH' | 'PATHEXT'): str
 }
 
 export default LocalSubprocessRuntime
+export type { SubprocessBrokerConfig } from './broker.ts'

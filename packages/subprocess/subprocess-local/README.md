@@ -5,6 +5,46 @@ kind: "package-reference"
 
 # @deepseek-ai/dsh-subprocess-local
 
+## Trusted broker route (draft)
+
+The local provider can opt into a host supplied Unix socket broker by providing
+`subprocessBrokerConfig` on the trusted Cordis context before loading this
+provider:
+
+```ts
+ctx.provide('subprocessBrokerConfig', {
+  socketPath: '/run/dsh-subprocess-broker.sock',
+  assignmentId: 'host-issued-worktree-assignment',
+})
+```
+
+When present, ordinary processes and PTY terminals use only that broker. A
+missing socket, rejected request, or invalid protocol event fails closed. The
+provider does not fall back to `systemd-run`, `node:child_process.spawn`, or
+`node-pty`. The request carries literal `argv`, `cwd`, effective child `env`,
+stdio dispositions, and the trusted assignment identifier. It never carries
+the requested UID or path authorization policy; the broker must resolve those
+from its own assignment table and must authenticate the local Core peer.
+The broker must canonicalize and validate `cwd` beneath the root named by the
+assignment, including symlinks and races. The requested `cwd` is an execution
+parameter, never the authorization rule.
+
+The newline framed v1 client protocol is a draft. Process requests receive an
+`accepted` handle, stdout/stderr and PTY data events, one `outcome`, and an
+`empty` event after the managed range is quiescent. For both process and PTY,
+the broker may send output after the direct `outcome`; it must send `empty`
+only after the full managed range is quiescent, and the client closes output
+streams only at `empty`. PTY operations use request
+IDs and responses for input, resize, foreground inspection, activity
+inspection, and foreground signals. Cancellation asks the broker to terminate
+the full range; `waitForExit()` settles only on `empty`. A terminal cancel
+remains valid after `outcome` until `empty`, because descendants may remain.
+PTY RPCs time out after ten seconds and close the connection; the broker must
+tear down the managed range on disconnect. The broker must also
+terminate the range when the client disconnects, including protocol failure or
+host shutdown. A matching broker implementation and protocol review are
+required before deployment.
+
 English | [中文](README.zh.md)
 
 ## Summary
