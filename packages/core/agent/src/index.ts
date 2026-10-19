@@ -11,7 +11,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { isPromise } from 'node:util/types'
 import { scopeTarget } from '@deepseek-ai/dsh-scope'
 import type { Scoped } from '@deepseek-ai/dsh-scope'
-import type { SessionEvent, SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
+import type { AgentSessionCreationReceipt, SessionEvent, SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import { installTurnArchiveAdmission } from './archive-admission.ts'
 import type { Agent } from './types.ts'
 import type { AgentOptions, SessionStartSource } from './runtime-types.ts'
@@ -159,8 +159,13 @@ export interface ResumeAgentOptions {
  */
 export interface AgentHandle {
   agent: Agent
+  /** One-use proof of the exact new session returned by `create`; absent on resumed handles. */
+  readonly sessionCreationReceipt?: AgentSessionCreationReceipt
   dispose(): Promise<void>
 }
+
+/** Opaque, per-call witness passed only to the registered creation factory. */
+export type AgentSessionCreationAttempt = object & { readonly __agentSessionCreationAttempt?: never }
 
 /**
  * The agent-creation factory the loop implementation provides to the registry
@@ -187,7 +192,7 @@ export interface AgentFactory {
    * @param options - agent/session identity, configuration, optional live parent, and setup.
    * @returns the owned handle after setup and both creation announcements complete.
    */
-  createAgent(ownerCtx: Context, options: CreateAgentOptions): Promise<AgentHandle>
+  createAgent(ownerCtx: Context, options: CreateAgentOptions, creationAttempt?: AgentSessionCreationAttempt): Promise<AgentHandle>
   /**
    * Resume an agent on a persisted session. Async because it opens the
    * persisted session for write, reads and repairs the log, publishes it, and
@@ -244,6 +249,8 @@ interface FactorySlot {
  */
 export class AgentRegistry extends Service {
   private store = new Map<SessionId, AgentEntry>()
+  private readonly sessionCreationReceipts = new WeakMap<object, object>()
+  private readonly sessionCreationAttempts = new WeakMap<object, { readonly id: SessionId; readonly receipt: object; publishedSession?: object }>()
   private factory: FactorySlot | undefined
   private readonly initiators = new AsyncLocalStorage<Agent | undefined>()
   private readonly initiatorRuns = new AsyncLocalStorage<InitiatorRun>()
@@ -392,6 +399,11 @@ export class AgentRegistry extends Service {
    */
   async create(options: CreateAgentOptions): Promise<AgentHandle> {
     const ownerCtx = this.ctx
+    const sessions = ownerCtx.get('sessions')
+    const existingSession = sessions?.get(options.sessionId)
+    const creationAttempt = Object.freeze({}) as AgentSessionCreationAttempt
+    const receipt = Object.freeze({})
+    this.sessionCreationAttempts.set(creationAttempt, { id: options.sessionId, receipt })
     // Re-trace a Service-backed factory through the accessing context
     // explicitly. This preserves AgentLoop's dependency origin while binding
     // its effects to ownerCtx; plain factories receive ownerCtx as an explicit
@@ -399,7 +411,48 @@ export class AgentRegistry extends Service {
     const { target } = this.requireFactory()
     const receiver = getTraceable(ownerCtx, target)
     // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
-    return Reflect.apply(target.createAgent, receiver, [ownerCtx, options])
+    let handle: AgentHandle
+    try {
+      handle = await Reflect.apply(target.createAgent, receiver, [ownerCtx, options, creationAttempt])
+    } catch (error: unknown) {
+      this.sessionCreationAttempts.delete(creationAttempt)
+      throw error
+    }
+    const provenance = sessions?.provenance
+    if (existingSession === undefined && options.parentAgent === undefined && options.seed === undefined
+      && options.meta?.parentSession === undefined && options.meta?.origin === undefined && options.meta?.isSeeded !== true
+      && options.inheritedEventCount === undefined && sessions !== undefined && provenance !== undefined
+      && sessions.get(handle.agent.id) === handle.agent.session
+      && this.sessionCreationAttempts.get(creationAttempt)?.publishedSession === handle.agent.session
+      && this.sessionCreationAttempts.get(creationAttempt)?.id === handle.agent.id) {
+      this.sessionCreationReceipts.set(receipt, handle.agent.session)
+      this.sessionCreationAttempts.delete(creationAttempt)
+      return { ...handle, sessionCreationReceipt: receipt as AgentSessionCreationReceipt }
+    }
+    this.sessionCreationAttempts.delete(creationAttempt)
+    return handle
+  }
+
+  /** Record the exact session publication performed by SessionStore.enter. */
+  recordSessionCreationPublication(session: { readonly id: SessionId }, attempt: AgentSessionCreationAttempt): void {
+    const pending = this.sessionCreationAttempts.get(attempt)
+    if (pending !== undefined && pending.id === session.id) {
+      this.sessionCreationAttempts.set(attempt, { ...pending, publishedSession: session })
+    }
+  }
+
+  /**
+   * Consume the one-use receipt returned for a new root session.
+   * @param session - the exact live Session to match.
+   * @param receipt - the creation receipt returned by this registry.
+   * @returns whether the receipt named this session and was consumed.
+   */
+  consumeSessionCreationReceipt(session: object, receipt: object): boolean {
+    if (receipt === null || typeof receipt !== 'object') return false
+    const recorded = this.sessionCreationReceipts.get(receipt)
+    if (recorded === undefined) return false
+    this.sessionCreationReceipts.delete(receipt)
+    return recorded === session
   }
 
   /**

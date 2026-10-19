@@ -5,3 +5,4 @@
  */
 export const apiSessionControllerIssuer = Object.freeze({})
 export const dshRoomLeaseIssuer = Object.freeze({})
+export const dshSvegliaCreationIssuer = Object.freeze({})
