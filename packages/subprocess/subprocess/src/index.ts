@@ -10,7 +10,7 @@
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import { proxyEnvironmentForChild } from '@deepseek-ai/dsh-http-proxy'
-import { z } from 'zod'
+import schema from '@deepseek-ai/schemastery'
 import { DSH_ENV_PREFIX } from './types.ts'
 import type { SubprocessHandle, SubprocessSpawnSpec } from './types.ts'
 import type { SubprocessTerminalEnvironment, SubprocessTerminalHandle, SubprocessTerminalSpawnSpec } from './types.ts'
@@ -177,7 +177,7 @@ declare module '@deepseek-ai/cordis' {
  *   when the top-level process exits.
  */
 export abstract class SubprocessRuntime extends Service {
-  static Config = z.object({ requireStartAuthorization: z.boolean().default(false) })
+  static Config: schema<Config> = schema.object({ requireStartAuthorization: schema.boolean().default(false) })
 
   private readonly requireStartAuthorization: boolean
 
