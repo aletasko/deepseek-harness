@@ -14407,6 +14407,9 @@ importers:
       '@deepseek-ai/dsh-win32-process':
         specifier: workspace:*
         version: link:../win32-process
+      '@deepseek-ai/schemastery':
+        specifier: link:../../../vendor/schemastery
+        version: link:../../../vendor/schemastery
       koffi:
         specifier: 3.1.1
         version: 3.1.1

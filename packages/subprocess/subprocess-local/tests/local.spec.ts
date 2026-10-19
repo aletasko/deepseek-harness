@@ -59,6 +59,17 @@ function spec(command: string, overrides: Partial<SubprocessSpawnSpec> = {}): Su
 }
 
 describe('LocalSubprocessRuntime', () => {
+  it('denies direct process and terminal provider calls in guarded-read mode', async () => {
+    const ctx = new Context()
+    const fiber = await ctx.plugin(LocalSubprocessRuntime, { denyProcessExecution: true })
+    try {
+      expect(() => ctx.subprocess.spawn({} as never)).toThrow('disabled by guarded-read policy')
+      await expect(ctx.subprocess.spawnTerminal({} as never)).rejects.toThrow('disabled by guarded-read policy')
+    } finally {
+      await fiber.dispose()
+    }
+  })
+
   it('discovers the platform shell without inventing a missing default and honors cancellation', async () => {
     let loginShell: string | null = '/account/shell'
     const userInfo = vi.spyOn(os, 'userInfo').mockImplementation(() => ({

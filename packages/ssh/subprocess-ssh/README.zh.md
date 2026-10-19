@@ -25,7 +25,7 @@ kind: "package-reference"
 <a id="use-this-package"></a>
 ## 使用本包
 
-将本提供方与 [`dsh-ssh`](../ssh/README.zh.md) 及其文件系统提供方一同挂载。本提供方没有独立部署配置。`resolveExecutable()` 检查远端可执行文件命名空间；完整的 spawn 请求提供远端 cwd、环境、流处置方式及清理宽限期。
+将本提供方与 [`dsh-ssh`](../ssh/README.zh.md) 及其文件系统提供方一同挂载。`denyProcessExecution` 默认为 `false`。当受保护的文件读取必须阻止基于子进程的读取时，将其设为 `true`；提供方会在发送 `process.prepare` 前拒绝普通进程与终端启动。这会禁用 bash、glob 和 grep 等进程消费方。`resolveExecutable()` 检查远端可执行文件命名空间；完整的 spawn 请求提供远端 cwd、环境、流处置方式及清理宽限期。
 
 普通 spawn 在远端分配过程中返回句柄。管道 stdin 和可选双工控制端点在分配过程中接受写入。终端分配、写入、前台检查、信号及终止均保留异步接口。
 
