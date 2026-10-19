@@ -2,7 +2,7 @@
 import { posix } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { FileSystem, FsError } from '@deepseek-ai/dsh-fs'
-import type { FsDirEntry, FsEditOutcome, FsEditRequest, FsErrorCode, FsInfo, FsPathInfo, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
+import type { FsDirEntry, FsEditOutcome, FsEditRequest, FsErrorCode, FsInfo, FsPathInfo, FsReadAccessContext, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-ssh'
@@ -45,11 +45,13 @@ export class SshFileSystem extends FileSystem {
     return await this.call('fs.lstat', { path, cwd: opts?.cwd }, pathInfoSchema.nullable(), signal) as FsPathInfo | null ?? undefined
   }
 
-  override readText(target: FsTarget, signal?: AbortSignal): Promise<string> {
+  override readText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<string> {
+    if (access !== undefined) return Promise.reject(this.unsupportedOpenedTargetAuthorization())
     return this.call('fs.readText', { target }, z.string(), signal)
   }
 
-  override async streamText(target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>> {
+  override async streamText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<AsyncIterable<string>> {
+    if (access !== undefined) throw this.unsupportedOpenedTargetAuthorization()
     const id = await this.call('fs.stream', { target }, textStreamIdSchema, signal)
     const call = this.call.bind(this)
     return (async function* () {
@@ -67,7 +69,8 @@ export class SshFileSystem extends FileSystem {
     })()
   }
 
-  override async readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array> {
+  override async readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number, access?: FsReadAccessContext): Promise<Uint8Array> {
+    if (access !== undefined) throw this.unsupportedOpenedTargetAuthorization()
     return Buffer.from(await this.call('fs.readBytes', { target, maxBytes }, z.base64(), signal), 'base64')
   }
 
@@ -101,6 +104,10 @@ export class SshFileSystem extends FileSystem {
       }
       throw new FsError(error instanceof Error ? error.message : String(error), signal?.aborted ? 'FS_ABORTED' : 'FS_IO_ERROR', { cause: error })
     }
+  }
+
+  private unsupportedOpenedTargetAuthorization(): FsError {
+    return new FsError('SSH filesystem cannot authorize the object opened by the remote provider', 'FS_PERMISSION_DENIED')
   }
 }
 

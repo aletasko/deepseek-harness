@@ -14,22 +14,43 @@ import { join, parse, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
-import { FsVersion } from '@deepseek-ai/dsh-fs'
-import type { FsTarget } from '@deepseek-ai/dsh-fs'
+import { FsError, FsReadAuthorizer, FsVersion } from '@deepseek-ai/dsh-fs'
+import type { FsReadAccessContext, FsTarget } from '@deepseek-ai/dsh-fs'
 
 let dir: string
 let ctx: Context
 let fs: LocalFileSystem
 let fiber: Awaited<ReturnType<Context['plugin']>>
+let authorizerFiber: Awaited<ReturnType<Context['plugin']>> | undefined
+let trustedReadActor: object | undefined
+let allowedOpenedTargetKeys: Set<string> | undefined
+let openedReadTargets: FsTarget[]
+
+class TestReadAuthorizer extends FsReadAuthorizer {
+  authorizeOpenedTarget(_requested: FsTarget, opened: FsTarget, access: FsReadAccessContext): void {
+    openedReadTargets.push(opened)
+    if (trustedReadActor === undefined || access.actor !== trustedReadActor) {
+      throw new FsError('untrusted read actor', 'FS_PERMISSION_DENIED')
+    }
+    if (allowedOpenedTargetKeys !== undefined && !allowedOpenedTargetKeys.has(String(opened.targetKey))) {
+      throw new FsError('opened target is not allowed', 'FS_PERMISSION_DENIED')
+    }
+  }
+}
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'dsh-fs-'))
   ctx = new Context()
   fiber = await ctx.plugin(LocalFileSystem, { cwd: dir })
   fs = ctx.fs as LocalFileSystem
+  authorizerFiber = undefined
+  trustedReadActor = undefined
+  allowedOpenedTargetKeys = undefined
+  openedReadTargets = []
 })
 afterEach(async () => {
   await fiber.dispose()
+  if (authorizerFiber !== undefined) await authorizerFiber.dispose()
   await rm(dir, { recursive: true, force: true })
 })
 
@@ -50,6 +71,13 @@ async function remountWithDiffLimit(diffBasisMaxBytes: number): Promise<void> {
   fs = ctx.fs as LocalFileSystem
 }
 
+async function remountWithReadAuthorizationRequired(): Promise<void> {
+  await fiber.dispose()
+  authorizerFiber = await ctx.plugin(TestReadAuthorizer)
+  fiber = await ctx.plugin(LocalFileSystem, { cwd: dir, requireReadAuthorization: true })
+  fs = ctx.fs as LocalFileSystem
+}
+
 describe('registration', () => {
   it('registers LocalFileSystem as ctx.fs with a default cwd', async () => {
     const bare = new Context()
@@ -63,6 +91,13 @@ describe('registration', () => {
     const path = join(dir, 'image.png')
     expect(fs.processPathFromHostPath(path)).toBe(path)
     expect(fs.processPathFromHostPath('image.png')).toBeUndefined()
+  })
+
+  it('refuses guarded-read configuration without a trusted provider authorizer', async () => {
+    const isolated = new Context()
+    await expect(isolated.plugin(LocalFileSystem, { cwd: dir, requireReadAuthorization: true }))
+      .rejects.toThrow('fs-local: requireReadAuthorization needs a mounted fsReadAuthorizer service')
+    await isolated.fiber.dispose()
   })
 
   it('rejects non-positive, fractional, unsafe, or unallocatable diff-basis limits', async () => {
@@ -268,6 +303,82 @@ describe('readText / streamText', () => {
     let streamed = ''
     for await (const chunk of await fs.streamText(target)) streamed += chunk
     expect(streamed).toBe('one\ntwo\nthree')
+  })
+
+  it('authorizes the opened target before readText, streamText, or readBytes returns content', async () => {
+    await writeFile(join(dir, 'authorized.txt'), 'secret')
+    await remountWithReadAuthorizationRequired()
+    const target = await fs.resolve('authorized.txt')
+    const actor = {}
+    trustedReadActor = actor
+    allowedOpenedTargetKeys = new Set([String(target.targetKey)])
+    const access: FsReadAccessContext = { actor }
+
+    expect(await fs.readText(target, undefined, access)).toBe('secret')
+    let streamed = ''
+    for await (const chunk of await fs.streamText(target, undefined, access)) streamed += chunk
+    expect(streamed).toBe('secret')
+    expect(Buffer.from(await fs.readBytes(target, undefined, 16, access)).toString()).toBe('secret')
+    expect(openedReadTargets).toHaveLength(3)
+    expect(openedReadTargets.every(actual => actual.targetKey === target.targetKey)).toBe(true)
+  })
+
+  it('fails before returning bytes when the opened-target authorizer rejects', async () => {
+    await writeFile(join(dir, 'denied.txt'), 'secret')
+    await remountWithReadAuthorizationRequired()
+    const target = await fs.resolve('denied.txt')
+    const actor = {}
+    trustedReadActor = actor
+    allowedOpenedTargetKeys = new Set()
+    const access: FsReadAccessContext = { actor }
+
+    await expect(fs.readText(target, undefined, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    const iterable = await fs.streamText(target, undefined, access)
+    const chunks: string[] = []
+    await expect((async () => { for await (const chunk of iterable) chunks.push(chunk) })()).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.readBytes(target, undefined, 16, access)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    expect(openedReadTargets).toHaveLength(3)
+    expect(chunks).toEqual([])
+  })
+
+  it('denies direct provider reads without a per-call context when guarded mode is configured', async () => {
+    await writeFile(join(dir, 'guarded.txt'), 'secret')
+    await remountWithReadAuthorizationRequired()
+    const target = await fs.resolve('guarded.txt')
+
+    await expect(fs.readText(target)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.streamText(target)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.readBytes(target, undefined, 16)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+    await expect(fs.readByteRange(target, { offset: 0, length: 16 })).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+
+    const forged = {
+      actor: {},
+      authorizeOpenedTarget: () => undefined,
+    } as unknown as FsReadAccessContext
+    await expect(fs.readText(target, undefined, forged)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+  })
+
+  it.skipIf(process.platform !== 'linux')('authorizes the object actually opened after a file path is swapped to an outside symlink', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'dsh-fs-outside-'))
+    try {
+      const inWorkspace = join(dir, 'replace.txt')
+      const outsideFile = join(outside, 'secret.txt')
+      await writeFile(inWorkspace, 'inside')
+      await writeFile(outsideFile, 'outside secret')
+      await remountWithReadAuthorizationRequired()
+      const target = await fs.resolve('replace.txt')
+      trustedReadActor = {}
+      allowedOpenedTargetKeys = new Set([String(target.targetKey)])
+      fs.internals.inspectBeforeReadOpen = async () => {
+        await unlink(inWorkspace)
+        await symlink(outsideFile, inWorkspace)
+      }
+
+      await expect(fs.readText(target, undefined, { actor: trustedReadActor })).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED' })
+      expect(String(openedReadTargets.at(-1)?.targetKey)).toBe(await realpath(outsideFile))
+    } finally {
+      await rm(outside, { recursive: true, force: true })
+    }
   })
 
   it('rejects a missing file, a directory, binary, and invalid UTF-8', async () => {

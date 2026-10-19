@@ -18,6 +18,7 @@ import type {
   FsInfo,
   FsPathInfo,
   FsObservation,
+  FsReadAccessContext,
   FsTarget,
   FsVersion,
   FsWriteIntent,
@@ -36,6 +37,7 @@ export type {
   FsErrorCode,
   FsInfo,
   FsObservation,
+  FsReadAccessContext,
   FsPathInfo,
   FsTarget,
   FsWriteIntent,
@@ -45,6 +47,7 @@ export type {
 declare module '@deepseek-ai/cordis' {
   interface Context {
     fs: FileSystem
+    fsReadAuthorizer: FsReadAuthorizer
   }
 
   interface Events {
@@ -76,6 +79,23 @@ declare module '@deepseek-ai/cordis' {
      */
     'fs/observed'(target: FsTarget, observation: FsObservation, actor: object | undefined): void
   }
+}
+
+/** Trusted provider-side policy for reads that require per-call authorization. */
+export abstract class FsReadAuthorizer extends Service {
+  constructor(ctx: Context) {
+    super(ctx, 'fsReadAuthorizer')
+  }
+
+  /**
+   * Authorize the object attached to the open handle before its bytes are read.
+   * Implementations must use target identity, never `displayPath` or raw input.
+   * @param requested - the target selected by the caller before opening.
+   * @param opened - the target identified from the provider's already-open file handle.
+   * @param access - per-call execution context supplied by trusted code.
+   * @throws when this call is not authorized.
+   */
+  abstract authorizeOpenedTarget(requested: FsTarget, opened: FsTarget, access: FsReadAccessContext): void | Promise<void>
 }
 
 /**
@@ -200,9 +220,10 @@ export abstract class FileSystem extends Service {
    * Read the whole regular text file as a single decoded string.
    * @param target - the resolved target to read.
    * @param signal - aborts the read.
+   * @param access - per-call identity for the provider-owned authorizer; required when the backend enables guarded reads.
    * @returns the full decoded UTF-8 content.
    */
-  abstract readText(target: FsTarget, signal?: AbortSignal): Promise<string>
+  abstract readText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<string>
 
   /**
    * Stream the whole regular text file as decoded text chunks (same text
@@ -211,9 +232,10 @@ export abstract class FileSystem extends Service {
    * touches raw bytes.
    * @param target - the resolved target to read.
    * @param signal - aborts the stream, including between chunks.
+   * @param access - per-call identity for the provider-owned authorizer; required when the backend enables guarded reads.
    * @returns the chunk iterable, decoded and validated like {@link readText}.
    */
-  abstract streamText(target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>>
+  abstract streamText(target: FsTarget, signal?: AbortSignal, access?: FsReadAccessContext): Promise<AsyncIterable<string>>
 
   /**
    * Read the whole regular file as raw bytes with no decoding or binary
@@ -223,9 +245,10 @@ export abstract class FileSystem extends Service {
    * @param target - the resolved target to read.
    * @param signal - aborts the read.
    * @param maxBytes - inclusive byte cap on the complete content.
+   * @param access - per-call identity for the provider-owned authorizer; required when the backend enables guarded reads.
    * @returns the full raw content, at most `maxBytes` long.
    */
-  abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array>
+  abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number, access?: FsReadAccessContext): Promise<Uint8Array>
 
   /**
    * Read one byte window of the regular file as raw bytes with no decoding or
