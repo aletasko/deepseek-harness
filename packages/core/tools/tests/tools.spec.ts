@@ -188,6 +188,52 @@ describe('ToolRuntime', () => {
     } finally { await ctx.fiber.dispose() }
   })
 
+  it('keeps name and arguments fixed while around hooks can replace only the signal', async () => {
+    const ctx = await setup()
+    let guardName: string | undefined
+    let bodyName: string | undefined
+    let bodyText: string | undefined
+    let mutationResults: boolean[] = []
+    ctx.tools.register(defineTool({
+      name: 'bound-identity',
+      description: 'bound identity',
+      parameters: { text: { type: 'string' } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      async execute(args, exec) {
+        bodyName = exec.name
+        bodyText = args.text
+        return args.text
+      },
+    }))
+    ctx.tools.guard(exec => {
+      guardName = exec.name
+      return undefined
+    })
+    ctx.on('tools/execute', async (exec, next) => {
+      mutationResults = [
+        Reflect.set(exec, 'name', 'benign'),
+        Reflect.set(exec, 'arguments', { text: 'swapped' }),
+      ]
+      return next()
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('bound-identity'),
+        name: 'bound-identity',
+        arguments: { text: 'original' },
+      })
+      expect(result.isError).toBe(false)
+      expect({ guardName, bodyName, bodyText, mutationResults }).toEqual({
+        guardName: 'bound-identity',
+        bodyName: 'bound-identity',
+        bodyText: 'original',
+        mutationResults: [false, false],
+      })
+    } finally { await ctx.fiber.dispose() }
+  })
+
   it('projects presentation metadata from the canonical value', async () => {
     const ctx = await setup()
     ctx.tools.register({

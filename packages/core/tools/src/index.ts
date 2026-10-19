@@ -386,9 +386,9 @@ export interface PtcDispatchLog {
 /**
  * One pending tool call inside the registry pipeline. Parsed arguments cross
  * one lossless-JSON materialization boundary before policy and are deep-frozen;
- * call identity, the caller signal, and the registry-assigned {@link token} are
- * readonly. The registry freezes the complete object before `tools/result`
- * observers run.
+ * identity fields are non-writable at runtime. Around-dispatch wrappers may
+ * replace only the signal. The registry freezes the complete object before
+ * `tools/result` observers run.
  */
 export interface ToolExecution extends ToolExecutionInput {
   /** Root model-requested call, resolved for every root and nested execution. */
@@ -403,7 +403,7 @@ export interface ToolExecution extends ToolExecutionInput {
  * The registry fuses every replacement with the captured caller signal.
  */
 export interface ToolDispatchExecution extends Omit<ToolExecution, 'signal'> {
-  /** Cancellation signal visible to the next wrapper or tool body. */
+  /** Cancellation signal visible to the next wrapper or tool body; the only mutable execution field. */
   signal: AbortSignal
 }
 
@@ -1447,6 +1447,7 @@ export class ToolRuntime extends Service {
         throw new TypeError('tool execution arguments must be losslessly JSON-serializable')
       }
       const execution: MutableToolRunContext = { ...base, arguments: deepFreeze(detached) }
+      lockExecutionIdentity(execution)
       this.executionDefinitions.set(execution, collapsed ? undefined : visible)
       this.deferredContexts.set(execution, deferredContexts)
       this.contentFinalizers.set(execution, finalizerFor())
@@ -1480,6 +1481,7 @@ export class ToolRuntime extends Service {
       return { kind: 'ready', exec: execution }
     } catch (error: unknown) {
       const execution: MutableToolRunContext = { ...base, arguments: undefined }
+      lockExecutionIdentity(execution)
       this.executionDefinitions.set(execution, collapsed ? undefined : visible)
       this.contentFinalizers.set(execution, finalizerFor())
       return { kind: 'final-result', exec: execution, result: toolErrorResult(error) }
@@ -1910,6 +1912,14 @@ export class ToolRuntime extends Service {
 /** Mint a same-process correlation token whose identity is its value. */
 function createExecutionToken(): ToolExecutionToken {
   return Symbol('dsh.tool.execution') as ToolExecutionToken
+}
+
+/** Keep registry identity fixed while leaving the documented wrapper signal writable. */
+function lockExecutionIdentity(exec: MutableToolRunContext): void {
+  for (const field of ['callId', 'rootCallId', 'name', 'schema', 'arguments', 'agent', 'parent', 'token'] as const) {
+    Object.defineProperty(exec, field, { configurable: false, writable: false })
+  }
+  Object.defineProperty(exec, 'signal', { configurable: false, writable: true })
 }
 
 function toolErrorResult(error: unknown): ToolExecutionResult {
