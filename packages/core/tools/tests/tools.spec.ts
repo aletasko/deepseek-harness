@@ -162,6 +162,164 @@ describe('ToolRuntime', () => {
     expect(observed).toEqual(result)
   })
 
+  it('denies dispatch when the global definition is replaced during pre-execute', async () => {
+    const ctx = await setup()
+    let originalCalls = 0
+    let replacementCalls = 0
+    const original = { ...echoTool, name: 'bound-global', async execute() { originalCalls++; return 'original' } }
+    const replacement = { ...echoTool, name: 'bound-global', async execute() { replacementCalls++; return 'replacement' } }
+    const disposeOriginal = ctx.tools.register(original)
+    let replaced = false
+    ctx.on('tools/pre-execute', async (_exec, next) => {
+      if (!replaced) {
+        replaced = true
+        disposeOriginal()
+        ctx.tools.register(replacement)
+      }
+      return next()
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('bound-global'),
+        name: 'bound-global',
+        arguments: {},
+      })
+      expect(result.isError).toBe(true)
+      expect(result.content).toEqual([{ type: 'text', text: 'Error: unknown tool "bound-global"' }])
+      expect({ originalCalls, replacementCalls }).toEqual({ originalCalls: 0, replacementCalls: 0 })
+    } finally { await ctx.fiber.dispose() }
+  })
+
+  it('keeps the registered execution and schemas detached from producer mutation', async () => {
+    const ctx = await setup()
+    let originalCalls = 0
+    const definition = {
+      ...echoTool,
+      name: 'detached-definition',
+      description: 'original description',
+      parameters: { text: { type: 'string' } },
+      output: { ...echoTool.output, schema: { type: 'string' as const } },
+      async execute() { originalCalls++; return 'original' },
+    }
+    const originalExecute = definition.execute
+    const originalRender = definition.output.render
+    ctx.tools.register(definition)
+    ctx.on('tools/pre-execute', async (_exec, next) => {
+      definition.description = 'mutated description'
+      definition.parameters.text.type = 'number'
+      Reflect.set(definition.output.schema, 'type', 'number')
+      definition.execute = async () => 'replacement'
+      return next()
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('detached-definition'),
+        name: 'detached-definition',
+        arguments: { text: 'ok' },
+      })
+      expect(result.isError).toBe(false)
+      expect(result.value).toBe('original')
+      expect(originalCalls).toBe(1)
+      expect(Object.isFrozen(originalExecute)).toBe(false)
+      expect(Object.isFrozen(originalRender)).toBe(false)
+      expect(ctx.tools.schemas().find(schema => schema.name === 'detached-definition')).toMatchObject({
+        description: 'original description',
+        parameters: { text: { type: 'string' } },
+      })
+    } finally { await ctx.fiber.dispose() }
+  })
+
+  it('binds callbacks to the frozen registered definition snapshot', async () => {
+    const ctx = await setup()
+    const definition: ToolDefinition = {
+      name: 'snapshot-receiver',
+      description: 'reads the registered snapshot through this',
+      parameters: { text: { type: 'string' } },
+      output: {
+        schema: { type: 'object', additionalProperties: true },
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+      },
+      execute() {
+        return { parameters: this.parameters, outputSchema: this.output.schema }
+      },
+    }
+    ctx.tools.register(definition)
+    ctx.on('tools/pre-execute', async (_exec, next) => {
+      Reflect.set(definition.parameters.text, 'type', 'number')
+      Reflect.set(definition.output.schema, 'additionalProperties', false)
+      return next()
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('snapshot-receiver'),
+        name: 'snapshot-receiver',
+        arguments: { text: 'ok' },
+      })
+      expect(result.isError).toBe(false)
+      expect(result.value).toEqual({
+        parameters: { text: { type: 'string' } },
+        outputSchema: { type: 'object', additionalProperties: true },
+      })
+      expect(Object.isFrozen(definition.execute)).toBe(false)
+      expect(Object.isFrozen(definition.output.render)).toBe(false)
+    } finally { await ctx.fiber.dispose() }
+  })
+
+  it('keeps execution identity fixed while around hooks can replace only the signal', async () => {
+    const ctx = await setup()
+    let guardName: string | undefined
+    let bodyName: string | undefined
+    let bodyText: string | undefined
+    let mutationResults: boolean[] = []
+    ctx.tools.register(defineTool({
+      name: 'bound-identity',
+      description: 'bound identity',
+      parameters: { text: { type: 'string' } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      async execute(args, exec) {
+        bodyName = exec.name
+        bodyText = args.text
+        return args.text
+      },
+    }))
+    ctx.tools.guard(exec => {
+      guardName = exec.name
+      return undefined
+    })
+    ctx.on('tools/execute', async (exec, next) => {
+      mutationResults = [
+        Reflect.set(exec, 'name', 'benign'),
+        Reflect.set(exec, 'arguments', { text: 'swapped' }),
+        Reflect.set(exec, 'agent', {}),
+        Reflect.set(exec, 'parent', Symbol('injected-parent')),
+        Reflect.set(exec, 'schema', {}),
+      ]
+      return next()
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('bound-identity'),
+        name: 'bound-identity',
+        arguments: { text: 'original' },
+      })
+      expect(result.isError).toBe(false)
+      expect({ guardName, bodyName, bodyText, mutationResults }).toEqual({
+        guardName: 'bound-identity',
+        bodyName: 'bound-identity',
+        bodyText: 'original',
+        mutationResults: [false, false, false, false, false],
+      })
+    } finally { await ctx.fiber.dispose() }
+  })
+
   it('projects presentation metadata from the canonical value', async () => {
     const ctx = await setup()
     ctx.tools.register({

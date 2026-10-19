@@ -263,6 +263,32 @@ describe('restrict() over an inherited scope layer', () => {
 })
 
 describe('scoped execution dispatch', () => {
+  it('denies dispatch when the scoped definition is disposed and replaced during pre-execute', async () => {
+    const ctx = await mount()
+    const { scope, key } = await mintAgentScope(ctx, 'a')
+    let originalCalls = 0
+    let replacementCalls = 0
+    const original = tool('scoped-bound', 'original scoped')
+    original.execute = () => { originalCalls++; return Promise.resolve('original scoped') }
+    const replacement = tool('scoped-bound', 'replacement scoped')
+    replacement.execute = () => { replacementCalls++; return Promise.resolve('replacement scoped') }
+    const dispose = scope.ctx.tools.register(original)
+    let replaced = false
+    scope.ctx.on('tools/pre-execute', async (_exec, next) => {
+      if (!replaced) {
+        replaced = true
+        dispose()
+        scope.ctx.tools.register(replacement)
+      }
+      return next()
+    })
+
+    try {
+      expect(await run(ctx, 'scoped-bound', key)).toBe('Error: unknown tool "scoped-bound"')
+      expect({ originalCalls, replacementCalls }).toEqual({ originalCalls: 0, replacementCalls: 0 })
+    } finally { await ctx.fiber.dispose() }
+  })
+
   it('an agent.ctx pre-execute listener gates only its own agent (and never subject-less calls)', async () => {
     const ctx = await mount()
     const { scope, key } = await mintAgentScope(ctx, 'a')
