@@ -19,6 +19,7 @@ import type { IPtyForkOptions, IWindowsPtyForkOptions } from 'node-pty'
 import { createLazyRequire } from '@deepseek-ai/dsh-lazy-require'
 import { SubprocessRuntime, SubprocessExecutableNotFoundError } from '@deepseek-ai/dsh-subprocess'
 import type {
+  Config as SubprocessConfig,
   SubprocessHandle,
   SubprocessSpawnSpec,
   SubprocessTerminalHandle,
@@ -87,8 +88,8 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   /** Test hook for platform process inspection; production resolves lazily on terminal spawn. */
   terminalInspector: ProcessInspector | undefined
 
-  constructor(ctx: Context) {
-    super(ctx)
+  constructor(ctx: Context, config: SubprocessConfig = {}) {
+    super(ctx, config)
     ctx.effect(() => {
       const onHostExit = (): void => { this.terminateForHostExit() }
       process.prependListener('exit', onHostExit)
@@ -196,6 +197,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
 
   spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
     validateSubprocessSpec(spec)
+    this.authorizeStart({ kind: 'spawn', argv: spec.argv, cwd: spec.cwd })
     const env = targetEnvironment(spec)
     const containmentMode = this.selectContainmentMode('ordinary')
     let handle: LocalSubprocessHandle
@@ -293,6 +295,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
       throw new Error('subprocess-local: terminal argv must contain a program')
     }
     spec.signal?.throwIfAborted()
+    this.authorizeStart({ kind: 'terminal', argv: spec.argv, cwd: spec.cwd })
     const inspector = this.terminalInspector ?? createProcessInspector()
     const containmentMode = this.selectContainmentMode('terminal')
     const env = targetEnvironment(spec)

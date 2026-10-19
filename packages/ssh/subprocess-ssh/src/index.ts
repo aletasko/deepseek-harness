@@ -3,7 +3,7 @@ import { Duplex, PassThrough, type Readable, type Writable } from 'node:stream'
 import type { Socket } from 'node:net'
 import { Context } from '@deepseek-ai/cordis'
 import { SubprocessRuntime, SubprocessExecutableNotFoundError } from '@deepseek-ai/dsh-subprocess'
-import type { SubprocessCollectedOutputs, SubprocessHandle, SubprocessOutcome, SubprocessOutputMode, SubprocessSpawnSpec, SubprocessTerminalHandle, SubprocessTerminalEnvironment, SubprocessTerminalSignal, SubprocessTerminalSpawnSpec } from '@deepseek-ai/dsh-subprocess'
+import type { Config as SubprocessConfig, SubprocessCollectedOutputs, SubprocessHandle, SubprocessOutcome, SubprocessOutputMode, SubprocessSpawnSpec, SubprocessTerminalHandle, SubprocessTerminalEnvironment, SubprocessTerminalSignal, SubprocessTerminalSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import { OutputCollector } from '@deepseek-ai/dsh-subprocess-local/output'
 import type { SshConnection } from '@deepseek-ai/dsh-ssh'
 import { doneSchema, foregroundSchema, terminalActivitySchema, outputSnapshotFrameLimit, outputSnapshotSchema, preparedSchema, remotePath, streamEndpointSchema } from '@deepseek-ai/dsh-ssh/schemas'
@@ -233,8 +233,8 @@ export class SshSubprocessRuntime extends SubprocessRuntime {
   private readonly terminalAllocations = new Set<Promise<SubprocessTerminalHandle>>()
   private readonly lifetime = new AbortController()
 
-  constructor(ctx: Context) {
-    super(ctx)
+  constructor(ctx: Context, config: SubprocessConfig = {}) {
+    super(ctx, config)
     ctx.effect(() => async () => {
       this.lifetime.abort(new Error('SSH subprocess provider disposed'))
       for (const handle of this.live) handle.terminate()
@@ -274,6 +274,7 @@ export class SshSubprocessRuntime extends SubprocessRuntime {
   override spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
     this.lifetime.signal.throwIfAborted()
     spec.signal?.throwIfAborted()
+    this.authorizeStart({ kind: 'spawn', argv: spec.argv, cwd: spec.cwd })
     const handle = new RemoteProcess(this.ctx.ssh, spec)
     this.live.add(handle)
     void handle.done.then(() => handle.waitForExit()).then(() => handle.streamsClosed)
@@ -285,6 +286,7 @@ export class SshSubprocessRuntime extends SubprocessRuntime {
     this.lifetime.signal.throwIfAborted()
     const signal = spec.signal === undefined ? this.lifetime.signal : AbortSignal.any([spec.signal, this.lifetime.signal])
     signal.throwIfAborted()
+    this.authorizeStart({ kind: 'terminal', argv: spec.argv, cwd: spec.cwd })
     const allocation = this.createTerminal(spec, signal)
     this.terminalAllocations.add(allocation)
     try { return await allocation } finally { this.terminalAllocations.delete(allocation) }
