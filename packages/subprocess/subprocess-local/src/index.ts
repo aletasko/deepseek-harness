@@ -14,6 +14,7 @@ import { userInfo } from 'node:os'
 import { delimiter, extname, isAbsolute, resolve } from 'node:path'
 import type { Duplex } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
+import schema from '@deepseek-ai/schemastery'
 import type * as NodePty from 'node-pty'
 import type { IPtyForkOptions, IWindowsPtyForkOptions } from 'node-pty'
 import { createLazyRequire } from '@deepseek-ai/dsh-lazy-require'
@@ -54,6 +55,11 @@ import { prepareShellActivity } from './shell-activity.ts'
 
 const requireNodePty = createLazyRequire<typeof NodePty>('node-pty', import.meta.url)
 
+export interface Config {
+  /** Deny all ordinary and terminal process launches when protected reads are enabled. */
+  denyProcessExecution?: boolean
+}
+
 /**
  * Local subprocess service: platform-selected managed ranges, Node-shaped stdio
  * dispositions (raw pipes, inherit, bounded tail-keep collection with spill
@@ -62,6 +68,7 @@ const requireNodePty = createLazyRequire<typeof NodePty>('node-pty', import.meta
  * JavaScript-observable host exit also performs synchronous final termination.
  */
 export class LocalSubprocessRuntime extends SubprocessRuntime {
+  static Config: schema<Config> = schema.object({ denyProcessExecution: schema.boolean().default(false) })
   /** Live handles retained for normal disposal and synchronous host-exit finalization. */
   private live = new Set<LocalSubprocessHandle>()
   /** Live terminals retained through normal quiescence or host-exit finalization. */
@@ -86,9 +93,11 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   private linuxScopeDecision: Extract<LinuxScopeDecision, { kind: 'scope' }> | undefined
   /** Test hook for platform process inspection; production resolves lazily on terminal spawn. */
   terminalInspector: ProcessInspector | undefined
+  private readonly denyProcessExecution: boolean
 
-  constructor(ctx: Context) {
+  constructor(ctx: Context, config: Config = {}) {
     super(ctx)
+    this.denyProcessExecution = config.denyProcessExecution ?? false
     ctx.effect(() => {
       const onHostExit = (): void => { this.terminateForHostExit() }
       process.prependListener('exit', onHostExit)
@@ -195,6 +204,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   }
 
   spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
+    if (this.denyProcessExecution) throw new Error('subprocess-local: process execution is disabled by guarded-read policy')
     validateSubprocessSpec(spec)
     const env = targetEnvironment(spec)
     const containmentMode = this.selectContainmentMode('ordinary')
@@ -288,6 +298,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   // Local PTY allocation is synchronous, but the provider contract permits remote asynchronous allocation.
   // oxlint-disable-next-line typescript/require-await -- Preserve promise rejection semantics at the async provider contract.
   async spawnTerminal(spec: SubprocessTerminalSpawnSpec): Promise<SubprocessTerminalHandle> {
+    if (this.denyProcessExecution) throw new Error('subprocess-local: process execution is disabled by guarded-read policy')
     const file = spec.argv[0]
     if (file === undefined || file.length === 0) {
       throw new Error('subprocess-local: terminal argv must contain a program')

@@ -10,6 +10,12 @@ import { doneSchema, foregroundSchema, terminalActivitySchema, outputSnapshotFra
 import type { SshProcessId } from '@deepseek-ai/dsh-ssh/schemas'
 import { SshRpcPeer, RemoteOperationError } from '@deepseek-ai/dsh-ssh/protocol'
 import { z } from 'zod'
+import schema from '@deepseek-ai/schemastery'
+
+export interface Config {
+  /** Deny all ordinary and terminal process launches when protected reads are enabled. */
+  denyProcessExecution?: boolean
+}
 
 function environment(env?: NodeJS.ProcessEnv): Record<string, string | null> | undefined {
   return env === undefined ? undefined : Object.fromEntries(Object.entries(env).map(([key, value]) => [key, value ?? null]))
@@ -227,14 +233,17 @@ class RemoteProcess implements SubprocessHandle {
 
 /** SSH provider paired with the SSH filesystem; the remote helper selects POSIX process ownership. */
 export class SshSubprocessRuntime extends SubprocessRuntime {
+  static Config: schema<Config> = schema.object({ denyProcessExecution: schema.boolean().default(false) })
   static inject = ['ssh']
   private readonly live = new Set<RemoteProcess>()
   private readonly terminals = new Set<SubprocessTerminalHandle>()
   private readonly terminalAllocations = new Set<Promise<SubprocessTerminalHandle>>()
   private readonly lifetime = new AbortController()
+  private readonly denyProcessExecution: boolean
 
-  constructor(ctx: Context) {
+  constructor(ctx: Context, config: Config = {}) {
     super(ctx)
+    this.denyProcessExecution = config.denyProcessExecution ?? false
     ctx.effect(() => async () => {
       this.lifetime.abort(new Error('SSH subprocess provider disposed'))
       for (const handle of this.live) handle.terminate()
@@ -272,6 +281,7 @@ export class SshSubprocessRuntime extends SubprocessRuntime {
   }
 
   override spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
+    if (this.denyProcessExecution) throw new Error('subprocess-ssh: process execution is disabled by guarded-read policy')
     this.lifetime.signal.throwIfAborted()
     spec.signal?.throwIfAborted()
     const handle = new RemoteProcess(this.ctx.ssh, spec)
@@ -282,6 +292,7 @@ export class SshSubprocessRuntime extends SubprocessRuntime {
   }
 
   override async spawnTerminal(spec: SubprocessTerminalSpawnSpec): Promise<SubprocessTerminalHandle> {
+    if (this.denyProcessExecution) throw new Error('subprocess-ssh: process execution is disabled by guarded-read policy')
     this.lifetime.signal.throwIfAborted()
     const signal = spec.signal === undefined ? this.lifetime.signal : AbortSignal.any([spec.signal, this.lifetime.signal])
     signal.throwIfAborted()
