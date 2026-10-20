@@ -11,7 +11,7 @@ import type { SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 interface WireMessage { type: string; [key: string]: unknown }
 interface Peer { socket: Socket; messages: WireMessage[]; waitFor(type: string): Promise<WireMessage>; send(value: object): void }
 
-async function fakeBroker(onMessage: (message: WireMessage, peer: Peer) => void): Promise<{
+async function fakeBroker(onMessage: (message: WireMessage, peer: Peer) => void, registrationReply: 'valid' | 'invalid' | 'none' = 'valid'): Promise<{
   socketPath: string
   peer: Peer
   close(): Promise<void>
@@ -48,6 +48,10 @@ async function fakeBroker(onMessage: (message: WireMessage, peer: Peer) => void)
         messages.push(message)
         for (const resolve of waiters.get(message.type) ?? []) resolve(message)
         waiters.delete(message.type)
+        if (message.type === 'register-core') {
+          if (registrationReply !== 'none') peer.send({ type: 'registered', requestId: registrationReply === 'valid' ? message.requestId : 'wrong-request', revision: 1 })
+          continue
+        }
         onMessage(message, peer)
       }
     })
@@ -89,6 +93,22 @@ async function withRuntime<T>(socketPath: string, run: (ctx: Context, fiber: Awa
 }
 
 describe('local subprocess broker route', () => {
+  it('registers Core before start and refuses a forged registration receipt', async () => {
+    const broker = await fakeBroker(() => {}, 'invalid')
+    try {
+      await withRuntime(broker.socketPath, async ctx => {
+        const runtime = ctx.subprocess as LocalSubprocessRuntime
+        const directSpawn = vi.fn()
+        runtime.internals.spawn = directSpawn as never
+        const handle = runtime.spawn(processSpec())
+        await expect(handle.done).rejects.toThrow(/invalid Core registration event/)
+        expect(await broker.peer.waitFor('register-core')).toMatchObject({ type: 'register-core', version: 1 })
+        expect(broker.peer.messages.some(message => message.type === 'start')).toBe(false)
+        expect(directSpawn).not.toHaveBeenCalled()
+      })
+    } finally { await broker.close() }
+  })
+
   it('uses a resolver registered after startup and denies again after disposal', async () => {
     const broker = await fakeBroker((message, peer) => {
       if (message.type === 'start') {
@@ -153,6 +173,8 @@ describe('local subprocess broker route', () => {
         broker.peer.send({ type: 'empty', handle: 'process-1' })
         await expect(handle.waitForExit()).resolves.toBe(true)
         const start = await broker.peer.waitFor('start')
+        expect(broker.peer.messages[0]).toMatchObject({ type: 'register-core', version: 1 })
+        expect(broker.peer.messages[0]).not.toHaveProperty('assignmentId')
         expect(start).toMatchObject({
           version: 1, mode: 'process', assignmentId: 'trusted-assignment-7',
           argv: ['/bin/echo', 'hello'], cwd: '/assigned/tree',

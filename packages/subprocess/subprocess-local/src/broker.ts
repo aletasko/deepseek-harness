@@ -150,6 +150,8 @@ export function launchBrokerProcess(
   const direct = Promise.withResolvers<SubprocessOutcome>()
   const empty = Promise.withResolvers<void>()
   let accepted = false
+  let registered = false
+  const registrationRequestId = randomUUID()
   let handleId = ''
   let pendingSignal: 'SIGTERM' | 'SIGKILL' | undefined
   let finished = false
@@ -170,8 +172,21 @@ export function launchBrokerProcess(
   }
   const dispose = connection.onMessage(message => {
     try {
+      if (message.type === 'registered') {
+        if (registered || accepted || message.requestId !== registrationRequestId
+          || !Number.isSafeInteger(message.revision) || (message.revision as number) < 1) {
+          throw new Error('invalid Core registration event')
+        }
+        registered = true
+        connection.send({
+          type: 'start', version: 1, requestId: randomUUID(), mode: 'process',
+          assignmentId, argv: [...spec.argv], cwd: spec.cwd, env,
+          stdio: stdioRequest(spec), graceMs: spec.graceMs,
+        })
+        return
+      }
       if (message.type === 'accepted') {
-        if (accepted || typeof message.handle !== 'string' || message.handle.length === 0) throw new Error('invalid accepted event')
+        if (!registered || accepted || typeof message.handle !== 'string' || message.handle.length === 0) throw new Error('invalid accepted event')
         accepted = true
         handleId = message.handle
         if (pendingSignal !== undefined) {
@@ -229,11 +244,7 @@ export function launchBrokerProcess(
   })
   connection.onClosed.then(error => { if (error !== undefined && !finished) fail(error) })
   try {
-    connection.send({
-      type: 'start', version: 1, requestId: randomUUID(), mode: 'process',
-      assignmentId, argv: [...spec.argv], cwd: spec.cwd, env,
-      stdio: stdioRequest(spec), graceMs: spec.graceMs,
-    })
+    connection.send({ type: 'register-core', version: 1, requestId: registrationRequestId })
     startupTimer = setTimeout(() => fail(new Error('subprocess-local broker: start acceptance timed out')), 10_000)
   } catch (error) {
     fail(error instanceof Error ? error : new Error(String(error)))
@@ -265,8 +276,10 @@ export class BrokerTerminalHandle implements SubprocessTerminalHandle {
   private readonly pending = new Map<string, ReturnType<typeof Promise.withResolvers<JsonRecord>>>()
   private nextId = 0
   private closed = false
+  private registered = false
 
   constructor(config: SubprocessBrokerConfig, assignmentId: string, spec: SubprocessTerminalSpawnSpec, env: Record<string, string>) {
+    const registrationRequestId = randomUUID()
     this.connection = new BrokerConnection(config.socketPath, spec.signal)
     this.done = this.doneResult.promise
     void this.done.catch(() => {})
@@ -274,11 +287,26 @@ export class BrokerTerminalHandle implements SubprocessTerminalHandle {
     this.ready = this.accepted.promise
     this.connection.onMessage(message => {
       try {
+        if (message.type === 'registered') {
+          if (this.registered || this.handleId.length > 0 || message.requestId !== registrationRequestId
+            || !Number.isSafeInteger(message.revision) || (message.revision as number) < 1) {
+            throw new Error('invalid terminal Core registration event')
+          }
+          this.registered = true
+          this.connection.send({
+            type: 'start', version: 1, requestId: randomUUID(), mode: 'terminal',
+            assignmentId, argv: [...spec.argv], cwd: spec.cwd, env,
+            stdio: { stdin: { mode: 'pty' }, stdout: { mode: 'pty' }, stderr: { mode: 'pty' } },
+            rows: spec.rows, cols: spec.cols, terminalType: spec.terminalType,
+            graceMs: spec.graceMs, shellActivity: spec.shellActivity === true,
+          })
+          return
+        }
         if (message.type !== 'accepted' && this.handleId.length > 0 && message.handle !== this.handleId) {
           throw new Error('terminal event handle mismatch')
         }
         if (message.type === 'accepted') {
-          if (this.handleId.length > 0 || !Number.isInteger(message.pid) || (message.pid as number) <= 0) throw new Error('invalid terminal accepted event')
+          if (!this.registered || this.handleId.length > 0 || !Number.isInteger(message.pid) || (message.pid as number) <= 0) throw new Error('invalid terminal accepted event')
           if (this.startupTimer !== undefined) clearTimeout(this.startupTimer)
           this.pidValue = message.pid as number
           this.handleId = message.handle as string
@@ -326,13 +354,7 @@ export class BrokerTerminalHandle implements SubprocessTerminalHandle {
         this.output.destroy()
       }
     })
-    this.connection.send({
-      type: 'start', version: 1, requestId: randomUUID(), mode: 'terminal',
-      assignmentId, argv: [...spec.argv], cwd: spec.cwd, env,
-      stdio: { stdin: { mode: 'pty' }, stdout: { mode: 'pty' }, stderr: { mode: 'pty' } },
-      rows: spec.rows, cols: spec.cols, terminalType: spec.terminalType,
-      graceMs: spec.graceMs, shellActivity: spec.shellActivity === true,
-    })
+    this.connection.send({ type: 'register-core', version: 1, requestId: registrationRequestId })
     this.startupTimer = setTimeout(() => {
       const error = new Error('subprocess-local broker: terminal start acceptance timed out')
       this.accepted.reject(error)
