@@ -100,12 +100,10 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   /** Test hook for platform process inspection; production resolves lazily on terminal spawn. */
   terminalInspector: ProcessInspector | undefined
   private readonly brokerConfig: SubprocessBrokerConfig | undefined
-  private readonly brokerAssignmentResolver: SubprocessBrokerAssignmentResolver | undefined
 
   constructor(ctx: Context, config: SubprocessConfig = {}) {
     super(ctx, config)
     this.brokerConfig = assertBrokerConfig(ctx.reflect.get('subprocessBrokerConfig') as SubprocessBrokerConfig | undefined)
-    this.brokerAssignmentResolver = ctx.reflect.get('subprocessBrokerAssignmentResolver') as SubprocessBrokerAssignmentResolver | undefined
     ctx.effect(() => {
       const onHostExit = (): void => { this.terminateForHostExit() }
       process.prependListener('exit', onHostExit)
@@ -122,7 +120,10 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   /** Resolve the assignment only from the exact Core-attested active session. */
   private brokerAssignment(): string {
     const { attestation } = attestSubprocessExecution(this.ctx)
-    return resolveBrokerAssignment(this.brokerAssignmentResolver, attestation.sessionId)
+    // ROOM may register or revoke its host-owned resolver after this plugin
+    // starts. Read the current provider for each launch; absence denies.
+    const resolver = this.ctx.reflect.get('subprocessBrokerAssignmentResolver') as SubprocessBrokerAssignmentResolver | undefined
+    return resolveBrokerAssignment(resolver, attestation.sessionId)
   }
 
   private terminateForHostExit(): void {

@@ -89,6 +89,41 @@ async function withRuntime<T>(socketPath: string, run: (ctx: Context, fiber: Awa
 }
 
 describe('local subprocess broker route', () => {
+  it('uses a resolver registered after startup and denies again after disposal', async () => {
+    const broker = await fakeBroker((message, peer) => {
+      if (message.type === 'start') {
+        peer.send({ type: 'accepted', handle: 'late-1' })
+        peer.send({ type: 'outcome', handle: 'late-1', exitCode: 0, signal: null })
+        peer.send({ type: 'empty', handle: 'late-1' })
+      }
+    })
+    const ctx = new Context()
+    ctx.provide('subprocessBrokerConfig', { socketPath: broker.socketPath })
+    ctx.provide('tools', {
+      currentActiveExecution: () => ({ active: true }),
+      attestActiveExecution: () => ({ direct: true, sessionId: 'session-7' }),
+    })
+    const fiber = await ctx.plugin(LocalSubprocessRuntime)
+    try {
+      const runtime = ctx.subprocess as LocalSubprocessRuntime
+      const directSpawn = vi.fn()
+      runtime.internals.spawn = directSpawn as never
+      expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/)
+      const disposeResolver = ctx.reflect.provide('subprocessBrokerAssignmentResolver', {
+        resolve: (id: string) => id === 'session-7' ? 'late-assignment' : undefined,
+      })
+      const handle = runtime.spawn(processSpec())
+      await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
+      expect(await broker.peer.waitFor('start')).toMatchObject({ assignmentId: 'late-assignment' })
+      await disposeResolver()
+      expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/)
+      expect(directSpawn).not.toHaveBeenCalled()
+    } finally {
+      await fiber.dispose()
+      await broker.close()
+    }
+  })
+
   it('streams process stdio and holds ownership through broker quiescence', async () => {
     const broker = await fakeBroker((message, peer) => {
       if (message.type === 'start') peer.send({ type: 'accepted', handle: 'process-1' })
