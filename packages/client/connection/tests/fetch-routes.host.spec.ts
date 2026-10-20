@@ -31,7 +31,7 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
 describe('Connection exact Fetch routes', () => {
   it('dispatches owned methods and returns 404 for unclaimed requests', async () => {
     const { connection, dispose: disposeFiber } = await mounted()
-    const route = vi.fn(async (request: Request) =>
+    const route = vi.fn(async (request: Request, _peer: PeerScope) =>
       Response.json({ query: new URL(request.url).searchParams.get('sessionId') }))
     const dispose = connection.fetch.register({
       path: '/api/session.export',
@@ -53,9 +53,11 @@ describe('Connection exact Fetch routes', () => {
     expect(response.status).toBe(200)
     expect(await response.json()).toEqual({ query: 'session-1' })
     expect(route).toHaveBeenCalledOnce()
+    expect(route.mock.calls[0]?.[1]).toBe(connection.browserPeer)
     const post = await shared.fetch(new Request('http://host/api/session.export', { method: 'POST' }), connection.browserPeer)
     expect(post.status).toBe(200)
     expect(route).toHaveBeenCalledTimes(2)
+    expect(route.mock.calls[1]?.[1]).toBe(connection.browserPeer)
 
     await dispose()
     const withdrawn = await shared.fetch(new Request('http://host/api/session.export'), connection.browserPeer)
@@ -93,7 +95,7 @@ describe('Connection exact Fetch routes', () => {
 
   it('refuses exact routes to non-owner Peers while the RPC interceptor still receives them', async () => {
     const { connection, dispose: disposeFiber } = await mounted()
-    const route = vi.fn(async () => new Response('route'))
+    const route = vi.fn(async (_request: Request, _peer: PeerScope) => new Response('route'))
     const disposeRoute = connection.fetch.register({
       path: '/api/session.export', methods: ['GET'], requestBody: 'buffered', fetch: route,
     })
@@ -109,6 +111,9 @@ describe('Connection exact Fetch routes', () => {
     expect(refused.status).toBe(403)
     expect(route).not.toHaveBeenCalled()
     expect((await shared.fetch(new Request('http://host/api/session.export'), connection.browserPeer)).status).toBe(200)
+    const apiOwner = connection.createPeer({ principal: { kind: 'owner' } })
+    expect((await shared.fetch(new Request('http://host/api/session.export'), apiOwner)).status).toBe(200)
+    expect(route.mock.calls.at(-1)?.[1]).toBe(apiOwner)
 
     const rpc = await shared.fetch(new Request('http://host/api/goals/get', {
       method: 'POST',
