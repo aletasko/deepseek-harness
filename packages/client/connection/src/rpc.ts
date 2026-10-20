@@ -162,7 +162,7 @@ export interface ConnectionFetchRoute {
    * authentication policy. Only owner Peers reach an exact route; the shared
    * handler answers 403 for every other principal.
    */
-  readonly fetch: (request: Request) => Promise<Response>
+  readonly fetch: (request: Request, peer: PeerScope) => Promise<Response>
 }
 
 /** Host registry for exact Fetch routes that cannot use JSON Remote invocation. */
