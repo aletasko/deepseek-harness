@@ -57,6 +57,7 @@ import {
   assertNoBrokerIdentityOverride,
   bindBrokerProcess,
   BrokerTerminalHandle,
+  brokerModeDeclared,
   launchBrokerProcess,
   resolveBrokerAssignment,
   terminalEnv,
@@ -99,8 +100,6 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   private linuxScopeDecision: Extract<LinuxScopeDecision, { kind: 'scope' }> | undefined
   /** Test hook for platform process inspection; production resolves lazily on terminal spawn. */
   terminalInspector: ProcessInspector | undefined
-  /** Latched once broker mode is declared: later absence of the config denies launches instead of reverting to local. */
-  private brokerModeDeclared = false
 
   constructor(ctx: Context, config: SubprocessConfig = {}) {
     super(ctx, config)
@@ -116,7 +115,6 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     if (declaredBrokerConfig !== undefined && ctx.reflect.get('pluginManager', false) !== undefined) {
       throw new Error('subprocess-local: broker mode cannot start while the plugin manager is present')
     }
-    this.brokerModeDeclared = declaredBrokerConfig !== undefined
     assertBrokerConfig(activeBrokerConfig)
     ctx.effect(() => {
       const onHostExit = (): void => { this.terminateForHostExit() }
@@ -133,17 +131,16 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
 
   /**
    * Read the broker configuration for this launch. The provider can register, replace, or dispose after
-   * construction, so the declaration is read per launch; a declared-but-inactive provider and a provider
-   * that vanished after broker mode was declared both deny rather than select the unconfined local path.
+   * construction, so the declaration is read per launch. Broker mode counts as declared once the name has
+   * ever been provided in this process (see {@link brokerModeDeclared}), so a provider that is pending,
+   * invalid, or already disposed denies instead of selecting the unconfined local path.
    * @returns The active broker configuration, or undefined when broker mode was never declared.
    * @throws When broker mode is declared but no active, valid configuration exists.
    */
   private currentBrokerConfig(): SubprocessBrokerConfig | undefined {
-    const declared = this.ctx.reflect.get('subprocessBrokerConfig', false) as SubprocessBrokerConfig | undefined
     const active = this.ctx.reflect.get('subprocessBrokerConfig') as SubprocessBrokerConfig | undefined
-    if (declared !== undefined) this.brokerModeDeclared = true
     if (active === undefined) {
-      if (!this.brokerModeDeclared) return undefined
+      if (!brokerModeDeclared(this.ctx)) return undefined
       throw new Error('subprocess-local: broker configuration is not active; refusing local spawn')
     }
     return assertBrokerConfig(active)

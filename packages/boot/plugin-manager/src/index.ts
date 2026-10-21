@@ -205,15 +205,21 @@ declare module '@deepseek-ai/cordis' {
 
 /**
  * Refuse profile management while the trusted subprocess broker is configured: an installed bundle runs Host code
- * in Core, outside the broker's confinement. `subprocessBrokerConfig` is read non-strictly so a provider that is
- * still starting or disposing also counts as configured.
- * @param ctx Context whose service scope is checked.
+ * in Core, outside the broker's confinement, and `pnpm` reads run unconfined in Core. Broker mode counts as declared
+ * once `subprocessBrokerConfig` has ever been provided in this process: `provide` records the name in
+ * `ctx.reflect.props` when the provider runs and Cordis keeps it after disposal, so a provider that is starting,
+ * disposing, or already gone still refuses. This is the same check as `brokerModeDeclared` in
+ * `@deepseek-ai/dsh-subprocess-local` and `assertNoSubprocessBroker` in `@deepseek-ai/dsh-cordis-host-runner`,
+ * duplicated because neither package may be imported here; keep the three in step. It guards one process only:
+ * Host code in the same process can mutate `reflect.props`, and a restart forgets the declaration, so a
+ * broker-required profile must be enforced statically.
+ * @param ctx Context whose Cordis root is checked.
  * @param action What the caller was about to do, for the error message.
  * @returns `ctx`, so the check can run before the service registers itself.
- * @throws When `subprocessBrokerConfig` is provided in `ctx`'s scope.
+ * @throws When `subprocessBrokerConfig` is, or ever was, provided in this process.
  */
 function assertNoSubprocessBroker(ctx: Context, action = 'start'): Context {
-  if (ctx.reflect.get('subprocessBrokerConfig', false) !== undefined) {
+  if (ctx.reflect.props['subprocessBrokerConfig'] !== undefined || ctx.reflect.get('subprocessBrokerConfig', false) !== undefined) {
     throw new Error(`plugin-manager: profile management cannot ${action} while a subprocess broker is configured`)
   }
   return ctx
@@ -403,9 +409,11 @@ export class PluginManager extends TypertRemoteService {
 
   /** Read the registries this manager asks: the configured first one, its fallbacks in order, and what pnpm's own configuration names.
    * @returns The registries in pnpm's comparison form; null is the one pnpm's own configuration names, `resolved` as pnpm reads it now.
+   * @throws When a subprocess broker is, or ever was, configured in this process; pnpm is not run.
    */
   @Remote
   async registries(): Promise<PluginRegistries> {
+    assertNoSubprocessBroker(this.ownerContext, 'read registries')
     return {
       ...this.configuredRegistries, fallbackRegistries: [...this.configuredRegistries.fallbackRegistries],
       resolved: await readProfileRegistry(this.profile.dir, {
@@ -419,9 +427,11 @@ export class PluginManager extends TypertRemoteService {
    * @param options The registry asked first.
    * @param signal Ends a registry lookup early.
    * @returns The package the spec names, or why it is refused.
+   * @throws When a subprocess broker is, or ever was, configured in this process; no lookup runs.
    */
   @Remote
   async inspect(spec: string, options?: InspectOptions, signal?: AbortSignal): Promise<PluginSpecInspection> {
+    assertNoSubprocessBroker(this.ownerContext, 'inspect a spec')
     let parsed
     try {
       parsed = parseInstallSpec(spec)
@@ -913,7 +923,8 @@ export class PluginManager extends TypertRemoteService {
 
   /**
    * Run one profile mutation under the profile lock.
-   * @throws When a subprocess broker is configured, checked again after the lock wait; nothing is written.
+   * @throws When a subprocess broker is, or ever was, configured in this process, checked again after the lock wait;
+   * nothing is written. An operation that already passed both checks is not interrupted.
    */
   private async change(
     operation: (result: ChangeResult) => Promise<ChangeResult['application'] | void>,

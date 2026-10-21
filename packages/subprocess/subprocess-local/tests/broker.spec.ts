@@ -297,6 +297,77 @@ describe('local subprocess broker configured after construction', () => {
     }
   })
 
+  it.each([
+    ['spawn', (runtime: LocalSubprocessRuntime) => { runtime.spawn(processSpec()) }],
+    ['spawnTerminal', async (runtime: LocalSubprocessRuntime) => { await runtime.spawnTerminal(TERMINAL_SPEC) }],
+  ] as const)('denies %s after a provider was provided and disposed with no launch in between', async (_api, launch) => {
+    const { ctx, runtime, localSpawn, stop } = await constructedWithoutBroker()
+    try {
+      const dispose = ctx.reflect.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/broker.sock' })
+      await dispose()
+      expect(ctx.reflect.get('subprocessBrokerConfig', false)).toBeUndefined()
+
+      await expect((async () => { await launch(runtime) })()).rejects.toThrow(/broker configuration is not active; refusing local spawn/)
+      expect(localSpawn).not.toHaveBeenCalled()
+    } finally { await stop() }
+  })
+
+  it.each([
+    ['spawn', (runtime: LocalSubprocessRuntime) => { runtime.spawn(processSpec()) }],
+    ['spawnTerminal', async (runtime: LocalSubprocessRuntime) => { await runtime.spawnTerminal(TERMINAL_SPEC) }],
+  ] as const)('denies %s after a provider that never became active was disposed with no launch in between', async (_api, launch) => {
+    const { ctx, runtime, localSpawn, stop } = await constructedWithoutBroker()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const provider = ctx.plugin({
+      name: 'late-pending-then-disposed-broker-config',
+      apply: async (inner: Context) => {
+        inner.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/broker.sock' })
+        await gate
+      },
+    })
+    try {
+      await vi.waitFor(() => { expect(ctx.reflect.get('subprocessBrokerConfig', false)).toBeDefined() })
+      release()
+      await (await provider).dispose()
+      expect(ctx.reflect.get('subprocessBrokerConfig', false)).toBeUndefined()
+
+      await expect((async () => { await launch(runtime) })()).rejects.toThrow(/broker configuration is not active; refusing local spawn/)
+      expect(localSpawn).not.toHaveBeenCalled()
+    } finally {
+      release()
+      await stop()
+    }
+  })
+
+  it('denies launches of a runtime constructed while a provider was active once that provider is disposed', async () => {
+    const ctx = new Context()
+    ctx.provide('tools', {
+      currentActiveExecution: () => ({ active: true }),
+      attestActiveExecution: () => ({ direct: true, sessionId: 'session-7' }),
+    })
+    const dispose = ctx.reflect.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/broker.sock' })
+    const fiber = await ctx.plugin(LocalSubprocessRuntime)
+    const runtime = ctx.subprocess as LocalSubprocessRuntime
+    const localSpawn = vi.fn()
+    runtime.internals.spawn = localSpawn as never
+    try {
+      await dispose()
+      expect(() => runtime.spawn(processSpec())).toThrow(/broker configuration is not active; refusing local spawn/)
+      await expect(runtime.spawnTerminal(TERMINAL_SPEC)).rejects.toThrow(/broker configuration is not active; refusing local spawn/)
+      expect(localSpawn).not.toHaveBeenCalled()
+    } finally { await fiber.dispose() }
+  })
+
+  it('relies on Cordis keeping the declared service name after the provider is disposed', async () => {
+    const ctx = new Context()
+    const dispose = ctx.reflect.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/broker.sock' })
+    await dispose()
+
+    expect(ctx.reflect.props['subprocessBrokerConfig']).toEqual({ type: 'service' })
+    expect(new Context().reflect.props['subprocessBrokerConfig']).toBeUndefined()
+  })
+
   it('denies a late config that is not an absolute socket path', async () => {
     const { ctx, runtime, localSpawn, stop } = await constructedWithoutBroker()
     try {

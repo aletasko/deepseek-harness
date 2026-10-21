@@ -1,8 +1,9 @@
 /** Profile management stays unavailable while the trusted subprocess broker is configured, in either initialization order. */
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
+import { withFileLock } from '@deepseek-ai/dsh-atomic-write'
 import { expect, it, onTestFinished, vi } from 'vitest'
 import PluginManager, { type Config } from '../src/index.ts'
 import * as tool from '../src/tools.ts'
@@ -22,7 +23,7 @@ function managerFixture(): { ctx: Context; profileDir: string } {
   const ctx = new Context()
   onTestFinished(async () => { await ctx.fiber.dispose(); rmSync(profileDir, { recursive: true, force: true }) })
   ctx.reflect.provide('loader', {} as never)
-  ctx.reflect.provide('profileContext', { dir: profileDir, startedBundles: [] } as never)
+  ctx.reflect.provide('profileContext', { dir: profileDir, installAnchor: join(profileDir, 'installation.json'), startedBundles: [] } as never)
   return { ctx, profileDir }
 }
 
@@ -148,13 +149,134 @@ it.each(MUTATIONS)('refuses %s on a live manager while the broker config provide
   expect(readdirSync(profileDir)).toEqual([])
 })
 
-it('serves a mutation again after the broker config is disposed', async () => {
-  const { ctx } = managerFixture()
+const DECLARED_REFUSAL = /profile management cannot change the profile while a subprocess broker is configured/
+
+it.each(MUTATIONS)('keeps refusing %s after the broker config is disposed with no call in between', async (_name, mutate) => {
+  const { ctx, profileDir } = managerFixture()
   await ctx.plugin(PluginManager, MANAGER_CONFIG)
   const manager = ctx.pluginManager
   const disposeConfig = ctx.reflect.provide('subprocessBrokerConfig', BROKER_CONFIG)
-  await expect(manager.removeBundle('missing-bundle')).rejects.toThrow(LATE_REFUSAL)
   await disposeConfig()
+  expect(ctx.reflect.get('subprocessBrokerConfig', false)).toBeUndefined()
 
-  await expect(manager.removeBundle('missing-bundle')).resolves.toMatchObject({ stage: 'remove', target: 'missing-bundle' })
+  await expect(mutate(manager)).rejects.toThrow(DECLARED_REFUSAL)
+
+  expect(readdirSync(profileDir)).toEqual([])
+})
+
+it.each(MUTATIONS)('keeps refusing %s after a pending broker config provider is disposed before it became active', async (_name, mutate) => {
+  const { ctx, profileDir } = managerFixture()
+  await ctx.plugin(PluginManager, MANAGER_CONFIG)
+  const manager = ctx.pluginManager
+  const stop = pendingBrokerConfig(ctx)
+  onTestFinished(async () => { await stop() })
+  await vi.waitFor(() => { expect(ctx.reflect.get('subprocessBrokerConfig', false)).toBeDefined() })
+  await stop()
+  expect(ctx.reflect.get('subprocessBrokerConfig', false)).toBeUndefined()
+
+  await expect(mutate(manager)).rejects.toThrow(DECLARED_REFUSAL)
+
+  expect(readdirSync(profileDir)).toEqual([])
+})
+
+it.each(['stays active', 'is disposed'] as const)('refuses a mutation queued on the profile lock when the broker config appears and %s before the lock frees', async (outcome) => {
+  const { ctx, profileDir } = managerFixture()
+  await ctx.plugin(PluginManager, MANAGER_CONFIG)
+  const manager = ctx.pluginManager
+  const lockHeld = Promise.withResolvers<undefined>()
+  const freeLock = Promise.withResolvers<undefined>()
+  const holder = withFileLock(join(profileDir, 'package.json'), async () => {
+    lockHeld.resolve(undefined)
+    await freeLock.promise
+  })
+  await lockHeld.promise
+  const queued = manager.removeBundle('missing-bundle')
+  const settled = queued.then(() => undefined, (error: unknown) => error)
+  await new Promise(resolve => setTimeout(resolve, 100))
+  const disposeConfig = ctx.reflect.provide('subprocessBrokerConfig', BROKER_CONFIG)
+  if (outcome === 'is disposed') await disposeConfig()
+  else onTestFinished(async () => { await disposeConfig() })
+
+  freeLock.resolve(undefined)
+  await holder
+
+  const failure = await settled
+  expect(failure).toBeInstanceOf(Error)
+  expect((failure as Error).message).toMatch(DECLARED_REFUSAL)
+  expect(readdirSync(profileDir)).toEqual([])
+})
+
+/** A pnpm stand-in that records every launch in `marker` and prints a registry URL. */
+function recordingPnpm(): { command: string; marker: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'plugin-manager-broker-gate-pnpm-'))
+  onTestFinished(() => { rmSync(dir, { recursive: true, force: true }) })
+  const marker = join(dir, 'launched')
+  const command = join(dir, 'pnpm')
+  writeFileSync(command, `#!/bin/sh\ntouch '${marker}'\necho https://registry.npmjs.org/\n`)
+  chmodSync(command, 0o700)
+  return { command, marker }
+}
+
+const PNPM_READS: [string, (manager: PluginManager) => Promise<unknown>][] = [
+  ['registries', manager => manager.registries()],
+  ['inspect', manager => manager.inspect('some-package')],
+]
+const READ_REFUSAL = /profile management cannot (read registries|inspect a spec) while a subprocess broker is configured/
+
+/** A manager over a readable empty profile, so `inspect` reaches its registry read; `pnpm` is the recording stand-in. */
+async function readerFixture(): Promise<{ ctx: Context; marker: string }> {
+  const { ctx, profileDir } = managerFixture()
+  const { command, marker } = recordingPnpm()
+  writeFileSync(join(profileDir, 'package.json'), '{}')
+  writeFileSync(join(profileDir, 'installation.json'), '{}')
+  await ctx.plugin(PluginManager, { ...MANAGER_CONFIG, pnpmCommand: command })
+  return { ctx, marker }
+}
+
+it.each(PNPM_READS)('launches the configured pnpm for %s when no broker was ever declared', async (_name, read) => {
+  const { ctx, marker } = await readerFixture()
+
+  await read(ctx.pluginManager).catch(() => undefined)
+
+  expect(existsSync(marker)).toBe(true)
+})
+
+it.each(PNPM_READS)('refuses %s without launching pnpm while the broker config is active', async (_name, read) => {
+  const { ctx, marker } = await readerFixture()
+  const disposeConfig = ctx.reflect.provide('subprocessBrokerConfig', BROKER_CONFIG)
+  onTestFinished(async () => { await disposeConfig() })
+
+  await expect(read(ctx.pluginManager)).rejects.toThrow(READ_REFUSAL)
+
+  expect(existsSync(marker)).toBe(false)
+})
+
+it.each(PNPM_READS)('refuses %s without launching pnpm after the broker config is disposed with no call in between', async (_name, read) => {
+  const { ctx, marker } = await readerFixture()
+  await ctx.reflect.provide('subprocessBrokerConfig', BROKER_CONFIG)()
+
+  await expect(read(ctx.pluginManager)).rejects.toThrow(READ_REFUSAL)
+
+  expect(existsSync(marker)).toBe(false)
+})
+
+it.each(PNPM_READS)('refuses %s without launching pnpm while the broker config provider is registered but not yet active', async (_name, read) => {
+  const { ctx, marker } = await readerFixture()
+  const stop = pendingBrokerConfig(ctx)
+  onTestFinished(async () => { await stop() })
+  await vi.waitFor(() => { expect(ctx.reflect.get('subprocessBrokerConfig', false)).toBeDefined() })
+
+  await expect(read(ctx.pluginManager)).rejects.toThrow(READ_REFUSAL)
+
+  expect(existsSync(marker)).toBe(false)
+})
+
+it('refuses manager construction after a broker config was provided and disposed', async () => {
+  const { ctx, profileDir } = managerFixture()
+  await ctx.reflect.provide('subprocessBrokerConfig', BROKER_CONFIG)()
+
+  await expect((async () => { await ctx.plugin(PluginManager, MANAGER_CONFIG) })()).rejects.toThrow(MANAGER_REFUSAL)
+
+  expect(ctx.reflect.get('pluginManager', false)).toBeUndefined()
+  expect(readdirSync(profileDir)).toEqual([])
 })

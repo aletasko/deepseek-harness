@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { connect } from 'node:net'
 import { isAbsolute } from 'node:path'
 import { PassThrough } from 'node:stream'
+import type { Context } from '@deepseek-ai/cordis'
 import type {
   SubprocessOutcome,
   SubprocessSpawnSpec,
@@ -434,6 +435,24 @@ export function bindBrokerProcess(
   internals?: Parameters<typeof bindManagedProcess>[2],
 ): ReturnType<typeof bindManagedProcess> {
   return bindManagedProcess(spec, launch, internals)
+}
+
+/**
+ * Whether broker mode has ever been declared in this Core process. `provide('subprocessBrokerConfig')` records the
+ * name in `ctx.reflect.props` as soon as the provider runs, and Cordis never removes it when the provider is
+ * disposed, so a pending, replaced, or disposed provider still counts. The same check is duplicated in
+ * `@deepseek-ai/dsh-plugin-manager` and `@deepseek-ai/dsh-cordis-host-runner`, which cannot import this package
+ * without a new dependency edge; keep the three in step.
+ *
+ * This is a same-process guard, not a security boundary: Host code that shares the process can mutate
+ * `reflect.props`, and the record is lost when the process restarts. A broker-required profile must be enforced
+ * statically.
+ * @param ctx Context whose Cordis root is checked.
+ * @returns True when the name was provided in this process or is provided now.
+ */
+export function brokerModeDeclared(ctx: Context): boolean {
+  return ctx.reflect.props['subprocessBrokerConfig'] !== undefined
+    || ctx.reflect.get('subprocessBrokerConfig', false) !== undefined
 }
 
 export function assertBrokerConfig(config: SubprocessBrokerConfig | undefined): SubprocessBrokerConfig | undefined {
