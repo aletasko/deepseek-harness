@@ -92,6 +92,63 @@ async function withRuntime<T>(socketPath: string, run: (ctx: Context, fiber: Awa
   try { return await run(ctx, fiber) } finally { await fiber.dispose() }
 }
 
+describe('local subprocess broker with the dynamic Host runner', () => {
+  const REFUSAL = /broker mode cannot start while the dynamic Cordis Host runner is present/
+
+  it('refuses construction before any broker connection when the runner service already exists', async () => {
+    const broker = await fakeBroker(() => {})
+    try {
+      const ctx = new Context()
+      ctx.provide('subprocessBrokerConfig', { socketPath: broker.socketPath })
+      ctx.reflect.provide('dynamicCordisRunner', {})
+      await expect((async () => { await ctx.plugin(LocalSubprocessRuntime) })()).rejects.toThrow(REFUSAL)
+      expect(ctx.reflect.get('subprocess', false)).toBeUndefined()
+      expect(broker.peer.messages).toHaveLength(0)
+    } finally { await broker.close() }
+  })
+
+  it('refuses construction when the broker config provider is registered but not yet active', async () => {
+    const ctx = new Context()
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const provider = ctx.plugin({
+      name: 'pending-broker-config',
+      apply: async (inner: Context) => {
+        inner.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/broker.sock' })
+        await gate
+      },
+    })
+    try {
+      await vi.waitFor(() => { expect(ctx.reflect.get('subprocessBrokerConfig', false)).toBeDefined() })
+      expect(ctx.reflect.get('subprocessBrokerConfig')).toBeUndefined()
+      await expect((async () => { await ctx.plugin(LocalSubprocessRuntime) })())
+        .rejects.toThrow(/registered but not active; refusing local spawn/)
+      expect(ctx.reflect.get('subprocess', false)).toBeUndefined()
+    } finally {
+      release()
+      await (await provider).dispose()
+    }
+  })
+
+  it('starts normally with a broker config and no runner', async () => {
+    const broker = await fakeBroker(() => {})
+    try {
+      await withRuntime(broker.socketPath, async ctx => {
+        expect(ctx.subprocess).toBeInstanceOf(LocalSubprocessRuntime)
+      })
+    } finally { await broker.close() }
+  })
+
+  it('starts normally with the runner and no broker config', async () => {
+    const ctx = new Context()
+    ctx.reflect.provide('dynamicCordisRunner', {})
+    const fiber = await ctx.plugin(LocalSubprocessRuntime)
+    try {
+      expect(ctx.subprocess).toBeInstanceOf(LocalSubprocessRuntime)
+    } finally { await fiber.dispose() }
+  })
+})
+
 describe('local subprocess broker route', () => {
   it('registers Core before start and refuses a forged registration receipt', async () => {
     const broker = await fakeBroker(() => {}, 'invalid')
