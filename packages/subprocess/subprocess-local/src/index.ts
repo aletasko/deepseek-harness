@@ -99,7 +99,8 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   private linuxScopeDecision: Extract<LinuxScopeDecision, { kind: 'scope' }> | undefined
   /** Test hook for platform process inspection; production resolves lazily on terminal spawn. */
   terminalInspector: ProcessInspector | undefined
-  private readonly brokerConfig: SubprocessBrokerConfig | undefined
+  /** Latched once broker mode is declared: later absence of the config denies launches instead of reverting to local. */
+  private brokerModeDeclared = false
 
   constructor(ctx: Context, config: SubprocessConfig = {}) {
     super(ctx, config)
@@ -115,7 +116,8 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     if (declaredBrokerConfig !== undefined && ctx.reflect.get('pluginManager', false) !== undefined) {
       throw new Error('subprocess-local: broker mode cannot start while the plugin manager is present')
     }
-    this.brokerConfig = assertBrokerConfig(activeBrokerConfig)
+    this.brokerModeDeclared = declaredBrokerConfig !== undefined
+    assertBrokerConfig(activeBrokerConfig)
     ctx.effect(() => {
       const onHostExit = (): void => { this.terminateForHostExit() }
       process.prependListener('exit', onHostExit)
@@ -128,6 +130,24 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
 
   /** Spill failures reach the plugin logger; the log line is the only trace of why a result has no spill path. */
   private readonly reportSpillFailure = logSpillFailure(this.ctx.logger, 'subprocess-local')
+
+  /**
+   * Read the broker configuration for this launch. The provider can register, replace, or dispose after
+   * construction, so the declaration is read per launch; a declared-but-inactive provider and a provider
+   * that vanished after broker mode was declared both deny rather than select the unconfined local path.
+   * @returns The active broker configuration, or undefined when broker mode was never declared.
+   * @throws When broker mode is declared but no active, valid configuration exists.
+   */
+  private currentBrokerConfig(): SubprocessBrokerConfig | undefined {
+    const declared = this.ctx.reflect.get('subprocessBrokerConfig', false) as SubprocessBrokerConfig | undefined
+    const active = this.ctx.reflect.get('subprocessBrokerConfig') as SubprocessBrokerConfig | undefined
+    if (declared !== undefined) this.brokerModeDeclared = true
+    if (active === undefined) {
+      if (!this.brokerModeDeclared) return undefined
+      throw new Error('subprocess-local: broker configuration is not active; refusing local spawn')
+    }
+    return assertBrokerConfig(active)
+  }
 
   /** Resolve the assignment only from the exact Core-attested active session. */
   private brokerAssignment(): string {
@@ -239,14 +259,15 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     validateSubprocessSpec(spec)
     this.authorizeStart({ kind: 'spawn', argv: spec.argv, cwd: spec.cwd })
     const env = targetEnvironment(spec)
-    const containmentMode = this.brokerConfig === undefined ? this.selectContainmentMode('ordinary') : undefined
+    const brokerConfig = this.currentBrokerConfig()
+    const containmentMode = brokerConfig === undefined ? this.selectContainmentMode('ordinary') : undefined
     let handle: LocalSubprocessHandle
     const internals: SpawnInternals = { ...this.internals, onSpillFailure: this.reportSpillFailure }
-    if (this.brokerConfig !== undefined) {
+    if (brokerConfig !== undefined) {
       const assignmentId = this.brokerAssignment()
       assertNoBrokerIdentityOverride(env)
       const binding = prepareManagedProcessBinding(internals)
-      handle = bindBrokerProcess(spec, launchBrokerProcess(spec, env, this.brokerConfig, assignmentId, spec.signal), binding)
+      handle = bindBrokerProcess(spec, launchBrokerProcess(spec, env, brokerConfig, assignmentId, spec.signal), binding)
     } else if (containmentMode === 'fallback') {
       handle = spawnSubprocess(spec, internals)
     } else {
@@ -342,11 +363,12 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     }
     spec.signal?.throwIfAborted()
     this.authorizeStart({ kind: 'terminal', argv: spec.argv, cwd: spec.cwd })
-    if (this.brokerConfig !== undefined) {
+    const brokerConfig = this.currentBrokerConfig()
+    if (brokerConfig !== undefined) {
       const assignmentId = this.brokerAssignment()
       const env = targetEnvironment(spec)
       assertNoBrokerIdentityOverride(env)
-      const handle = new BrokerTerminalHandle(this.brokerConfig, assignmentId, spec, terminalEnv(spec, env))
+      const handle = new BrokerTerminalHandle(brokerConfig, assignmentId, spec, terminalEnv(spec, env))
       this.brokerTerminals.add(handle)
       try {
         await handle.ready

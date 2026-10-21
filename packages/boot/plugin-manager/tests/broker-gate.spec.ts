@@ -112,3 +112,49 @@ it('registers the tool when no broker is configured', async () => {
 
   expect(register).toHaveBeenCalledTimes(1)
 })
+
+const MUTATIONS: [string, (manager: PluginManager) => Promise<unknown>][] = [
+  ['setVersionExemption', manager => manager.setVersionExemption('pkg@1.0.0', '0.0.0', false)],
+  ['setPluginEnabled', manager => manager.setPluginEnabled('missing' as never, true)],
+  ['setBundleEnabled', manager => manager.setBundleEnabled('missing-bundle', true)],
+  ['installBundle', manager => manager.installBundle('missing-bundle')],
+  ['removeBundle', manager => manager.removeBundle('missing-bundle')],
+]
+const LATE_REFUSAL = /profile management cannot change the profile while a subprocess broker is configured/
+
+it.each(MUTATIONS)('refuses %s on a live manager once the broker config appears, leaving the profile untouched', async (_name, mutate) => {
+  const { ctx, profileDir } = managerFixture()
+  await ctx.plugin(PluginManager, MANAGER_CONFIG)
+  const manager = ctx.pluginManager
+  const disposeConfig = ctx.reflect.provide('subprocessBrokerConfig', BROKER_CONFIG)
+
+  await expect(mutate(manager)).rejects.toThrow(LATE_REFUSAL)
+
+  expect(readdirSync(profileDir)).toEqual([])
+  await disposeConfig()
+})
+
+it.each(MUTATIONS)('refuses %s on a live manager while the broker config provider is registered but not yet active', async (_name, mutate) => {
+  const { ctx, profileDir } = managerFixture()
+  await ctx.plugin(PluginManager, MANAGER_CONFIG)
+  const manager = ctx.pluginManager
+  const stop = pendingBrokerConfig(ctx)
+  onTestFinished(async () => { await stop() })
+  await vi.waitFor(() => { expect(ctx.reflect.get('subprocessBrokerConfig', false)).toBeDefined() })
+  expect(ctx.reflect.get('subprocessBrokerConfig')).toBeUndefined()
+
+  await expect(mutate(manager)).rejects.toThrow(LATE_REFUSAL)
+
+  expect(readdirSync(profileDir)).toEqual([])
+})
+
+it('serves a mutation again after the broker config is disposed', async () => {
+  const { ctx } = managerFixture()
+  await ctx.plugin(PluginManager, MANAGER_CONFIG)
+  const manager = ctx.pluginManager
+  const disposeConfig = ctx.reflect.provide('subprocessBrokerConfig', BROKER_CONFIG)
+  await expect(manager.removeBundle('missing-bundle')).rejects.toThrow(LATE_REFUSAL)
+  await disposeConfig()
+
+  await expect(manager.removeBundle('missing-bundle')).resolves.toMatchObject({ stage: 'remove', target: 'missing-bundle' })
+})

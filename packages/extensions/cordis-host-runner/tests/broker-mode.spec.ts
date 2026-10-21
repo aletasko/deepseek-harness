@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Timer from '@deepseek-ai/cordis-plugin-timer'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -45,5 +45,63 @@ describe('dynamic Host runner with a subprocess broker', () => {
     await mount(harness, REVERSE_TOOL_CODE)
 
     expect(harness.ctx.tools.get('reverse_text')).toBeDefined()
+  })
+
+  it('refuses invoke on an already-live run once the broker is configured, and serves it again after the config is gone', async () => {
+    const harness = await setup()
+    const { pluginId, packageId } = harness.runner.define({
+      sessionId: AGENT_A.id, plugin: { kind: 'new', idPrefix: 'live' }, name: 'live-double', purpose: 'spec fixture',
+      code: { host: "harness.handle('double', async (args) => args.value * 2)\nreturn { name: 'doubler', apply() {} }" },
+    })
+    const receipt = await harness.runner.run(AGENT_A, pluginId, packageId, 'run')
+    if (!receipt.ok) throw new Error(receipt.message)
+    await expect(harness.runner.invoke(pluginId, receipt.pluginRunId, 'double', { value: 2 })).resolves.toEqual({ ok: true, value: 4 })
+
+    const disposeConfig = harness.ctx.reflect.provide('subprocessBrokerConfig', BROKER_CONFIG)
+    await expect(harness.runner.invoke(pluginId, receipt.pluginRunId, 'double', { value: 2 })).rejects.toThrow(/cannot be invoked while a subprocess broker is configured/)
+
+    await disposeConfig()
+    await expect(harness.runner.invoke(pluginId, receipt.pluginRunId, 'double', { value: 3 })).resolves.toEqual({ ok: true, value: 6 })
+  })
+
+  it('refuses invoke while the broker config provider is registered but not yet active', async () => {
+    const harness = await setup()
+    const pluginId = await mount(harness, "harness.handle('ping', async () => 'pong')\nreturn { name: 'pinger', apply() {} }")
+    const runId = harness.runner.inventory().find(row => row.pluginId === pluginId)?.activeRun?.pluginRunId
+    if (runId === undefined) throw new Error('fixture did not start')
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const provider = harness.ctx.plugin({
+      name: 'pending-broker-config',
+      apply: async (inner: Context) => {
+        inner.provide('subprocessBrokerConfig', BROKER_CONFIG)
+        await gate
+      },
+    })
+    try {
+      await vi.waitFor(() => { expect(harness.ctx.reflect.get('subprocessBrokerConfig', false)).toBeDefined() })
+      expect(harness.ctx.reflect.get('subprocessBrokerConfig')).toBeUndefined()
+      await expect(harness.runner.invoke(pluginId, runId, 'ping', null)).rejects.toThrow(BROKER_REFUSAL)
+    } finally {
+      release()
+      await (await provider).dispose()
+    }
+  })
+
+  it('refuses to restart Host code for a plugin that is already running, leaving it stopped', async () => {
+    const harness = await setup()
+    const { pluginId, packageId } = harness.runner.define({
+      sessionId: AGENT_A.id, plugin: { kind: 'new', idPrefix: 'again' }, name: 'again', purpose: 'spec fixture',
+      code: { host: "return { name: 'again', apply() {} }" },
+    })
+    const first = await harness.runner.run(AGENT_A, pluginId, packageId, 'run')
+    expect(first.ok).toBe(true)
+    harness.ctx.reflect.provide('subprocessBrokerConfig', BROKER_CONFIG)
+
+    const second = await harness.runner.run(AGENT_A, pluginId, packageId, 'run')
+
+    expect(second).toMatchObject({ ok: false })
+    expect(JSON.stringify(second)).toMatch(BROKER_REFUSAL)
+    expect(running(harness.runner, AGENT_A).every(row => !row.running)).toBe(true)
   })
 })

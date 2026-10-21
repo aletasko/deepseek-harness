@@ -200,6 +200,126 @@ describe('local subprocess broker with the plugin manager', () => {
   })
 })
 
+/** Broker that accepts one start and finishes the process or terminal immediately. */
+function acceptingBroker(label: string): ReturnType<typeof fakeBroker> {
+  return fakeBroker((message, peer) => {
+    if (message.type !== 'start') return
+    peer.send({ type: 'accepted', handle: label, pid: 4242 })
+    peer.send({ type: 'outcome', handle: label, exitCode: 0, signal: null })
+    peer.send({ type: 'empty', handle: label })
+  })
+}
+
+/** A started runtime that was constructed before any broker config existed. */
+async function constructedWithoutBroker(): Promise<{
+  ctx: Context
+  runtime: LocalSubprocessRuntime
+  localSpawn: ReturnType<typeof vi.fn>
+  stop: () => Promise<void>
+}> {
+  const ctx = new Context()
+  ctx.provide('tools', {
+    currentActiveExecution: () => ({ active: true }),
+    attestActiveExecution: () => ({ direct: true, sessionId: 'session-7' }),
+  })
+  ctx.provide('subprocessBrokerAssignmentResolver', { resolve: (id: string) => id === 'session-7' ? 'trusted-assignment-7' : undefined })
+  const fiber = await ctx.plugin(LocalSubprocessRuntime)
+  const runtime = ctx.subprocess as LocalSubprocessRuntime
+  const localSpawn = vi.fn()
+  runtime.internals.spawn = localSpawn as never
+  runtime.terminalInspector = { snapshot: vi.fn() } as never
+  return { ctx, runtime, localSpawn, stop: async () => { await fiber.dispose() } }
+}
+
+const TERMINAL_SPEC = { argv: ['/bin/sh'], cwd: '/assigned/tree', rows: 24, cols: 80, terminalType: 'xterm', graceMs: 100 }
+
+describe('local subprocess broker configured after construction', () => {
+  it('routes spawn and spawnTerminal through a config provided after the constructor', async () => {
+    const broker = await acceptingBroker('late-config')
+    const { ctx, runtime, localSpawn, stop } = await constructedWithoutBroker()
+    try {
+      ctx.reflect.provide('subprocessBrokerConfig', { socketPath: broker.socketPath })
+      await expect(runtime.spawn(processSpec()).done).resolves.toEqual({ exitCode: 0, signal: null })
+      await expect(broker.peer.waitFor('start')).resolves.toMatchObject({ mode: 'process', assignmentId: 'trusted-assignment-7' })
+      const terminal = await runtime.spawnTerminal(TERMINAL_SPEC)
+      expect(terminal.pid).toBe(4242)
+      expect(broker.peer.messages.filter(message => message.type === 'start').map(message => message.mode)).toContain('process')
+      expect(localSpawn).not.toHaveBeenCalled()
+    } finally {
+      await stop()
+      await broker.close()
+    }
+  })
+
+  it('denies spawn and spawnTerminal while a late config provider is registered but not yet active', async () => {
+    const { ctx, runtime, localSpawn, stop } = await constructedWithoutBroker()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const provider = ctx.plugin({
+      name: 'late-pending-broker-config',
+      apply: async (inner: Context) => {
+        inner.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/broker.sock' })
+        await gate
+      },
+    })
+    try {
+      await vi.waitFor(() => { expect(ctx.reflect.get('subprocessBrokerConfig', false)).toBeDefined() })
+      expect(ctx.reflect.get('subprocessBrokerConfig')).toBeUndefined()
+      expect(() => runtime.spawn(processSpec())).toThrow(/broker configuration is not active; refusing local spawn/)
+      await expect(runtime.spawnTerminal(TERMINAL_SPEC)).rejects.toThrow(/broker configuration is not active; refusing local spawn/)
+      expect(localSpawn).not.toHaveBeenCalled()
+    } finally {
+      release()
+      await (await provider).dispose()
+      await stop()
+    }
+  })
+
+  it('keeps denying after the provider is disposed and follows a replacement provider', async () => {
+    const first = await acceptingBroker('first')
+    const second = await acceptingBroker('second')
+    const { ctx, runtime, localSpawn, stop } = await constructedWithoutBroker()
+    try {
+      const disposeFirst = ctx.reflect.provide('subprocessBrokerConfig', { socketPath: first.socketPath })
+      await expect(runtime.spawn(processSpec()).done).resolves.toEqual({ exitCode: 0, signal: null })
+      await disposeFirst()
+      expect(() => runtime.spawn(processSpec())).toThrow(/broker configuration is not active/)
+      await expect(runtime.spawnTerminal(TERMINAL_SPEC)).rejects.toThrow(/broker configuration is not active/)
+      ctx.reflect.provide('subprocessBrokerConfig', { socketPath: second.socketPath })
+      await expect(runtime.spawn(processSpec()).done).resolves.toEqual({ exitCode: 0, signal: null })
+      expect(first.peer.messages.filter(message => message.type === 'start')).toHaveLength(1)
+      expect(second.peer.messages.filter(message => message.type === 'start')).toHaveLength(1)
+      expect(localSpawn).not.toHaveBeenCalled()
+    } finally {
+      await stop()
+      await first.close()
+      await second.close()
+    }
+  })
+
+  it('denies a late config that is not an absolute socket path', async () => {
+    const { ctx, runtime, localSpawn, stop } = await constructedWithoutBroker()
+    try {
+      ctx.reflect.provide('subprocessBrokerConfig', { socketPath: 'relative.sock' })
+      expect(() => runtime.spawn(processSpec())).toThrow(/invalid trusted broker configuration/)
+      await expect(runtime.spawnTerminal(TERMINAL_SPEC)).rejects.toThrow(/invalid trusted broker configuration/)
+      expect(localSpawn).not.toHaveBeenCalled()
+    } finally { await stop() }
+  })
+
+  it('keeps the ordinary local path when broker mode was never declared', { timeout: 30_000 }, async () => {
+    const { runtime, stop } = await constructedWithoutBroker()
+    delete runtime.internals.spawn
+    try {
+      const handle = runtime.spawn(processSpec({
+        argv: [process.execPath, '-e', ''], cwd: process.cwd(),
+        stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 }, stderr: { maxBytes: 1024 } },
+      }))
+      await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
+    } finally { await stop() }
+  })
+})
+
 describe('local subprocess broker route', () => {
   it('registers Core before start and refuses a forged registration receipt', async () => {
     const broker = await fakeBroker(() => {}, 'invalid')

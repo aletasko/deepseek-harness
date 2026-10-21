@@ -759,6 +759,7 @@ export class DynamicCordisRunnerService extends TypertRemoteService {
    * @param method - Registered Host handler name.
    * @param args - JSON argument delivered to the handler.
    * @returns The JSON result or a typed invocation failure.
+   * @throws when a subprocess broker is configured, including after this run started; the handler is not called.
    */
   @Remote('invoke')
   async invoke(
@@ -767,6 +768,7 @@ export class DynamicCordisRunnerService extends TypertRemoteService {
     method: string,
     args: JsonValue,
   ): Promise<DynamicCordisInvokeResult> {
+    assertNoSubprocessBroker(this.rootCtx, 'be invoked')
     const plugin = this.registry.get(pluginId)
     if (plugin === undefined || plugin.run === undefined) {
       return { ok: false, code: 'plugin-not-running', message: `dynamic plugin "${pluginId}" is not running` }

@@ -208,12 +208,13 @@ declare module '@deepseek-ai/cordis' {
  * in Core, outside the broker's confinement. `subprocessBrokerConfig` is read non-strictly so a provider that is
  * still starting or disposing also counts as configured.
  * @param ctx Context whose service scope is checked.
+ * @param action What the caller was about to do, for the error message.
  * @returns `ctx`, so the check can run before the service registers itself.
  * @throws When `subprocessBrokerConfig` is provided in `ctx`'s scope.
  */
-function assertNoSubprocessBroker(ctx: Context): Context {
+function assertNoSubprocessBroker(ctx: Context, action = 'start'): Context {
   if (ctx.reflect.get('subprocessBrokerConfig', false) !== undefined) {
-    throw new Error('plugin-manager: profile management cannot start while a subprocess broker is configured')
+    throw new Error(`plugin-manager: profile management cannot ${action} while a subprocess broker is configured`)
   }
   return ctx
 }
@@ -910,12 +911,18 @@ export class PluginManager extends TypertRemoteService {
     return restart === undefined ? { warnings } : { warnings, restartReason: restart }
   }
 
+  /**
+   * Run one profile mutation under the profile lock.
+   * @throws When a subprocess broker is configured, checked again after the lock wait; nothing is written.
+   */
   private async change(
     operation: (result: ChangeResult) => Promise<ChangeResult['application'] | void>,
     request: Pick<ChangeResult, 'stage' | 'target' | 'enabled'>,
     reason: PluginChange['reason'],
   ): Promise<ChangeResult> {
+    assertNoSubprocessBroker(this.ownerContext, 'change the profile')
     return withFileLock(join(this.profile.dir, 'package.json'), async () => {
+      assertNoSubprocessBroker(this.ownerContext, 'change the profile')
       this.abort.signal.throwIfAborted()
       const before = this.diskState()
       const result: ChangeResult = { ...request, changed: false,
