@@ -203,6 +203,21 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
+/**
+ * Refuse profile management while the trusted subprocess broker is configured: an installed bundle runs Host code
+ * in Core, outside the broker's confinement. `subprocessBrokerConfig` is read non-strictly so a provider that is
+ * still starting or disposing also counts as configured.
+ * @param ctx Context whose service scope is checked.
+ * @returns `ctx`, so the check can run before the service registers itself.
+ * @throws When `subprocessBrokerConfig` is provided in `ctx`'s scope.
+ */
+function assertNoSubprocessBroker(ctx: Context): Context {
+  if (ctx.reflect.get('subprocessBrokerConfig', false) !== undefined) {
+    throw new Error('plugin-manager: profile management cannot start while a subprocess broker is configured')
+  }
+  return ctx
+}
+
 /** Manage profile files and apply their declared reload lifecycle. */
 export class PluginManager extends TypertRemoteService {
   static inject = ['loader', 'profileContext']
@@ -239,7 +254,7 @@ export class PluginManager extends TypertRemoteService {
   private readonly installs = new Map<PluginInstallRequestId, InstallControl>()
 
   constructor(ctx: Context, config: Config) {
-    super(ctx, 'pluginManager')
+    super(assertNoSubprocessBroker(ctx), 'pluginManager')
     this.ownerEntryId = ctx.fiber.entry?.id
     this.ownerContext = ctx
     this.profile = ctx.profileContext

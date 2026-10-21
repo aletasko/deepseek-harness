@@ -112,6 +112,9 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     if (declaredBrokerConfig !== undefined && ctx.reflect.get('dynamicCordisRunner', false) !== undefined) {
       throw new Error('subprocess-local: broker mode cannot start while the dynamic Cordis Host runner is present')
     }
+    if (declaredBrokerConfig !== undefined && ctx.reflect.get('pluginManager', false) !== undefined) {
+      throw new Error('subprocess-local: broker mode cannot start while the plugin manager is present')
+    }
     this.brokerConfig = assertBrokerConfig(activeBrokerConfig)
     ctx.effect(() => {
       const onHostExit = (): void => { this.terminateForHostExit() }

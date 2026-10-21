@@ -149,6 +149,57 @@ describe('local subprocess broker with the dynamic Host runner', () => {
   })
 })
 
+describe('local subprocess broker with the plugin manager', () => {
+  const REFUSAL = /broker mode cannot start while the plugin manager is present/
+
+  it('refuses construction before any broker connection when the manager service already exists', async () => {
+    const broker = await fakeBroker(() => {})
+    try {
+      const ctx = new Context()
+      ctx.provide('subprocessBrokerConfig', { socketPath: broker.socketPath })
+      ctx.reflect.provide('pluginManager', {})
+      await expect((async () => { await ctx.plugin(LocalSubprocessRuntime) })()).rejects.toThrow(REFUSAL)
+      expect(ctx.reflect.get('subprocess', false)).toBeUndefined()
+      expect(broker.peer.messages).toHaveLength(0)
+    } finally { await broker.close() }
+  })
+
+  it('refuses construction when the manager service is registered but not yet active', async () => {
+    const broker = await fakeBroker(() => {})
+    const ctx = new Context()
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    ctx.provide('subprocessBrokerConfig', { socketPath: broker.socketPath })
+    const provider = ctx.plugin({
+      name: 'pending-plugin-manager',
+      apply: async (inner: Context) => {
+        inner.provide('pluginManager', {})
+        await gate
+      },
+    })
+    try {
+      await vi.waitFor(() => { expect(ctx.reflect.get('pluginManager', false)).toBeDefined() })
+      expect(ctx.reflect.get('pluginManager')).toBeUndefined()
+      await expect((async () => { await ctx.plugin(LocalSubprocessRuntime) })()).rejects.toThrow(REFUSAL)
+      expect(ctx.reflect.get('subprocess', false)).toBeUndefined()
+      expect(broker.peer.messages).toHaveLength(0)
+    } finally {
+      release()
+      await (await provider).dispose()
+      await broker.close()
+    }
+  })
+
+  it('starts normally with the manager and no broker config', async () => {
+    const ctx = new Context()
+    ctx.reflect.provide('pluginManager', {})
+    const fiber = await ctx.plugin(LocalSubprocessRuntime)
+    try {
+      expect(ctx.subprocess).toBeInstanceOf(LocalSubprocessRuntime)
+    } finally { await fiber.dispose() }
+  })
+})
+
 describe('local subprocess broker route', () => {
   it('registers Core before start and refuses a forged registration receipt', async () => {
     const broker = await fakeBroker(() => {}, 'invalid')
