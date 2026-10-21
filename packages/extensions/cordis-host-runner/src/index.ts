@@ -153,8 +153,12 @@ export class DynamicCordisRunnerService extends TypertRemoteService {
   private readonly resolved: ResolvedConfig
   private group: Fiber | undefined
 
-  /** Create the service under the Host composition. */
+  /**
+   * Create the service under the Host composition.
+   * @throws when a subprocess broker is configured; the service is not registered in that case.
+   */
   constructor(ctx: Context, config: Config) {
+    assertNoSubprocessBroker(ctx, 'be constructed')
     super(ctx, 'dynamicCordisRunner')
     this.rootCtx = ctx
     this.resolved = config as ResolvedConfig
@@ -914,6 +918,7 @@ export class DynamicCordisRunnerService extends TypertRemoteService {
       return dispose
     }
     try {
+      assertNoSubprocessBroker(this.rootCtx, 'run Host code')
       const sandbox = createSandbox(plugin.pluginId, { handle })
       const evaluated = await evaluateHostCode(sandbox, hostCode, plugin.pluginId, this.resolved.vmTimeoutMs)
       if (!isPlugin(evaluated)) {
@@ -1253,6 +1258,20 @@ export class DynamicCordisRunnerService extends TypertRemoteService {
   private requireGroup(): Fiber {
     this.group ??= this.rootCtx.plugin({ name: 'cordis-dynamic', apply: () => {} })
     return this.group
+  }
+}
+
+/**
+ * Refuse model-defined Host code while the trusted subprocess broker is configured. The Host vm is not a
+ * security boundary, and `subprocessBrokerConfig` is read non-strictly so a provider that is still starting
+ * or disposing also counts as configured.
+ * @param ctx - Context whose service scope is checked.
+ * @param action - what the caller was about to do, for the error message.
+ * @throws when `subprocessBrokerConfig` is provided in `ctx`'s scope.
+ */
+function assertNoSubprocessBroker(ctx: Context, action: string): void {
+  if (ctx.reflect.get('subprocessBrokerConfig', false) !== undefined) {
+    throw new Error(`dynamic Cordis Host code cannot ${action} while a subprocess broker is configured`)
   }
 }
 

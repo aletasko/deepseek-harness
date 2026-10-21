@@ -103,7 +103,16 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
 
   constructor(ctx: Context, config: SubprocessConfig = {}) {
     super(ctx, config)
-    this.brokerConfig = assertBrokerConfig(ctx.reflect.get('subprocessBrokerConfig') as SubprocessBrokerConfig | undefined)
+    // Non-strict reads: a provider that is still starting or disposing counts as present.
+    const declaredBrokerConfig = ctx.reflect.get('subprocessBrokerConfig', false)
+    const activeBrokerConfig = ctx.reflect.get('subprocessBrokerConfig') as SubprocessBrokerConfig | undefined
+    if (declaredBrokerConfig !== undefined && activeBrokerConfig === undefined) {
+      throw new Error('subprocess-local: broker configuration is registered but not active; refusing local spawn')
+    }
+    if (declaredBrokerConfig !== undefined && ctx.reflect.get('dynamicCordisRunner', false) !== undefined) {
+      throw new Error('subprocess-local: broker mode cannot start while the dynamic Cordis Host runner is present')
+    }
+    this.brokerConfig = assertBrokerConfig(activeBrokerConfig)
     ctx.effect(() => {
       const onHostExit = (): void => { this.terminateForHostExit() }
       process.prependListener('exit', onHostExit)
