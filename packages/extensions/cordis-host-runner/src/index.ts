@@ -759,6 +759,8 @@ export class DynamicCordisRunnerService extends TypertRemoteService {
    * @param method - Registered Host handler name.
    * @param args - JSON argument delivered to the handler.
    * @returns The JSON result or a typed invocation failure.
+   * @throws when a subprocess broker is, or ever was, configured in this process, including after this run
+   * started; the handler is not called.
    */
   @Remote('invoke')
   async invoke(
@@ -767,6 +769,7 @@ export class DynamicCordisRunnerService extends TypertRemoteService {
     method: string,
     args: JsonValue,
   ): Promise<DynamicCordisInvokeResult> {
+    assertNoSubprocessBroker(this.rootCtx, 'be invoked')
     const plugin = this.registry.get(pluginId)
     if (plugin === undefined || plugin.run === undefined) {
       return { ok: false, code: 'plugin-not-running', message: `dynamic plugin "${pluginId}" is not running` }
@@ -1262,15 +1265,20 @@ export class DynamicCordisRunnerService extends TypertRemoteService {
 }
 
 /**
- * Refuse model-defined Host code while the trusted subprocess broker is configured. The Host vm is not a
- * security boundary, and `subprocessBrokerConfig` is read non-strictly so a provider that is still starting
- * or disposing also counts as configured.
- * @param ctx - Context whose service scope is checked.
+ * Refuse model-defined Host code once the trusted subprocess broker has been declared. The Host vm is not a
+ * security boundary. Broker mode counts as declared once `subprocessBrokerConfig` has ever been provided in this
+ * process: `provide` records the name in `ctx.reflect.props` when the provider runs and Cordis keeps it after
+ * disposal, so a provider that is starting, disposing, or already gone still refuses. This is the same check as
+ * `brokerModeDeclared` in `@deepseek-ai/dsh-subprocess-local` and `assertNoSubprocessBroker` in
+ * `@deepseek-ai/dsh-plugin-manager`, duplicated because neither package may be imported here; keep the three in
+ * step. It guards one process only: Host code in the same process can mutate `reflect.props`, and a restart
+ * forgets the declaration, so a broker-required profile must be enforced statically.
+ * @param ctx - Context whose Cordis root is checked.
  * @param action - what the caller was about to do, for the error message.
- * @throws when `subprocessBrokerConfig` is provided in `ctx`'s scope.
+ * @throws when `subprocessBrokerConfig` is, or ever was, provided in this process.
  */
 function assertNoSubprocessBroker(ctx: Context, action: string): void {
-  if (ctx.reflect.get('subprocessBrokerConfig', false) !== undefined) {
+  if (ctx.reflect.props['subprocessBrokerConfig'] !== undefined || ctx.reflect.get('subprocessBrokerConfig', false) !== undefined) {
     throw new Error(`dynamic Cordis Host code cannot ${action} while a subprocess broker is configured`)
   }
 }

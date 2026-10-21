@@ -22,6 +22,19 @@ ctx.provide('subprocessBrokerAssignmentResolver', {
 })
 ```
 
+The configuration is read on every launch, so a provider that registers or is
+replaced after this provider starts takes effect on the next `spawn` or
+`spawnTerminal`. Once the name has been provided in the Core process, a launch
+with no active valid configuration (provider still starting, invalid, or
+disposed) is denied instead of using the local path. The record is Cordis's
+`reflect.props` entry for the name, which survives provider disposal until the
+process ends. It is a same-process guard, not a security boundary: Host code
+sharing the process can edit `reflect.props`, and a Core restart forgets the
+declaration, so a profile that requires the broker must also be enforced
+statically. `@deepseek-ai/dsh-plugin-manager` and
+`@deepseek-ai/dsh-cordis-host-runner` apply the same check to profile
+mutations, `pnpm` reads, and Host code execution.
+
 When present, ordinary processes and PTY terminals use only that broker. A
 missing socket, rejected request, or invalid protocol event fails closed. The
 provider does not fall back to `systemd-run`, `node:child_process.spawn`, or
