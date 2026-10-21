@@ -80,8 +80,13 @@ export const inject = ['tools', 'pluginManager', 'sandboxPolicy']
 
 /** Register one management tool for discovery and the four persistent actions.
  * @param ctx Agent-scoped tool registration context.
+ * @throws When `subprocessBrokerConfig` is provided in `ctx`'s scope, before any tool registers. A provider that is
+ * still starting or disposing counts, so the read is non-strict.
  */
 export function apply(ctx: Context): void {
+  if (ctx.reflect.get('subprocessBrokerConfig', false) !== undefined) {
+    throw new Error('plugin_manager: installing bundles cannot be offered while a subprocess broker is configured')
+  }
   ctx.tools.register(defineTool({
     name: 'plugin_manager',
     description: 'List plugins or bundles in the current profile, enable or disable them, install a bundle, or remove an installed bundle. Every action requires danger-full-access permission or approval for this call. Approval does not change the session permission mode. Changes affect every session in this profile. List first to obtain exact identifiers. Package installation can execute allowed build scripts. Live profiles apply changes immediately, including upgrades of installed packages; a change result that is not applied carries nextStep, which says what to do or tell the user. Unmet DSH version requirements (engines.dsh, else DSH peer dependencies) block installation and activation. Version exemptions risk crashes and data loss: warn the user and obtain explicit permission for the exact plugin and runtime versions before granting one.',
