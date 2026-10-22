@@ -2,7 +2,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { assignmentUnavailableClient } from '../src/broker-binding.ts'
-import { BrokerControlClient, createBrokerClient } from '../src/broker-client.ts'
+import { BrokerControlClient, createBrokerClient, ReconnectingBrokerClient } from '../src/broker-client.ts'
 import { broker, cleanups, UUID, type FakeServer } from './socket-broker.ts'
 
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
@@ -257,7 +257,7 @@ describe('start and worker-exited', () => {
     const frame = await server.next('start')
     server.send({ type: 'error', code: 'start-refused', message: 'start refused', requestId: frame.requestId, reason: 'stdio-unsupported' })
     expect(await refused).toEqual({ ok: false, reason: 'stdio-unsupported' })
-    expect(await control.start({ ...startRequest(assignmentId), env: { DSH_SESSION_ID: 'x' } })).toEqual({ ok: false, reason: 'invalid-env' })
+    expect(await control.start({ ...startRequest(assignmentId), env: { DSH_SESSION_ID: 'x' } })).toMatchObject({ ok: false, reason: 'invalid-env' })
     expect(server.frames.filter(f => f.type === 'start')).toHaveLength(1)
   })
 
@@ -354,9 +354,10 @@ describe('which client Core runs (S6 contract 10)', () => {
 
   it('is the real client, connected to that socket and to no other, when one is configured', async () => {
     const server = await broker()
-    const real = createBrokerClient({ socketPath: server.socketPath })
+    // The test server's socket belongs to the test user, not to root.
+    const real = createBrokerClient({ socketPath: server.socketPath }, {}, {}, { ownerUid: process.getuid!() })
     cleanups.push(() => { real.closeControl() })
-    expect(real).toBeInstanceOf(BrokerControlClient)
+    expect(real).toBeInstanceOf(ReconnectingBrokerClient)
     expect((await server.next('register-core')).type).toBe('register-core')
   })
 })

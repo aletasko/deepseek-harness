@@ -9,9 +9,13 @@
  * - no stdout or stderr capture: `collect`, `pipe` and `inherit` yield empty, ended streams, so a caller that reads
  *   the output of a brokered process sees none (the exit status is real);
  * - no stdin: whatever the caller writes is discarded;
- * - no control channel (refused at spawn) and no terminal sessions (refused: lease `terminal` is refused in v1);
- * - no per-process signal: the broker has no frame to signal one worker, so `signal()` cannot end it. A worker ends
- *   by exiting, or when its binding is revoked or the control connection closes (the broker kills the whole range).
+ * - no control channel (refused at spawn) and no terminal sessions (refused: lease `terminal` is refused in v1).
+ *
+ * Stopping is real (S6 contract 11): the handle's termination (an abort, a tool timeout, `terminate()`, disposal) asks
+ * the launcher to send the broker a `signal` frame, TERM first and KILL after `graceMs`, which the broker delivers to
+ * the worker's whole range; `worker-exited` still settles the outcome. An abort that arrives before the broker has
+ * started the worker means it is never started. Waiting for the range after a termination request is bounded
+ * (`graceMs` plus a margin), so a worker or a broker that does not answer cannot hang a disposal for ever.
  */
 import { PassThrough } from 'node:stream'
 import { isAbsolute } from 'node:path'
@@ -33,6 +37,8 @@ export interface BrokerLaunchRequest {
   readonly cwd: string
   readonly env: Readonly<Record<string, string>>
   readonly graceMs: number
+  /** Aborted by the first termination request. A launch that sees it before the broker started the worker gives up. */
+  readonly signal?: AbortSignal
 }
 
 /** How a brokered worker ended, as the broker reported it, or why that is unknown (the connection was lost). */
@@ -41,8 +47,15 @@ export type BrokerWorkerExit =
   | { readonly ok: false; readonly reason: string }
 
 export type BrokerLaunchResult =
-  | { readonly ok: true; readonly pid: number; readonly workerId: string; readonly exited: Promise<BrokerWorkerExit> }
-  | { readonly ok: false; readonly reason: string }
+  | {
+    readonly ok: true
+    readonly pid: number
+    readonly workerId: string
+    readonly exited: Promise<BrokerWorkerExit>
+    /** Deliver TERM or KILL to the worker's range through the broker. `worker-exited` follows when it is gone. */
+    readonly signal: (name: 'TERM' | 'KILL') => Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }>
+  }
+  | { readonly ok: false; readonly reason: string; readonly detail?: string }
 
 /**
  * Host-owned bridge from a Core-attested execution to a broker worker: lease and start over the shared control
@@ -85,26 +98,41 @@ export function readBrokerLauncher(ctx: Context): SubprocessBrokerLauncher | und
   return value as SubprocessBrokerLauncher
 }
 
-function refused(reason: string): Error {
-  return new Error(`subprocess-local: the broker refused the launch (${reason})`)
+function refused(reason: string, detail?: string): Error {
+  return new Error(`subprocess-local: the broker refused the launch (${reason}${detail === undefined ? '' : `: ${detail}`})`)
+}
+
+/** Beyond the grace period of a termination request, how long the range may take to be reported gone. */
+export const BROKER_EXIT_MARGIN_MS = 5000
+
+export interface BrokerLaunchOptions {
+  /** Test seam for {@link BROKER_EXIT_MARGIN_MS}. */
+  readonly exitMarginMs?: number
 }
 
 /**
  * Start a process through the broker and adapt it to the normal local lifecycle binder. Returns at once: the lease,
  * the start and the wait for `worker-exited` happen behind `direct`, which settles with the worker's real exit status
- * or rejects when the broker refused or the connection was lost. An already aborted request never gets here
- * (`validateSubprocessSpec` rejects it), and one aborted later cannot be delivered (see the module comment).
- * stdout and stderr are empty streams that end with the worker (see the module comment).
+ * or rejects when the broker refused or the connection was lost.
+ *
+ * Termination: the binder calls `owner.signal('SIGTERM')` on abort, timeout, `terminate()` or disposal and
+ * `owner.signal('SIGKILL')` once `graceMs` has passed. The first call aborts the launch request, so a launch that has
+ * not yet got a worker from the broker stops there, and `direct` settles as if the process had been terminated
+ * (`SIGTERM`, or `SIGKILL` when that was asked); a worker that is already running, or that starts while the request
+ * is in flight, is sent a `signal` frame (a KILL that was asked wins over a TERM). stdout and stderr are empty
+ * streams that end with the worker (see the module comment).
  * @param spec The spawn request. Its stdio dispositions are not forwarded: v1 is `ignore` for all three.
  * @param env The environment the worker gets.
  * @param launcher The launcher installed by the CLI.
  * @param execution The ToolRuntime's active execution, taken by the caller in its own synchronous turn.
+ * @param options Test seams.
  */
 export function launchBrokerProcess(
   spec: SubprocessSpawnSpec,
   env: NodeJS.ProcessEnv,
   launcher: SubprocessBrokerLauncher,
   execution: unknown,
+  options: BrokerLaunchOptions = {},
 ): ManagedProcessLaunch {
   const stdin = spec.stdio.stdin === 'pipe' ? new PassThrough() : null
   stdin?.resume()
@@ -112,6 +140,10 @@ export function launchBrokerProcess(
   const stderr = new PassThrough()
   const direct = Promise.withResolvers<SubprocessOutcome>()
   const settled = Promise.withResolvers<void>()
+  const cancel = new AbortController()
+  const firstSignal = Promise.withResolvers<void>()
+  let requested: 'TERM' | 'KILL' | undefined
+  let worker: Extract<BrokerLaunchResult, { ok: true }> | undefined
   const closeStreams = (): void => {
     stdin?.destroy()
     stdout.end()
@@ -119,12 +151,30 @@ export function launchBrokerProcess(
   }
   const environment: Record<string, string> = {}
   for (const [name, value] of Object.entries(env)) if (typeof value === 'string') environment[name] = value
+  const deliver = (name: 'TERM' | 'KILL'): void => {
+    // A worker that has already gone answers not-found; there is nothing left to do about that, or about a lost broker
+    // (the connection ending kills the range and settles `exited`).
+    try {
+      void worker?.signal(name).catch(() => {})
+    } catch { /* a launcher whose handle cannot signal is no reason to throw out of a termination request */ }
+  }
   void (async () => {
     try {
       const started = await launcher.launch({
         execution, argv: [...spec.argv], cwd: spec.cwd, env: environment, graceMs: Math.max(1, spec.graceMs),
+        signal: spec.signal === undefined ? cancel.signal : AbortSignal.any([cancel.signal, spec.signal]),
       })
-      if (!started.ok) throw refused(started.reason)
+      if (!started.ok) {
+        if (started.reason === 'aborted') {
+          // Never started: report what a terminated process reports.
+          direct.resolve({ exitCode: null, signal: requested === 'KILL' ? 'SIGKILL' : 'SIGTERM' })
+          return
+        }
+        throw refused(started.reason, started.detail)
+      }
+      worker = started
+      // A termination asked for while the broker was starting the worker is delivered now that there is one.
+      if (requested !== undefined) deliver(requested)
       const exit = await started.exited
       if (!exit.ok) throw new Error(`subprocess-local: the broker connection ended before the process was reported done (${exit.reason})`)
       direct.resolve({ exitCode: exit.code, signal: exit.signal as NodeJS.Signals | null })
@@ -135,12 +185,44 @@ export function launchBrokerProcess(
       settled.resolve()
     }
   })()
+  // The range is gone when `worker-exited` has settled the launch. After a termination request that wait is bounded:
+  // a worker that is not reported gone within the grace period plus the margin is an error for the caller (disposal
+  // then force-stops what it can), not an unbounded wait.
+  const margin = options.exitMarginMs ?? BROKER_EXIT_MARGIN_MS
+  let exitWait: Promise<void> | undefined
+  const waitForExit = (): Promise<void> => {
+    exitWait ??= new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let over = false
+      void firstSignal.promise.then(() => {
+        if (over) return
+        timer = setTimeout(() => {
+          over = true
+          reject(new Error(`subprocess-local: the broker did not report the process gone within ${spec.graceMs + margin} ms of the termination request`))
+        }, spec.graceMs + margin)
+        timer.unref()
+      })
+      void settled.promise.then(() => {
+        over = true
+        clearTimeout(timer)
+        resolve()
+      })
+    })
+    exitWait.catch(() => {})
+    return exitWait
+  }
   const owner: ManagedProcessLaunch['owner'] = {
-    // The broker has no frame that signals one worker. A termination request cannot be delivered; the worker ends by
-    // exiting, or with its binding when that is revoked or the connection closes.
-    signal: () => {},
-    waitForExit: () => settled.promise,
-    terminateForHostExit: () => {},
+    signal: (signal) => {
+      const name = signal === 'SIGKILL' ? 'KILL' : 'TERM'
+      if (requested !== 'KILL') requested = name
+      cancel.abort()
+      firstSignal.resolve()
+      deliver(name)
+    },
+    waitForExit,
+    // Nothing can be sent synchronously at host exit, and nothing needs to be: the process exiting closes the control
+    // connection and the broker kills every worker of it. A launch that has not got a worker is told to stop.
+    terminateForHostExit: () => { cancel.abort() },
     cleanup: () => {},
   }
   return { stdin, stdout, stderr, direct: direct.promise, owner }

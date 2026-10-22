@@ -64,6 +64,13 @@ export const BROKER_LAUNCHER_KEY: unique symbol = Symbol.for('dsh.subprocess-loc
  * The launcher there is this process's alone: no Context name for a plugin to provide, and a property no later code
  * can replace. It is installed at boot, before anything can be granted, because a slot left empty is a slot the first
  * plugin to define the symbol would own; the runtime also refuses a slot that is not locked. A second call throws.
+ *
+ * Trust boundary, stated exactly (S6a review F8): any code in this process can read the slot and call `launch`, which
+ * skips the gates and the scrubbed environment of `ctx.subprocess.spawn`. It still takes the session from the
+ * ToolRuntime's attestation of a live, direct tool execution, the binding from Core's record of that session and the
+ * lease, root and jail from the broker, so such a caller can run a command of its choosing in its own agent's jail
+ * and nowhere else. The slot is not what keeps hostile code out; the boot-deny gate (no model-defined Host code in
+ * the process) and the broker are. The full statement is on `BindingLauncher.launch`.
  */
 export function installBrokerLauncher(ctx: Context, host: BindingHost): void {
   const root = ctx.root as unknown as object

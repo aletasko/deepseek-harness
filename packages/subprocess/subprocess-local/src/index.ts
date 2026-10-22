@@ -277,7 +277,9 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
       }
       this.warnBrokerStdio()
       const binding = prepareManagedProcessBinding(internals)
-      handle = bindBrokerProcess(spec, launchBrokerProcess(spec, env, launcher, execution), binding)
+      handle = bindBrokerProcess(spec, launchBrokerProcess(spec, env, launcher, execution, {
+        ...this.internals.brokerExitMarginMs === undefined ? {} : { exitMarginMs: this.internals.brokerExitMarginMs },
+      }), binding)
     } else if (containmentMode === 'fallback') {
       handle = spawnSubprocess(spec, internals)
     } else {

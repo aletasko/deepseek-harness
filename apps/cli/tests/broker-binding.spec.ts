@@ -18,6 +18,7 @@ import {
   assignmentUnavailableClient, BindingIssuer, BrokerGate, createBindingHost,
   type AssignmentGrant, type BindingBrokerClient, type BindingGrant, type BindingHost, type IssueInput,
 } from '../src/broker-binding.ts'
+import { BindingLauncher } from '../src/broker-launch.ts'
 import type { BrokerConfig } from '../src/broker-required.ts'
 import { FakeBroker } from './fake-broker.ts'
 
@@ -581,12 +582,191 @@ describe('the launch bridge: lease then start, for the attested session only (W-
     expect(env.broker.assigns).toHaveLength(0)
   })
 
+  it('starts nothing for a caller that already gave up: aborted before the lease, no frame is sent', async () => {
+    const env = await environment()
+    await bound(env, 'session-7')
+    const abort = new AbortController()
+    abort.abort()
+    expect(await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec, signal: abort.signal })))
+      .toEqual({ ok: false, reason: 'aborted' })
+    expect(env.broker.assigns).toHaveLength(0)
+    expect(env.broker.starts).toHaveLength(0)
+  })
+
+  it('starts nothing for a caller that gave up while the broker was leasing', async () => {
+    const env = await environment()
+    await bound(env, 'session-7')
+    const abort = new AbortController()
+    const leased = Promise.withResolvers<unknown>()
+    env.broker.assignAnswer = () => leased.promise
+    const launching = inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec, signal: abort.signal }))
+    await vi.waitFor(() => { expect(env.broker.assigns).toHaveLength(1) })
+    abort.abort()
+    leased.resolve({ ok: true, assignmentId: 'late-opaque', revision: 1 })
+    expect(await launching).toEqual({ ok: false, reason: 'aborted' })
+    expect(env.broker.starts).toHaveLength(0)
+  })
+
+  it('refuses a signal that is not an AbortSignal', async () => {
+    const env = await environment()
+    await bound(env, 'session-7')
+    expect(await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec, signal: { aborted: false } }))
+      .toEqual({ ok: false, reason: 'invalid-request' })
+    expect(env.broker.assigns).toHaveLength(0)
+  })
+
+  it('hands back a worker that can be signalled, through the same connection, and keeps one that was aborted while starting', async () => {
+    const env = await environment()
+    await bound(env, 'session-7')
+    const abort = new AbortController()
+    const started = Promise.withResolvers<unknown>()
+    env.broker.startAnswer = () => started.promise
+    const launching = inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec, signal: abort.signal }))
+    await vi.waitFor(() => { expect(env.broker.starts).toHaveLength(1) })
+    abort.abort()
+    started.resolve({ ok: true, pid: 9, workerId: 'w-late', exited: new Promise(() => {}) })
+    const result = await launching
+    // The worker exists, so it is returned: the runtime that asked for the stop sends it the signal.
+    expect(result).toMatchObject({ ok: true, workerId: 'w-late' })
+    if (!result.ok) return
+    expect(await result.signal('TERM')).toEqual({ ok: true })
+    expect(await result.signal('KILL')).toEqual({ ok: true })
+    expect(env.broker.signals).toEqual([{ workerId: 'w-late', signal: 'TERM' }, { workerId: 'w-late', signal: 'KILL' }])
+  })
+
+  it('kills the worker, and leaves the new binding alone, when the session was re-bound while the broker was starting it', async () => {
+    const env = await environment()
+    const first = await bound(env, 'session-7')
+    const started = Promise.withResolvers<unknown>()
+    env.broker.startAnswer = () => started.promise
+    const launching = inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec }))
+    await vi.waitFor(() => { expect(env.broker.starts).toHaveLength(1) })
+    await env.host.issuer.revoke('session-7')
+    const second = await env2bind(env, 'session-7')
+    expect(second).toMatchObject({ ok: true })
+    expect((second as BindingGrant).bindingId).not.toBe((first.outcome as BindingGrant).bindingId)
+    started.resolve({ ok: true, pid: 9, workerId: 'w-old', exited: new Promise(() => {}) })
+    expect(await launching).toEqual({ ok: false, reason: 'revoked' })
+    expect(env.broker.signals).toEqual([{ workerId: 'w-old', signal: 'KILL' }])
+    // One revoke, the explicit one: the replacement binding was not revoked on the old worker's account.
+    expect(env.broker.revokes).toHaveLength(1)
+    expect(env.host.issuer.lookup('session-7')).toMatchObject({ bindingId: (second as BindingGrant).bindingId })
+  })
+
+  it('kills the worker when the gate latched off while the broker was starting it', async () => {
+    const env = await environment()
+    await bound(env, 'session-7')
+    env.broker.startAnswer = async () => {
+      env.ctx.reflect.provide('pluginManager', {})
+      return { ok: true, pid: 9, workerId: 'w-gate', exited: new Promise(() => {}) }
+    }
+    await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec }))
+    expect(env.broker.signals).toEqual([{ workerId: 'w-gate', signal: 'KILL' }])
+  })
+
+  it('relays the detail of a local refusal of the start to the caller', async () => {
+    const env = await environment()
+    await bound(env, 'session-7')
+    env.broker.startAnswer = async () => ({ ok: false, reason: 'invalid-argv', detail: 'argument 0 is 5000 characters long' })
+    expect(await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec })))
+      .toEqual({ ok: false, reason: 'invalid-argv', detail: 'argument 0 is 5000 characters long' })
+  })
+
   it('lease() takes the current revision from the issuer, so a caller cannot name a stale or future one', async () => {
     const env = await environment()
     const { outcome } = await bound(env, 'session-7')
     const { revision } = outcome as BindingGrant
     expect(await inTool(env, 'session-7', exec => env.host.resolver.lease(exec))).toMatchObject({ ok: true, revision })
     expect(env.broker.assigns.map(request => request.revision)).toEqual([revision])
+  })
+})
+
+describe('the launcher rechecks the very binding after start (F7)', () => {
+  const request = { argv: ['/bin/true'], cwd: '/srv', env: {}, graceMs: 100 }
+
+  function rig(lookups: Array<{ bindingId: string; revision: number } | { ok: false; reason: string }>, gateOpen = () => true) {
+    const calls = { revoked: [] as string[], signals: [] as string[] }
+    let next = 0
+    const issuer = {
+      lookup: () => lookups[Math.min(next++, lookups.length - 1)],
+      revoke: (id: string) => { calls.revoked.push(id); return Promise.resolve({ ok: true }) },
+    }
+    const resolver = { lease: () => Promise.resolve({ ok: true, assignmentId: 'a-1', revision: 1 }) }
+    const client = {
+      start: () => Promise.resolve({ ok: true, pid: 9, workerId: 'w-1', exited: new Promise(() => {}) }),
+      signal: (workerId: string, signal: string) => { calls.signals.push(`${workerId}:${signal}`); return Promise.resolve({ ok: true }) },
+    }
+    const launcher = new BindingLauncher(() => 'session-1', { isActive: gateOpen } as never, issuer as never, resolver as never, client as never)
+    return { launcher, calls }
+  }
+
+  it('keeps the worker when the session still has the same binding id and revision', async () => {
+    const { launcher, calls } = rig([{ bindingId: 'b-1', revision: 1 }, { bindingId: 'b-1', revision: 1 }])
+    expect(await launcher.launch({ execution: {}, ...request })).toMatchObject({ ok: true, workerId: 'w-1' })
+    expect(calls).toEqual({ revoked: [], signals: [] })
+  })
+
+  it('kills it when the binding id is another one', async () => {
+    const { launcher, calls } = rig([{ bindingId: 'b-1', revision: 1 }, { bindingId: 'b-2', revision: 1 }])
+    expect(await launcher.launch({ execution: {}, ...request })).toEqual({ ok: false, reason: 'revoked' })
+    expect(calls).toEqual({ revoked: [], signals: ['w-1:KILL'] })
+  })
+
+  it('kills it when the revision is another one, even with the same binding id', async () => {
+    const { launcher, calls } = rig([{ bindingId: 'b-1', revision: 1 }, { bindingId: 'b-1', revision: 2 }])
+    expect(await launcher.launch({ execution: {}, ...request })).toEqual({ ok: false, reason: 'revoked' })
+    expect(calls).toEqual({ revoked: [], signals: ['w-1:KILL'] })
+  })
+
+  it('kills it when the binding is gone', async () => {
+    const { launcher, calls } = rig([{ bindingId: 'b-1', revision: 1 }, { ok: false, reason: 'no-binding' }])
+    expect(await launcher.launch({ execution: {}, ...request })).toEqual({ ok: false, reason: 'revoked' })
+    expect(calls.signals).toEqual(['w-1:KILL'])
+  })
+
+  it('revokes the session as well, and kills the worker, when the gate closed', async () => {
+    const { launcher, calls } = rig([{ bindingId: 'b-1', revision: 1 }, { bindingId: 'b-1', revision: 1 }], () => false)
+    expect(await launcher.launch({ execution: {}, ...request })).toEqual({ ok: false, reason: 'gate-inactive' })
+    expect(calls).toEqual({ revoked: ['session-1'], signals: ['w-1:KILL'] })
+  })
+})
+
+describe('a connection that ends takes the bindings with it', () => {
+  it('forgets every binding at once, sends no revoke, and refuses a lease', async () => {
+    const env = await environment()
+    await bound(env, 'session-1')
+    await bound(env, 'session-2')
+    expect(env.host.issuer.lookup('session-1')).toMatchObject({ bindingId: expect.any(String) as string })
+    env.broker.loseConnection()
+    expect(env.host.issuer.lookup('session-1')).toEqual({ ok: false, reason: 'no-binding' })
+    expect(env.host.issuer.lookup('session-2')).toEqual({ ok: false, reason: 'no-binding' })
+    expect(await inTool(env, 'session-1', exec => env.host.launcher.launch({ execution: exec, argv: ['/bin/true'], cwd: '/srv', env: {}, graceMs: 10 })))
+      .toEqual({ ok: false, reason: 'no-binding' })
+    expect(env.broker.assigns).toHaveLength(0)
+    expect(env.broker.revokes).toHaveLength(0)
+    // Disposing the sessions afterwards owes the broker nothing.
+    await env.host.issuer.revokeAll()
+    expect(env.broker.revokes).toHaveLength(0)
+  })
+
+  it('refuses a bind that was still in flight when the connection ended', async () => {
+    const env = await environment()
+    const granted = Promise.withResolvers<unknown>()
+    env.broker.bindAnswer = () => granted.promise
+    const pending = bound(env, 'session-1')
+    await vi.waitFor(() => { expect(env.broker.binds).toHaveLength(1) })
+    env.broker.loseConnection()
+    granted.resolve({ ok: true, bindingId: 'b-late', revision: 1 })
+    expect((await pending).outcome).toMatchObject({ ok: false })
+    expect(env.host.issuer.lookup('session-1')).toMatchObject({ ok: false })
+  })
+
+  it('allows the session to be bound again afterwards (on the new connection)', async () => {
+    const env = await environment()
+    await bound(env, 'session-1')
+    env.broker.loseConnection()
+    expect(await env2bind(env, 'session-1')).toMatchObject({ ok: true })
+    expect(env.host.issuer.lookup('session-1')).toMatchObject({ bindingId: expect.any(String) as string })
   })
 })
 
@@ -598,6 +778,7 @@ describe('deny-safe shipped client', () => {
       await assignmentUnavailableClient.revoke({ sessionId: 's', bindingId: 'b' }),
       await assignmentUnavailableClient.assign({ sessionId: 's', bindingId: 'b', revision: 1 }),
       await assignmentUnavailableClient.start({ assignmentId: 'a', argv: ['/bin/true'], cwd: '/', env: {}, graceMs: 1 }),
+      await assignmentUnavailableClient.signal('w', 'KILL'),
       await assignmentUnavailableClient.status(),
     ]
     for (const answer of answers) expect(answer).toEqual({ ok: false, reason: 'assignment-unavailable' })

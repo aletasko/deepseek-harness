@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { BindingRequest } from '../src/broker-binding.ts'
 import {
-  bindFrame, leaseFrame, parseInbound, refusalOf, registerFrame, revokeFrame, startFrame, startRequestProblem, statusFrame,
+  bindFrame, leaseFrame, parseInbound, refusalOf, registerFrame, revokeFrame, signalFrame, startFrame, startRequestProblem, statusFrame,
   toAssignmentGrant, toBindingGrant, WireViolation,
 } from '../src/broker-wire.ts'
 
@@ -95,7 +95,7 @@ describe('start requests the broker would reject by shape are refused before the
     ['DSH_BROKER_ prefix', { ...base, env: { DSH_BROKER_X: 'x' } }, 'invalid-env'],
     ['zero grace', { ...base, graceMs: 0 }, 'invalid-grace'],
     ['frame over 256 KiB', { ...base, argv: Array.from({ length: 128 }, () => 'x'.repeat(4096)), env: Object.fromEntries(Array.from({ length: 256 }, (_, i) => [`V${i}`, 'y'.repeat(4096)])) }, 'frame-too-large'],
-  ])('%s', (_name, request, problem) => { expect(startRequestProblem(request)).toBe(problem) })
+  ])('%s', (_name, request, problem) => { expect(startRequestProblem(request)?.reason).toBe(problem) })
 })
 
 describe('answers from the broker (S6 contract 6, fail closed)', () => {
@@ -150,3 +150,91 @@ describe('answers from the broker (S6 contract 6, fail closed)', () => {
     ['null', null],
   ])('refuses %s', (_name, frame) => { expect(() => parseInbound(frame)).toThrow(WireViolation) })
 })
+
+describe('signal and signalled (S6 contract 11)', () => {
+  it('signal carries only type, version, requestId, workerId and the signal name', () => {
+    expect(signalFrame('w1', 'TERM', ID)).toEqual({ type: 'signal', version: 1, requestId: ID, workerId: 'w1', signal: 'TERM' })
+    expect(signalFrame('w1', 'KILL', ID)).toEqual({ type: 'signal', version: 1, requestId: ID, workerId: 'w1', signal: 'KILL' })
+  })
+
+  it('parses signalled, with or without version, and refuses a malformed one', () => {
+    expect(parseInbound({ type: 'signalled', requestId: ID, workerId: 'w1' })).toEqual({ type: 'signalled', requestId: ID, workerId: 'w1' })
+    expect(parseInbound({ type: 'signalled', version: 1, requestId: ID, workerId: 'a1b2c3d4e5f6' })).toEqual({ type: 'signalled', requestId: ID, workerId: 'a1b2c3d4e5f6' })
+    for (const frame of [
+      { type: 'signalled', requestId: ID },
+      { type: 'signalled', requestId: ID, workerId: 'w/1' },
+      { type: 'signalled', requestId: ID, workerId: 'w1', signal: 'KILL' },
+      { type: 'signalled', requestId: 'req-1', workerId: 'w1' },
+    ]) expect(() => parseInbound(frame)).toThrow(WireViolation)
+  })
+})
+
+describe('version on answers (F3)', () => {
+  const answers: Array<[string, Record<string, unknown>]> = [
+    ['registered', { type: 'registered', requestId: ID, revision: 7 }],
+    ['bound', { type: 'bound', requestId: ID, bindingId: 'b0ff', revision: 2 }],
+    ['leased', { type: 'leased', requestId: ID, assignmentId: 'Zm9v-_9', revision: 2, ttlMs: 5000 }],
+    ['revoked', { type: 'revoked', requestId: ID, bindingId: 'b0ff', count: 1 }],
+    ['started', { type: 'started', requestId: ID, pid: 99, workerId: 'a1b2c3' }],
+    ['signalled', { type: 'signalled', requestId: ID, workerId: 'a1b2c3' }],
+    ['status', { type: 'status', requestId: ID, bindings: 1, workers: [] }],
+    ['error', { type: 'error', code: 'bind-refused', reason: 'cwd-mismatch', message: 'bind refused', requestId: ID }],
+    ['error without a request id', { type: 'error', code: 'peer-denied', reason: 'peer-not-authorised', message: 'peer denied' }],
+    ['worker-exited', { type: 'worker-exited', workerId: 'a1', bindingId: 'b0ff', code: 0, signal: null }],
+  ]
+
+  it.each(answers)('%s: version 1 is accepted, and the parsed frame is the same as without it', (_name, frame) => {
+    expect(parseInbound({ ...frame, version: 1 })).toEqual(parseInbound(frame))
+  })
+
+  it.each(answers)('%s: any other version is a violation', (_name, frame) => {
+    for (const version of [0, 2, '1', 1.5, null, true, [1], { v: 1 }]) {
+      expect(() => parseInbound({ ...frame, version }), JSON.stringify(version)).toThrow(WireViolation)
+    }
+  })
+
+  it('does not leak version into the relayed status', () => {
+    expect(parseInbound({ type: 'status', version: 1, requestId: ID, bindings: 1, epoch: 3, workers: [] }))
+      .toEqual({ type: 'status', requestId: ID, status: { bindings: 1, epoch: 3, workers: [] } })
+  })
+
+  it('still refuses an unknown field next to a valid version', () => {
+    expect(() => parseInbound({ type: 'bound', version: 1, requestId: ID, bindingId: 'b', revision: 1, ok: true })).toThrow(WireViolation)
+  })
+})
+
+describe('the reason a start is refused says what to change and never repeats a value (F4)', () => {
+  const base = { assignmentId: 'a-1', argv: ['/bin/true'], cwd: '/srv', env: {}, graceMs: 100 }
+
+  it('names the argument, its length and the limit', () => {
+    expect(startRequestProblem({ ...base, argv: ['/bin/sh', '-c', 'x'.repeat(5000)] })).toEqual({
+      reason: 'invalid-argv',
+      detail: expect.stringMatching(
+        /^argument 2 is 5000 characters long; the broker accepts at most 4096 per argument \(.*file in the workspace/u,
+      ) as string,
+    })
+  })
+
+  it('names the environment variable, not its value', () => {
+    const problem = startRequestProblem({ ...base, env: { 'BASH_FUNC_x%%': 'hunter2' } })
+    expect(problem?.reason).toBe('invalid-env')
+    expect(problem?.detail).toContain('"BASH_FUNC_x%%"')
+    expect(problem?.detail).not.toContain('hunter2')
+    const long = startRequestProblem({ ...base, env: { A: 'hunter2'.repeat(1000) } })
+    expect(long?.detail).toContain('"A"')
+    expect(long?.detail).not.toContain('hunter2')
+    expect(startRequestProblem({ ...base, env: { DSH_BROKER_X: 'x' } })?.detail).toMatch(/reserved for the broker/u)
+  })
+
+  it('says how many arguments or variables there are against the limit', () => {
+    expect(startRequestProblem({ ...base, argv: Array.from({ length: 129 }, () => 'x') })?.detail).toMatch(/129 arguments; the broker accepts 1 to 128/u)
+    expect(startRequestProblem({ ...base, env: Object.fromEntries(Array.from({ length: 257 }, (_, i) => [`V${i}`, 'y'])) })?.detail).toMatch(/257 variables.*at most 256/u)
+  })
+
+  it('does not put an argument in the detail', () => {
+    const problem = startRequestProblem({ ...base, argv: ['/bin/sh', 'secret-token\0'] })
+    expect(problem?.reason).toBe('invalid-argv')
+    expect(problem?.detail).not.toContain('secret-token')
+  })
+})
+

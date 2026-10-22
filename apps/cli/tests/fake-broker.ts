@@ -1,6 +1,6 @@
 import type {
   AssignmentGrant, AssignRequest, BindingBrokerClient, BindingGrant, BindingRefusal, BindingRequest, BrokerStatus,
-  RevokeRequest, StartGrant, StartRequest, WorkerExit,
+  RevokeRequest, StartGrant, StartRequest, WorkerExit, WorkerSignalName,
 } from '../src/broker-binding.ts'
 
 /** The root broker, simulated. It owns ids, revisions and assignments; Core owns none of them. */
@@ -10,6 +10,8 @@ export class FakeBroker implements BindingBrokerClient {
   readonly revokes: RevokeRequest[] = []
   readonly assigns: AssignRequest[] = []
   readonly starts: StartRequest[] = []
+  readonly signals: Array<{ workerId: string; signal: WorkerSignalName }> = []
+  private readonly closedListeners: Array<(reason: string) => void> = []
   readonly issuedAssignments = new Map<string, string>()
   closed = 0
   /** Test hooks. */
@@ -60,6 +62,18 @@ export class FakeBroker implements BindingBrokerClient {
     const exited = Promise.withResolvers<WorkerExit>()
     this.exitWorker = (exit) => { exited.resolve(exit) }
     return { ok: true, pid: 4242, workerId: `worker-${this.starts.length}`, exited: exited.promise }
+  }
+
+  signal(workerId: string, signal: WorkerSignalName): Promise<{ ok: true } | BindingRefusal> {
+    this.signals.push({ workerId, signal })
+    return Promise.resolve({ ok: true })
+  }
+
+  onClosed(listener: (reason: string) => void): void { this.closedListeners.push(listener) }
+
+  /** The connection ended on its own: the broker revoked everything and every listener hears it. */
+  loseConnection(reason = 'control-closed'): void {
+    for (const listener of this.closedListeners) listener(reason)
   }
 
   status(): Promise<BrokerStatus | BindingRefusal> {

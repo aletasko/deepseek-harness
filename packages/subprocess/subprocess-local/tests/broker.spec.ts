@@ -33,7 +33,7 @@ function scriptedLauncher(answer?: (request: BrokerLaunchRequest) => Promise<Bro
 }
 
 function exitingWith(exit: BrokerWorkerExit): BrokerLaunchResult {
-  return { ok: true, pid: 4242, workerId: 'w1', exited: Promise.resolve(exit) }
+  return { ok: true, pid: 4242, workerId: 'w1', exited: Promise.resolve(exit), signal: () => Promise.resolve({ ok: true }) }
 }
 
 interface WireMessage { type: string; [key: string]: unknown }
@@ -416,7 +416,7 @@ describe('local subprocess broker route (S6 bridge: lease and start through the 
     await inRuntime(launcher, async (_ctx, runtime, localSpawn) => {
       const handle = runtime.spawn(processSpec({ env: { A: 'b' }, graceMs: 250 }))
       await expect(handle.done).resolves.toEqual({ exitCode: 7, signal: null })
-      expect(requests).toEqual([{ execution: { active: true }, argv: ['/bin/echo', 'hello'], cwd: '/assigned/tree', env: expect.objectContaining({ A: 'b' }) as object, graceMs: 250 }])
+      expect(requests).toEqual([{ execution: { active: true }, argv: ['/bin/echo', 'hello'], cwd: '/assigned/tree', env: expect.objectContaining({ A: 'b' }) as object, graceMs: 250, signal: expect.any(AbortSignal) as AbortSignal }])
       expect(localSpawn).not.toHaveBeenCalled()
     })
   })
@@ -432,7 +432,7 @@ describe('local subprocess broker route (S6 bridge: lease and start through the 
     const { launcher, requests } = scriptedLauncher()
     await inRuntime(launcher, async (_ctx, runtime) => {
       await runtime.spawn(processSpec()).done
-      expect(JSON.stringify(Object.keys(requests[0]!).sort())).toBe(JSON.stringify(['argv', 'cwd', 'env', 'execution', 'graceMs']))
+      expect(JSON.stringify(Object.keys(requests[0]!).sort())).toBe(JSON.stringify(['argv', 'cwd', 'env', 'execution', 'graceMs', 'signal']))
       expect(JSON.stringify(requests[0])).not.toContain('session-7')
     })
   })
@@ -447,7 +447,7 @@ describe('local subprocess broker route (S6 bridge: lease and start through the 
       await new Promise(resolve => setTimeout(resolve, 30))
       expect(settled).toBe(false)
       const exit = Promise.withResolvers<BrokerWorkerExit>()
-      started.resolve({ ok: true, pid: 9, workerId: 'w', exited: exit.promise })
+      started.resolve({ ok: true, pid: 9, workerId: 'w', exited: exit.promise, signal: () => Promise.resolve({ ok: true }) })
       await new Promise(resolve => setTimeout(resolve, 30))
       expect(settled).toBe(false)
       exit.resolve({ ok: true, code: 0, signal: null })
@@ -508,19 +508,213 @@ describe('local subprocess broker route (S6 bridge: lease and start through the 
     })
   })
 
-  it('cannot signal one worker (the broker has no such frame): terminate waits for the broker exit rather than pretending', async () => {
+  /** A launcher whose worker records the signals it is sent and exits when the script says so. */
+  function workerLauncher(): {
+    launcher: SubprocessBrokerLauncher
+    requests: BrokerLaunchRequest[]
+    signals: string[]
+    exit: PromiseWithResolvers<BrokerWorkerExit>
+    started: PromiseWithResolvers<BrokerLaunchResult>
+    start: () => void
+  } {
     const exit = Promise.withResolvers<BrokerWorkerExit>()
-    const { launcher } = scriptedLauncher(() => ({ ok: true, pid: 9, workerId: 'w', exited: exit.promise }))
+    const started = Promise.withResolvers<BrokerLaunchResult>()
+    const signals: string[] = []
+    const { launcher, requests } = scriptedLauncher(() => started.promise)
+    const start = (): void => {
+      started.resolve({
+        ok: true, pid: 9, workerId: 'w', exited: exit.promise,
+        signal: (name) => { signals.push(name); return Promise.resolve({ ok: true }) },
+      })
+    }
+    return { launcher, requests, signals, exit, started, start }
+  }
+
+  it('terminate() sends TERM through the launcher, then KILL after graceMs, and the broker exit still settles the handle', async () => {
+    const { launcher, signals, exit, start } = workerLauncher()
+    start()
     await inRuntime(launcher, async (_ctx, runtime) => {
-      const handle = runtime.spawn(processSpec({ graceMs: 20 }))
-      await new Promise(resolve => setTimeout(resolve, 10))
+      const handle = runtime.spawn(processSpec({ graceMs: 60 }))
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(signals).toEqual([])
       handle.terminate()
-      let settled = false
-      void handle.done.then(() => { settled = true }, () => { settled = true })
-      await new Promise(resolve => setTimeout(resolve, 80))
-      expect(settled).toBe(false)
+      await vi.waitFor(() => { expect(signals).toEqual(['TERM']) })
+      await new Promise(resolve => setTimeout(resolve, 30))
+      expect(signals).toEqual(['TERM'])
+      await vi.waitFor(() => { expect(signals).toEqual(['TERM', 'KILL']) })
       exit.resolve({ ok: true, code: null, signal: 'SIGKILL' })
       await expect(handle.done).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' })
+    })
+  })
+
+  it('does not escalate to KILL when the worker exits after TERM', async () => {
+    const { launcher, signals, exit, start } = workerLauncher()
+    start()
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      const handle = runtime.spawn(processSpec({ graceMs: 80 }))
+      await new Promise(resolve => setTimeout(resolve, 20))
+      handle.terminate()
+      await vi.waitFor(() => { expect(signals).toEqual(['TERM']) })
+      exit.resolve({ ok: true, code: null, signal: 'SIGTERM' })
+      await expect(handle.done).resolves.toEqual({ exitCode: null, signal: 'SIGTERM' })
+      await handle.waitForExit()
+      await new Promise(resolve => setTimeout(resolve, 150))
+      expect(signals).toEqual(['TERM'])
+    })
+  })
+
+  it('an abort of the caller signal stops the worker the same way', async () => {
+    const { launcher, signals, exit, start } = workerLauncher()
+    start()
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      const abort = new AbortController()
+      const handle = runtime.spawn(processSpec({ graceMs: 500, signal: abort.signal }))
+      await new Promise(resolve => setTimeout(resolve, 20))
+      abort.abort(new Error('tool timeout'))
+      await vi.waitFor(() => { expect(signals).toEqual(['TERM']) })
+      exit.resolve({ ok: true, code: null, signal: 'SIGTERM' })
+      await expect(handle.done).resolves.toEqual({ exitCode: null, signal: 'SIGTERM' })
+    })
+  })
+
+  it('aborts the launch request when termination is asked before the worker exists, and a launcher that gives up ends the handle as terminated', async () => {
+    const { launcher, requests, started } = workerLauncher()
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      const handle = runtime.spawn(processSpec({ graceMs: 500 }))
+      expect(requests[0]!.signal!.aborted).toBe(false)
+      handle.terminate()
+      expect(requests[0]!.signal!.aborted).toBe(true)
+      started.resolve({ ok: false, reason: 'aborted' })
+      await expect(handle.done).resolves.toEqual({ exitCode: null, signal: 'SIGTERM' })
+    })
+  })
+
+  it('an abort of the caller signal also aborts the launch request', async () => {
+    const { launcher, requests, started } = workerLauncher()
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      const abort = new AbortController()
+      const handle = runtime.spawn(processSpec({ graceMs: 500, signal: abort.signal }))
+      abort.abort(new Error('cancelled'))
+      expect(requests[0]!.signal!.aborted).toBe(true)
+      started.resolve({ ok: false, reason: 'aborted' })
+      await expect(handle.done).resolves.toEqual({ exitCode: null, signal: 'SIGTERM' })
+    })
+  })
+
+  it('delivers a termination asked for while the worker was starting, as soon as there is a worker, and KILL wins', async () => {
+    const { launcher, signals, exit, started, start } = workerLauncher()
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      const handle = runtime.spawn(processSpec({ graceMs: 40 }))
+      await new Promise(resolve => setTimeout(resolve, 10))
+      handle.terminate()
+      // TERM and then, after graceMs, KILL both come due before the broker has answered the start.
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(signals).toEqual([])
+      start()
+      await vi.waitFor(() => { expect(signals).toEqual(['KILL']) })
+      exit.resolve({ ok: true, code: null, signal: 'SIGKILL' })
+      await expect(handle.done).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' })
+      expect(started).toBeDefined()
+    })
+  })
+
+  it('reports SIGKILL for a launch that never started when KILL had been asked', async () => {
+    const { launcher, started } = workerLauncher()
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      const handle = runtime.spawn(processSpec({ graceMs: 20 }))
+      handle.terminate()
+      await new Promise(resolve => setTimeout(resolve, 80))
+      started.resolve({ ok: false, reason: 'aborted' })
+      await expect(handle.done).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' })
+    })
+  })
+
+  it('a signal that cannot be delivered does not throw out of the termination request', async () => {
+    const exit = Promise.withResolvers<BrokerWorkerExit>()
+    const { launcher } = scriptedLauncher(() => ({
+      ok: true, pid: 9, workerId: 'w', exited: exit.promise,
+      signal: () => Promise.reject(new Error('socket closed')),
+    }))
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      const handle = runtime.spawn(processSpec({ graceMs: 30 }))
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(() => { handle.terminate() }).not.toThrow()
+      await new Promise(resolve => setTimeout(resolve, 80))
+      exit.resolve({ ok: true, code: null, signal: 'SIGKILL' })
+      await expect(handle.done).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' })
+    })
+  })
+
+  describe('disposal with a live worker (F5)', () => {
+    async function liveRuntime(launcher: SubprocessBrokerLauncher, marginMs: number): Promise<{ runtime: LocalSubprocessRuntime; fiber: Awaited<ReturnType<Context['plugin']>> }> {
+      const ctx = new Context()
+      ctx.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/broker.sock' })
+      ctx.provide('tools', { currentActiveExecution: () => ({ active: true }), attestActiveExecution: () => ({ direct: true, sessionId: 'session-7' }) })
+      installLauncher(ctx, launcher)
+      const fiber = await ctx.plugin(LocalSubprocessRuntime)
+      const runtime = ctx.subprocess as LocalSubprocessRuntime
+      runtime.internals.brokerExitMarginMs = marginMs
+      return { runtime, fiber }
+    }
+
+    it('signals the worker and finishes once the broker reports it gone', async () => {
+      const { launcher, signals, exit, start } = workerLauncher()
+      start()
+      const { runtime, fiber } = await liveRuntime(launcher, 2000)
+      const handle = runtime.spawn(processSpec({ graceMs: 50 }))
+      void handle.done.catch(() => {})
+      await new Promise(resolve => setTimeout(resolve, 20))
+      const disposing = fiber.dispose()
+      await vi.waitFor(() => { expect(signals).toEqual(['TERM']) })
+      exit.resolve({ ok: true, code: null, signal: 'SIGTERM' })
+      await disposing
+    })
+
+    it('escalates to KILL, and gives up with an error when the worker is never reported gone', async () => {
+      const { launcher, signals, start } = workerLauncher()
+      start()
+      const { runtime, fiber } = await liveRuntime(launcher, 100)
+      const handle = runtime.spawn(processSpec({ graceMs: 50 }))
+      void handle.done.catch(() => {})
+      await new Promise(resolve => setTimeout(resolve, 20))
+      const began = Date.now()
+      handle.terminate()
+      await expect(handle.waitForExit()).rejects.toThrow(/did not report the process gone within 150 ms/)
+      expect(Date.now() - began).toBeLessThan(2000)
+      expect(signals).toEqual(['TERM', 'KILL'])
+      // Disposal reports that error and ends; it does not wait for ever.
+      await fiber.dispose()
+    })
+
+    it('is bounded as well when the broker never even answered the start', async () => {
+      const { launcher } = workerLauncher()
+      const { runtime, fiber } = await liveRuntime(launcher, 100)
+      const handle = runtime.spawn(processSpec({ graceMs: 50 }))
+      void handle.done.catch(() => {})
+      await new Promise(resolve => setTimeout(resolve, 20))
+      const began = Date.now()
+      await fiber.dispose()
+      // 50 ms of grace and 100 ms of margin: ended by the bound, not by the (never answering) broker.
+      expect(Date.now() - began).toBeGreaterThanOrEqual(100)
+      expect(Date.now() - began).toBeLessThan(3000)
+    })
+
+    it('does not wait at all, and does not time anything out, for a worker that is already done', async () => {
+      const { launcher } = scriptedLauncher(() => exitingWith({ ok: true, code: 0, signal: null }))
+      const { runtime, fiber } = await liveRuntime(launcher, 100)
+      await runtime.spawn(processSpec()).done
+      await fiber.dispose()
+    })
+  })
+
+  it('says why the broker refused a launch it could not take, with the limit and no value', async () => {
+    const { launcher } = scriptedLauncher(() => ({
+      ok: false, reason: 'invalid-argv', detail: 'argument 2 is 5000 characters long; the broker accepts at most 4096 per argument',
+    }))
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      await expect(runtime.spawn(processSpec()).done).rejects.toThrow(
+        'subprocess-local: the broker refused the launch (invalid-argv: argument 2 is 5000 characters long; the broker accepts at most 4096 per argument)',
+      )
     })
   })
 

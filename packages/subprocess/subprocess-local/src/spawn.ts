@@ -67,6 +67,8 @@ export interface SpawnInternals {
   platform?: NodeJS.Platform
   /** Linux process-group member probe (defaults to `/proc` inspection). */
   linuxProcessGroupHasLiveMembers?: (processGroupId: number) => boolean | undefined
+  /** Broker mode: the margin past `graceMs` that waiting for a terminated worker may take (test seam). */
+  brokerExitMarginMs?: number
 }
 
 /**

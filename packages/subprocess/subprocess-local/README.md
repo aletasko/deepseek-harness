@@ -29,12 +29,26 @@ configurable, inherited or an accessor denies the launch.
 
 For each `spawn` the runtime attests the active ToolRuntime execution in the
 caller's own synchronous turn and hands that execution (not a session id) to
-`launcher.launch({ execution, argv, cwd, env, graceMs })`. The launcher derives
+`launcher.launch({ execution, argv, cwd, env, graceMs, signal })`. The launcher derives
 the session from the execution alone, leases the session's binding with mode
 `process` and starts the worker over the same control connection, and the
 runtime waits for the broker's unsolicited `worker-exited` to settle the
 handle's outcome. Both steps are broker round trips, so the launcher is
-asynchronous; a refusal rejects `handle.done`.
+asynchronous; a refusal rejects `handle.done`, and the message says why when Core
+refused the launch itself (which argument is longer than the broker's 4096
+characters, which environment variable name or reserved name it will not take;
+never a value).
+
+Who may call the launcher. The slot is readable by any code in the process, and
+calling it directly skips what `spawn` does first (the approval and
+process-execution gates, the scrubbed environment). What a caller still cannot
+choose: the session (read from the ToolRuntime's attestation of a live, direct
+tool execution), the binding, the lease and the root and jail the worker runs
+in (the broker's). Code already inside an agent's tool call can therefore start
+a worker of its choice in that agent's own jail, as `spawn` would let it; it
+cannot start one for another session, outside a tool call, or without a binding.
+The boundary is the broker, and the boot-deny gate that keeps hostile Host code
+out of the process; the slot is a speed bump, not a boundary.
 
 The configuration is read on every launch, so a provider that registers or is
 replaced after this provider starts takes effect on the next `spawn`. Once the
@@ -71,10 +85,27 @@ mode `process`. Consequently, for a launch routed through the broker:
 - **No control channel and no terminal sessions.** A request with
   `stdio.control` and every `spawnTerminal` is refused; lease mode `terminal`
   is refused by the v1 broker.
-- **No per-process signal.** The broker has no frame to signal one worker, so
-  `terminate()` and an abort cannot end it. A worker ends by exiting, or when
-  its binding is revoked or the control connection closes, which makes the
-  broker kill the whole range.
+
+### Stopping a brokered worker (S6 contract 11)
+
+An abort, a tool timeout, `terminate()` and disposal reach the worker through the
+broker's `signal` frame, which the broker delivers to the worker's whole range:
+`TERM` first, `KILL` once `graceMs` has passed (the lifecycle binder's escalation,
+unchanged), and `worker-exited` still settles the handle with the real outcome.
+
+- An abort that arrives before the broker has started the worker means it is
+  **never started**; the handle settles as a terminated process (`SIGTERM`, or
+  `SIGKILL` when that was asked) and no `start` frame is sent.
+- An abort that arrives while the broker is starting the worker is delivered as
+  soon as there is a worker (a `KILL` that was asked wins over a `TERM`).
+- Disposal sends the signals and then waits for the range to be reported gone for
+  at most `graceMs` plus 5 s; after that the wait rejects (disposal reports it and
+  ends) instead of hanging. A worker that is not reported gone then dies with the
+  control connection, which the broker treats as revoking everything.
+- A signal that cannot be delivered (the broker answers `not-found` for a worker
+  that already left, or the connection is gone) is not an error for the caller.
+- At host exit nothing can be sent synchronously and nothing needs to be: the
+  process exiting closes the control connection and the broker kills every worker.
 
 English | [中文](README.zh.md)
 

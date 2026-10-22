@@ -15,7 +15,7 @@ import {
   assertBrokerBootInputs, assertBrokerTree, auditBrokerTree, BROKER_SOCKET_ENV, readBrokerRequirement,
 } from '../src/broker-required.ts'
 import { createBindingHost, type BindingHost } from '../src/broker-binding.ts'
-import { BrokerControlClient } from '../src/broker-client.ts'
+import { ReconnectingBrokerClient } from '../src/broker-client.ts'
 import { BROKER_LAUNCHER_KEY, LIFECYCLE_HOOK_KEY, ROOM_PLUGIN_SPECIFIER } from '../src/broker-capabilities.ts'
 import { claimBrokerControl } from '../src/broker-control.ts'
 import { runProfile } from '../src/profile-boot.ts'
@@ -806,8 +806,8 @@ describe('binding host in the launcher', () => {
       expect(createBindingHost).toHaveBeenCalledTimes(1)
       const [options] = vi.mocked(createBindingHost).mock.calls[0]!
       expect(options).toMatchObject({ broker: { socketPath: SOCKET } })
-      expect(options.client).toBeInstanceOf(BrokerControlClient)
-      expect((options.client as BrokerControlClient).socketPath).toBe(SOCKET)
+      expect(options.client).toBeInstanceOf(ReconnectingBrokerClient)
+      expect((options.client as ReconnectingBrokerClient).socketPath).toBe(SOCKET)
       expect(options.ctx).toBe(ctx)
       expect(builtHost().gate.isActive()).toBe(true)
       // Held by the launcher alone: nothing about it is published on the Context.

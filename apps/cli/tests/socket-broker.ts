@@ -1,5 +1,5 @@
 import { once } from 'node:events'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs'
 import { createServer, type Server, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -73,6 +73,8 @@ export async function broker(options: { register?: 'ok' | 'silent' | ((frame: Fr
   })
   listener.listen(socketPath)
   await once(listener, 'listening')
+  // What the real broker does: reachable by its owner and group, closed to others (the client checks this).
+  chmodSync(socketPath, 0o660)
   cleanups.push(() => server.close())
   return server
 }

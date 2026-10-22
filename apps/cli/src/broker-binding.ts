@@ -53,11 +53,20 @@ export type BindingRefusalReason =
   | 'broker-malformed'
   | 'invalid-label'
   | 'assignment-unavailable'
+  | 'aborted'
+  | 'control-closed'
+  | 'control-reconnecting'
+  | 'untrusted-socket'
   | (string & {})
 
 export interface BindingRefusal {
   readonly ok: false
   readonly reason: BindingRefusalReason
+  /**
+   * What the user can act on, when Core refused locally and knows more than the token (which limit, which variable
+   * name). Never carries a command line, a value or a secret. Broker-supplied refusals have none.
+   */
+  readonly detail?: string
 }
 
 export type BindingKind = 'room-seat' | 'attach' | 'child'
@@ -138,6 +147,9 @@ export interface StartRequest {
   readonly graceMs: number
 }
 
+/** Delivered to a worker's whole range by the broker (S6 contract 11). */
+export type WorkerSignalName = 'TERM' | 'KILL'
+
 /** How a broker worker ended, from the broker's `worker-exited`, or why Core can no longer tell. */
 export type WorkerExit =
   | { readonly ok: true; readonly code: number | null; readonly signal: string | null }
@@ -169,9 +181,17 @@ export interface BindingBrokerClient {
   assign(request: AssignRequest): Promise<AssignmentGrant | BindingRefusal>
   /** Start a worker under a leased assignment, over the same connection. v1 stdio is `ignore` only. */
   start(request: StartRequest): Promise<StartGrant | BindingRefusal>
+  /** Stop a worker this connection started (`signal` frame, contract 11); `not-found` if it is not one of ours. */
+  signal(workerId: string, signal: WorkerSignalName): Promise<{ readonly ok: true } | BindingRefusal>
   status(): Promise<BrokerStatus | BindingRefusal>
   /** Drop the control connection, which the broker treats as revoking everything. Used when a revoke is not acked. */
   closeControl(): void
+  /**
+   * Call `listener` every time a control connection ends, for any reason, with the reason. Everything the broker
+   * granted over that connection died with it; the issuer forgets its bindings when this fires. A client that has no
+   * connection to lose (the deny client) never calls it.
+   */
+  onClosed?(listener: (reason: BindingRefusalReason) => void): void
 }
 
 /**
@@ -183,6 +203,7 @@ export const assignmentUnavailableClient: BindingBrokerClient = Object.freeze({
   revoke: () => Promise.resolve(refusal('assignment-unavailable')),
   assign: () => Promise.resolve(refusal('assignment-unavailable')),
   start: () => Promise.resolve(refusal('assignment-unavailable')),
+  signal: () => Promise.resolve(refusal('assignment-unavailable')),
   status: () => Promise.resolve(refusal('assignment-unavailable')),
   closeControl: () => {},
 })
@@ -346,7 +367,11 @@ export class BindingIssuer {
     private readonly gate: BrokerGate,
     private readonly client: BindingBrokerClient,
     readonly timeoutMs: number = DEFAULT_BROKER_TIMEOUT_MS,
-  ) {}
+  ) {
+    // A connection that ends on its own (the broker died, the socket broke) took every grant with it: the broker
+    // revokes everything when the connection closes. No frame is owed, so the bindings are only forgotten.
+    client.onClosed?.(() => { this.forgetAll() })
+  }
 
   /**
    * Ask the broker to bind a live session. Revocation needs no pairing by the caller: the agent loop awaits
@@ -540,6 +565,16 @@ export class BindingIssuer {
    */
   closeControl(): void {
     this.client.closeControl()
+    this.forgetAll()
+  }
+
+  /**
+   * Mark every binding unusable and drop it: `lookup` answers `no-binding`, a bind still in flight is refused
+   * `revoked` when it returns, and no revoke frame is sent for any of them. Used when the connection they were
+   * granted on is gone. A reconnected client is a new epoch with no bindings; sessions bound before the loss stay
+   * unbound until they are bound again.
+   */
+  private forgetAll(): void {
     for (const record of this.records.values()) {
       record.revoked = true
       record.revocation ??= Promise.resolve({ ok: true as const })

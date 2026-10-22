@@ -59,6 +59,9 @@ async function coreFrames(server: FakeServer): Promise<Map<string, Frame>> {
   const started = control.start({ assignmentId: 'opaque-1', argv: ['/bin/echo', 'hi'], cwd: '/srv/worktrees/a', env: { A: 'b' }, graceMs: 200 })
   const start = await reply('start', 1, f => ({ type: 'started', requestId: f.requestId, pid: 7, workerId: 'w1' }))
   await started
+  const signalled = control.signal('w1', 'TERM')
+  const signal = await reply('signal', 1, f => ({ type: 'signalled', requestId: f.requestId, workerId: 'w1' }))
+  await signalled
   const revoked = control.revoke({ sessionId: 'session-1', bindingId: 'b1' })
   const revoke = await reply('revoke', 1, f => ({ type: 'revoked', requestId: f.requestId, bindingId: 'b1', count: 2 }))
   await revoked
@@ -67,7 +70,7 @@ async function coreFrames(server: FakeServer): Promise<Map<string, Frame>> {
   await status
   return new Map<string, Frame>([
     ['register-core', await server.next('register-core')], ['bind room-seat', roomSeat], ['bind attach', attach], ['bind child', child],
-    ['lease', lease], ['start', start], ['revoke', revoke], ['status', statusFrame],
+    ['lease', lease], ['start', start], ['signal', signal], ['revoke', revoke], ['status', statusFrame],
   ])
 }
 
@@ -93,6 +96,10 @@ describe.skipIf(missing !== undefined)('frames Core produces, parsed by the brok
         expect(withOrca, 'child frame with an orca locator added').toMatchObject({ accepted: true })
         continue
       }
+      if (name === 'signal' && !verdict.accepted && !strict) {
+        console.warn(`broker-wire-crosscheck: this broker predates contract point 11 (signal): ${verdict.error}`)
+        continue
+      }
       expect(verdict, `${name}: ${verdict.error ?? ''}`).toMatchObject({ accepted: true })
     }
   })
@@ -111,9 +118,17 @@ describe.skipIf(missing !== undefined)('frames Core produces, parsed by the brok
       { name: 'attach without cwd', frame: Object.fromEntries(Object.entries(get('bind attach')).filter(([key]) => key !== 'cwd')) },
       { name: 'attach without orca', frame: Object.fromEntries(Object.entries(get('bind attach')).filter(([key]) => key !== 'orca')) },
       { name: 'stdio pipe on start is parsed but not v1', frame: { ...get('start'), mode: 'terminal' } },
+      { name: 'signal with a name other than TERM or KILL', frame: { ...get('signal'), signal: 'HUP' } },
+      { name: 'signal with a number', frame: { ...get('signal'), signal: 15 } },
+      { name: 'signal without a worker', frame: Object.fromEntries(Object.entries(get('signal')).filter(([key]) => key !== 'workerId')) },
+      { name: 'signal with a binding id', frame: { ...get('signal'), bindingId: 'b1' } },
+      { name: 'signal without version', frame: Object.fromEntries(Object.entries(get('signal')).filter(([key]) => key !== 'version')) },
     ]
     const verdicts = brokerParses(cases)
+    const understandsSignal = brokerParses([{ name: 'signal', frame: get('signal') }]).get('signal')!.accepted
     for (const { name } of cases.filter(entry => entry.name !== 'stdio pipe on start is parsed but not v1')) {
+      // A broker that does not know `signal` refuses every one of these for that reason; only one that does proves anything.
+      if (name.startsWith('signal') && !understandsSignal) continue
       expect(verdicts.get(name), name).toMatchObject({ accepted: false })
     }
   })
@@ -128,6 +143,20 @@ describe.skipIf(missing !== undefined)('frames the broker\'s own daemon code bui
     if (run.status !== 0) throw new Error(`broker response probe failed (${run.status}): ${run.stderr}`)
     const answers = JSON.parse(run.stdout) as Record<string, unknown>
 
+    const strict = process.env['DSH_BROKER_S6_STRICT'] === '1'
+    // Every answer below is the daemon's own, including `registered`, which the live control loop produced.
+    if (answers['live'] !== true) {
+      console.warn(`broker-wire-crosscheck: the live control loop of this broker could not be driven (${typeof answers['live-error'] === 'string' ? answers['live-error'] : 'unprivileged uid or daemon too old'}); registered is not daemon-produced`)
+      expect(strict, 'STRICT needs the live control loop').toBe(false)
+    }
+    const versioned = Object.entries(answers).filter(([name, value]) => name !== 'live' && name !== 'live-error' && typeof value === 'object' && value !== null && 'type' in value)
+    for (const [name, value] of versioned) {
+      const version = (value as { version?: unknown }).version
+      // A broker from before the S9 branch sends no version; one that sends it sends 1, and Core accepts both.
+      if (strict) expect(version, `${name} carries version 1 (STRICT)`).toBe(1)
+      else expect([undefined, 1], name).toContain(version)
+      if ((value as { type: string }).type !== 'refused-by-parser') parseInbound(value)
+    }
     const bound = parseInbound(answers['bind room-seat'])
     expect(bound.type === 'bound' && toBindingGrant(bound)).toEqual({ ok: true, bindingId: 'b0ffee00'.repeat(4), revision: 3 })
     expect(bound).toMatchObject({ requestId: frames.get('bind room-seat')!.requestId })
@@ -136,20 +165,31 @@ describe.skipIf(missing !== undefined)('frames the broker\'s own daemon code bui
     expect(parseInbound(answers['revoke'])).toMatchObject({ type: 'revoked', bindingId: 'b1' })
     expect(parseInbound(answers['start'])).toMatchObject({ type: 'started', pid: 4242, workerId: 'a1b2c3d4e5f6' })
     expect(parseInbound(answers['status'])).toMatchObject({ type: 'status', status: { epoch: 7, bindings: 2 } })
-    expect(parseInbound(answers['registered'])).toMatchObject({ type: 'registered', revision: 7 })
+    const registered = parseInbound(answers['registered'])
+    expect(registered).toMatchObject({ type: 'registered', requestId: frames.get('register-core')!.requestId })
+    expect(registered.type === 'registered' && Number.isSafeInteger(registered.revision) && registered.revision >= 1).toBe(true)
+    const signalled = answers['signal'] as { type?: string }
+    if (signalled.type === 'signalled') {
+      expect(parseInbound(signalled)).toEqual({ type: 'signalled', requestId: frames.get('signal')!.requestId, workerId: 'w1' })
+      const refused = parseInbound(answers['signal refused'])
+      expect(refused.type === 'error' && refusalOf(refused)).toEqual({ ok: false, reason: 'unknown-worker' })
+    } else expect(strict, 'a broker without signal predates contract point 11').toBe(false)
     if (answers['worker-exited code'] !== undefined) {
       expect(parseInbound(answers['worker-exited code'])).toMatchObject({ code: 0, signal: null })
       expect(parseInbound(answers['worker-exited SIGKILL'])).toMatchObject({ code: null, signal: 'SIGKILL' })
       expect(parseInbound(answers['worker-exited SIG65'])).toMatchObject({ code: null, signal: 'SIG65' })
-    } else expect(process.env['DSH_BROKER_S6_STRICT'], 'a broker without worker-exited predates contract point 7').not.toBe('1')
+    } else expect(strict, 'a broker without worker-exited predates contract point 7').toBe(false)
 
-    const refusals: Array<[string, string]> = [
-      ['bind refused', 'cwd-mismatch'], ['start refused', 'stdio-unsupported'], ['revoke unconfirmed', 'timeout'],
-      ['busy', 'too-many-in-flight'], ['control-active', 'control-active'], ['peer denied', 'peer-denied'], ['invalid frame', 'invalid-frame'],
+    // [answer, the broker's reason, what a broker from before the S6b reasons answered: its code stands in]
+    const refusals: Array<[string, string, string | undefined]> = [
+      ['bind refused', 'cwd-mismatch', undefined], ['start refused', 'stdio-unsupported', undefined], ['revoke unconfirmed', 'timeout', undefined],
+      ['busy', 'too-many-in-flight', undefined], ['control-active', 'another-control-connection', 'control-active'],
+      ['peer denied', 'peer-not-authorised', 'peer-denied'], ['invalid frame', 'frame-rejected', 'invalid-frame'],
     ]
-    for (const [name, reason] of refusals) {
+    for (const [name, reason, before] of refusals) {
       const frame = parseInbound(answers[name])
-      expect(frame.type === 'error' && refusalOf(frame), name).toEqual({ ok: false, reason })
+      const got = frame.type === 'error' ? refusalOf(frame).reason : undefined
+      expect(strict || before === undefined ? [reason] : [reason, before], name).toContain(got)
     }
   })
 })
