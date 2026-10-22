@@ -1,6 +1,6 @@
 /**
  * The broker control connection is opened once by the launcher, before the tree mounts (see `src/broker-control.ts`).
- * Nothing here talks to a broker: the client is the one that refuses everything, or a stand-in that counts.
+ * Nothing here talks to a broker: the client is the deny client, or a stand-in that counts.
  */
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -86,15 +86,29 @@ describe('opening the control connection', () => {
     expect(() => { claimBrokerControl(holder)() }).not.toThrow()
   })
 
+  it('closes the connection when the owning context is disposed, before the claim is released', async () => {
+    const holder = {}
+    const events: string[] = []
+    const client: BindingBrokerClient = {
+      ...assignmentUnavailableClient,
+      closeControl: () => { events.push(`closed; claim held: ${(() => { try { claimBrokerControl(holder); return 'no' } catch { return 'yes' } })()}`) },
+    }
+    const ctx = root()
+    openBrokerControl(ctx, BROKER, () => client, holder)
+    await ctx.fiber.dispose()
+    expect(events).toEqual(['closed; claim held: yes'])
+    expect(() => { claimBrokerControl(holder)() }).not.toThrow()
+  })
+
   it('releases the claim at once when connecting throws, and rethrows', () => {
     const holder = {}
     expect(() => openBrokerControl(root(), BROKER, () => { throw new Error('connect failed') }, holder)).toThrow('connect failed')
     claimBrokerControl(holder)()
   })
 
-  it('hands back the client the launcher passed: today the one that refuses every request', async () => {
+  it('hands back the client the launcher passed (here the deny client; the launcher passes createBrokerClient)', async () => {
     const client = openBrokerControl(root(), BROKER, () => assignmentUnavailableClient, {})
-    expect(await client.bind({ sessionId: 's', workspaceId: 'w', coreEpoch: 'e', kind: 'attach', cwd: '/x' })).toEqual({ ok: false, reason: 'assignment-unavailable' })
+    expect(await client.bind({ sessionId: 's', workspaceId: 'w', kind: 'attach', cwd: '/x' })).toEqual({ ok: false, reason: 'assignment-unavailable' })
     expect(Object.isFrozen(client)).toBe(true)
   })
 })

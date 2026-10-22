@@ -1,17 +1,22 @@
-/** Opt-in Unix-socket client for a trusted host subprocess broker. */
-import { Buffer } from 'node:buffer'
-import { randomUUID } from 'node:crypto'
-import { connect } from 'node:net'
-import { isAbsolute } from 'node:path'
+/**
+ * Broker mode for the local subprocess runtime: the launch path that hands a process to the root broker.
+ *
+ * Core keeps ONE control connection to the broker (S6 contract), owned by the launcher. This package does not open
+ * sockets: it asks the launcher's {@link SubprocessBrokerLauncher}, installed on the root context by the CLI, to
+ * lease and start a worker for the attested execution, and maps the broker's `worker-exited` to the handle's
+ * outcome. What v1 does not carry, because the broker's `start` accepts only `ignore` for every stream:
+ *
+ * - no stdout or stderr capture: `collect`, `pipe` and `inherit` yield empty, ended streams, so a caller that reads
+ *   the output of a brokered process sees none (the exit status is real);
+ * - no stdin: whatever the caller writes is discarded;
+ * - no control channel (refused at spawn) and no terminal sessions (refused: lease `terminal` is refused in v1);
+ * - no per-process signal: the broker has no frame to signal one worker, so `signal()` cannot end it. A worker ends
+ *   by exiting, or when its binding is revoked or the control connection closes (the broker kills the whole range).
+ */
 import { PassThrough } from 'node:stream'
+import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import type {
-  SubprocessOutcome,
-  SubprocessSpawnSpec,
-  SubprocessTerminalHandle,
-  SubprocessTerminalSignal,
-  SubprocessTerminalSpawnSpec,
-} from '@deepseek-ai/dsh-subprocess'
+import type { SubprocessOutcome, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import type { ManagedProcessLaunch } from './managed-owner.ts'
 import { bindManagedProcess } from './spawn.ts'
 
@@ -20,10 +25,32 @@ export interface SubprocessBrokerConfig {
   socketPath: string
 }
 
-/** Host-owned mapping from Core-attested session identity to broker policy. */
-export interface SubprocessBrokerAssignmentResolver {
-  /** Return the opaque broker assignment for this session, or deny with undefined. */
-  resolve(sessionId: string): string | undefined
+/** What the runtime asks the launcher for. The session identity is NOT in it: the launcher reads it from `execution`. */
+export interface BrokerLaunchRequest {
+  /** The ToolRuntime's active execution, captured in the caller's own synchronous turn. */
+  readonly execution: unknown
+  readonly argv: readonly string[]
+  readonly cwd: string
+  readonly env: Readonly<Record<string, string>>
+  readonly graceMs: number
+}
+
+/** How a brokered worker ended, as the broker reported it, or why that is unknown (the connection was lost). */
+export type BrokerWorkerExit =
+  | { readonly ok: true; readonly code: number | null; readonly signal: string | null }
+  | { readonly ok: false; readonly reason: string }
+
+export type BrokerLaunchResult =
+  | { readonly ok: true; readonly pid: number; readonly workerId: string; readonly exited: Promise<BrokerWorkerExit> }
+  | { readonly ok: false; readonly reason: string }
+
+/**
+ * Host-owned bridge from a Core-attested execution to a broker worker: lease and start over the shared control
+ * connection. Asynchronous on purpose, because both steps are broker round trips.
+ */
+export interface SubprocessBrokerLauncher {
+  /** Never throws; a refusal is `{ ok: false, reason }`. */
+  launch(request: BrokerLaunchRequest): Promise<BrokerLaunchResult>
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -33,425 +60,90 @@ declare module '@deepseek-ai/cordis' {
 }
 
 /**
- * Registry-wide key under which the launcher defines the assignment resolver on the ROOT context. The resolver is
- * deliberately not a Context name: any plugin can `provide` a name, and whichever provider Cordis picks would
- * decide which `assignmentId` a launch carries. A symbol-keyed own property that the launcher defines once, before
- * the tree mounts, as non-writable and non-configurable, cannot be shadowed by `ctx.provide` or replaced
- * afterwards. Anything in this process can still read it, and code that runs before the launcher could define it
- * first, which is why {@link readBrokerAssignmentResolver} only accepts a locked property and the launcher claims
- * the slot even while it has nothing to grant (see `installAssignmentResolver` in the CLI's `broker-capabilities`).
+ * Registry-wide key under which the launcher defines the broker launcher on the ROOT context. It is deliberately not
+ * a Context name: any plugin can `provide` a name, and whichever provider Cordis picks would decide what a launch
+ * runs against. A symbol-keyed own property that the launcher defines once, before the tree mounts, as non-writable
+ * and non-configurable, cannot be shadowed by `ctx.provide` or replaced afterwards. Anything in this process can
+ * still read it, and code that runs before the launcher could define it first, which is why
+ * {@link readBrokerLauncher} only accepts a locked property and the launcher claims the slot at boot (see
+ * `installBrokerLauncher` in the CLI's `broker-capabilities`).
  */
-export const BROKER_ASSIGNMENT_RESOLVER_KEY: unique symbol = Symbol.for('dsh.subprocess-local.broker-assignment-resolver')
+export const BROKER_LAUNCHER_KEY: unique symbol = Symbol.for('dsh.subprocess-local.broker-launcher')
 
 /**
- * The launcher-installed resolver, or `undefined` (deny) when the root has none, or one that is replaceable, inherited,
- * an accessor, or not an object with a `resolve` function. Read per launch, never cached.
+ * The launcher-installed broker launcher, or `undefined` (deny) when the root has none, or one that is replaceable,
+ * inherited, an accessor, or not an object with a `launch` function. Read per launch, never cached.
  * @param ctx Any context of this process; the root is consulted.
  */
-export function readBrokerAssignmentResolver(ctx: Context): SubprocessBrokerAssignmentResolver | undefined {
-  const descriptor = Object.getOwnPropertyDescriptor(ctx.root, BROKER_ASSIGNMENT_RESOLVER_KEY)
+export function readBrokerLauncher(ctx: Context): SubprocessBrokerLauncher | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(ctx.root, BROKER_LAUNCHER_KEY)
   if (descriptor === undefined || !('value' in descriptor) || descriptor.writable !== false || descriptor.configurable !== false) {
     return undefined
   }
   const value: unknown = descriptor.value
-  if (value === null || typeof value !== 'object' || typeof (value as { resolve?: unknown }).resolve !== 'function') return undefined
-  return value as SubprocessBrokerAssignmentResolver
+  if (value === null || typeof value !== 'object' || typeof (value as { launch?: unknown }).launch !== 'function') return undefined
+  return value as SubprocessBrokerLauncher
 }
 
-type JsonRecord = Record<string, unknown>
-
-class BrokerConnection {
-  readonly socket
-  private buffer = ''
-  private readonly listeners = new Set<(message: JsonRecord) => void>()
-  private readonly closed = Promise.withResolvers<Error | undefined>()
-  get onClosed(): Promise<Error | undefined> { return this.closed.promise }
-
-  constructor(socketPath: string, signal?: AbortSignal) {
-    this.socket = connect(socketPath)
-    this.socket.setEncoding('utf8')
-    this.socket.on('data', (chunk: string) => this.read(chunk))
-    this.socket.on('error', error => this.fail(error))
-    this.socket.once('close', () => {
-      signal?.removeEventListener('abort', abort)
-      const error = new Error('subprocess-local broker: socket closed before terminal event')
-      this.closed.resolve(error)
-    })
-    const abort = (): void => { this.socket.destroy(abortError(signal!)) }
-    signal?.addEventListener('abort', abort, { once: true })
-  }
-
-  onMessage(listener: (message: JsonRecord) => void): () => void {
-    this.listeners.add(listener)
-    return () => this.listeners.delete(listener)
-  }
-
-  send(message: JsonRecord): void {
-    if (this.socket.destroyed) throw new Error('subprocess-local broker: connection is closed')
-    this.socket.write(`${JSON.stringify(message)}\n`)
-  }
-
-  fail(error: Error): void {
-    this.closed.resolve(error)
-  }
-
-  private read(chunk: string): void {
-    this.buffer += chunk
-    if (this.buffer.length > 8 * 1024 * 1024) {
-      this.fail(new Error('subprocess-local broker: protocol frame exceeds limit'))
-      this.socket.destroy()
-      return
-    }
-    while (true) {
-      const end = this.buffer.indexOf('\n')
-      if (end < 0) return
-      const line = this.buffer.slice(0, end)
-      this.buffer = this.buffer.slice(end + 1)
-      try {
-        const message: unknown = JSON.parse(line)
-        if (message === null || typeof message !== 'object' || Array.isArray(message)) throw new Error('expected object')
-        for (const listener of this.listeners) listener(message as JsonRecord)
-      } catch (cause) {
-        this.fail(new Error('subprocess-local broker: invalid protocol frame', { cause }))
-        this.socket.destroy()
-        return
-      }
-    }
-  }
+function refused(reason: string): Error {
+  return new Error(`subprocess-local: the broker refused the launch (${reason})`)
 }
 
-function abortError(signal: AbortSignal): Error {
-  return signal.reason instanceof Error ? signal.reason : new Error('subprocess-local broker: request aborted')
-}
-
-function outcomeOf(message: JsonRecord): SubprocessOutcome {
-  if (message.type !== 'outcome'
-    || !(message.exitCode === null || Number.isInteger(message.exitCode))
-    || !(message.signal === null || typeof message.signal === 'string')) {
-    throw new Error('subprocess-local broker: invalid outcome event')
-  }
-  return { exitCode: message.exitCode as number | null, signal: message.signal as NodeJS.Signals | null }
-}
-
-function decodeBase64(value: unknown, label: string): Buffer {
-  if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value)) {
-    throw new Error(`subprocess-local broker: invalid ${label} data`)
-  }
-  return Buffer.from(value, 'base64')
-}
-
-function stdioRequest(spec: SubprocessSpawnSpec): JsonRecord {
-  const mode = (value: unknown, input = false): JsonRecord => {
-    if (value === 'pipe' || value === 'inherit' || value === 'ignore') return { mode: value }
-    if (input && value !== null && typeof value === 'object' && typeof (value as { data?: unknown }).data === 'string') {
-      return { mode: 'data', data: (value as { data: string }).data }
-    }
-    if (value !== null && typeof value === 'object') {
-      const collect = value as { maxBytes?: unknown; spill?: { maxBytes?: unknown } }
-      return { mode: 'collect', maxBytes: collect.maxBytes, spillMaxBytes: collect.spill?.maxBytes }
-    }
-    throw new Error('subprocess-local broker: invalid stdio disposition')
-  }
-  return {
-    stdin: mode(spec.stdio.stdin, true), stdout: mode(spec.stdio.stdout), stderr: mode(spec.stdio.stderr),
-    ...(spec.stdio.control === undefined ? {} : { control: { mode: 'pipe' } }),
-  }
-}
-
-/** Start a broker process and adapt its streams to the normal local lifecycle binder. */
+/**
+ * Start a process through the broker and adapt it to the normal local lifecycle binder. Returns at once: the lease,
+ * the start and the wait for `worker-exited` happen behind `direct`, which settles with the worker's real exit status
+ * or rejects when the broker refused or the connection was lost. An already aborted request never gets here
+ * (`validateSubprocessSpec` rejects it), and one aborted later cannot be delivered (see the module comment).
+ * stdout and stderr are empty streams that end with the worker (see the module comment).
+ * @param spec The spawn request. Its stdio dispositions are not forwarded: v1 is `ignore` for all three.
+ * @param env The environment the worker gets.
+ * @param launcher The launcher installed by the CLI.
+ * @param execution The ToolRuntime's active execution, taken by the caller in its own synchronous turn.
+ */
 export function launchBrokerProcess(
   spec: SubprocessSpawnSpec,
   env: NodeJS.ProcessEnv,
-  config: SubprocessBrokerConfig,
-  assignmentId: string,
-  signal?: AbortSignal,
+  launcher: SubprocessBrokerLauncher,
+  execution: unknown,
 ): ManagedProcessLaunch {
-  const connection = new BrokerConnection(config.socketPath, signal)
   const stdin = spec.stdio.stdin === 'pipe' ? new PassThrough() : null
+  stdin?.resume()
   const stdout = new PassThrough()
   const stderr = new PassThrough()
-  if (spec.stdio.stdout === 'inherit') stdout.resume()
-  if (spec.stdio.stderr === 'inherit') stderr.resume()
-  const control = spec.stdio.control === 'pipe' ? new PassThrough() : null
   const direct = Promise.withResolvers<SubprocessOutcome>()
-  const empty = Promise.withResolvers<void>()
-  let accepted = false
-  let registered = false
-  const registrationRequestId = randomUUID()
-  let handleId = ''
-  let pendingSignal: 'SIGTERM' | 'SIGKILL' | undefined
-  let finished = false
-  let outcomeSeen = false
-  let exitOutcome: SubprocessOutcome | undefined
-  let protocolError: Error | undefined
-  let startupTimer: ReturnType<typeof setTimeout> | undefined
-  const fail = (error: Error): void => {
-    if (protocolError !== undefined || finished) return
-    protocolError = error
-    if (startupTimer !== undefined) clearTimeout(startupTimer)
-    direct.reject(error)
+  const settled = Promise.withResolvers<void>()
+  const closeStreams = (): void => {
     stdin?.destroy()
-    stdout?.destroy()
-    stderr?.destroy()
-    empty.reject(error)
-    connection.socket.destroy()
+    stdout.end()
+    stderr.end()
   }
-  const dispose = connection.onMessage(message => {
+  const environment: Record<string, string> = {}
+  for (const [name, value] of Object.entries(env)) if (typeof value === 'string') environment[name] = value
+  void (async () => {
     try {
-      if (message.type === 'registered') {
-        if (registered || accepted || message.requestId !== registrationRequestId
-          || !Number.isSafeInteger(message.revision) || (message.revision as number) < 1) {
-          throw new Error('invalid Core registration event')
-        }
-        registered = true
-        connection.send({
-          type: 'start', version: 1, requestId: randomUUID(), mode: 'process',
-          assignmentId, argv: [...spec.argv], cwd: spec.cwd, env,
-          stdio: stdioRequest(spec), graceMs: spec.graceMs,
-        })
-        return
-      }
-      if (message.type === 'accepted') {
-        if (!registered || accepted || typeof message.handle !== 'string' || message.handle.length === 0) throw new Error('invalid accepted event')
-        accepted = true
-        handleId = message.handle
-        if (pendingSignal !== undefined) {
-          connection.send({ type: 'cancel', handle: handleId, signal: pendingSignal })
-          pendingSignal = undefined
-        }
-        if (startupTimer !== undefined) clearTimeout(startupTimer)
-        stdin?.on('data', chunk => {
-          if (!connection.socket.write(`${JSON.stringify({ type: 'stdin', handle: message.handle, data: Buffer.from(chunk).toString('base64') })}\n`)) {
-            stdin.pause()
-            connection.socket.once('drain', () => stdin.resume())
-          }
-        })
-        stdin?.on('end', () => connection.send({ type: 'stdin-eof', handle: message.handle }))
-        control?.on('data', chunk => connection.send({ type: 'control-input', handle: message.handle, data: Buffer.from(chunk).toString('base64') }))
-        control?.on('end', () => connection.send({ type: 'control-eof', handle: message.handle }))
-        return
-      }
-      if (message.type === 'error') {
-        throw new Error(typeof message.message === 'string' ? message.message : 'broker rejected request')
-      }
-      if (!accepted) throw new Error('event arrived before accepted')
-      if (message.handle !== handleId) throw new Error('event handle does not match accepted request')
-      if (message.type === 'stdout' || message.type === 'stderr') {
-        const target = message.type === 'stdout' ? stdout : stderr
-        const bytes = decodeBase64(message.data, 'process output')
-        if (!target.write(bytes)) {
-          connection.socket.pause()
-          target.once('drain', () => connection.socket.resume())
-        }
-        if ((message.type === 'stdout' ? spec.stdio.stdout : spec.stdio.stderr) === 'inherit') {
-          ;(message.type === 'stdout' ? process.stdout : process.stderr).write(bytes)
-        }
-      } else if (message.type === 'control') {
-        if (control === null) throw new Error('unexpected control data')
-        control.write(decodeBase64(message.data, 'control'))
-      } else if (message.type === 'outcome') {
-        if (outcomeSeen) throw new Error('duplicate outcome')
-        outcomeSeen = true
-        exitOutcome = outcomeOf(message)
-        direct.resolve(exitOutcome)
-      } else if (message.type === 'empty') {
-        if (!outcomeSeen || finished) throw new Error('unexpected empty event')
-        finished = true
-        // The broker owns the full managed range. Descendants may still write
-        // after the direct command exits, so close streams only at quiescence.
-        stdout.end(); stderr.end(); control?.end()
-        empty.resolve()
-        dispose()
-        connection.socket.end()
-      } else throw new Error('unknown event type')
+      const started = await launcher.launch({
+        execution, argv: [...spec.argv], cwd: spec.cwd, env: environment, graceMs: Math.max(1, spec.graceMs),
+      })
+      if (!started.ok) throw refused(started.reason)
+      const exit = await started.exited
+      if (!exit.ok) throw new Error(`subprocess-local: the broker connection ended before the process was reported done (${exit.reason})`)
+      direct.resolve({ exitCode: exit.code, signal: exit.signal as NodeJS.Signals | null })
     } catch (error) {
-      fail(error instanceof Error ? error : new Error(String(error)))
+      direct.reject(error instanceof Error ? error : new Error(String(error)))
+    } finally {
+      closeStreams()
+      settled.resolve()
     }
-  })
-  connection.onClosed.then(error => { if (error !== undefined && !finished) fail(error) })
-  try {
-    connection.send({ type: 'register-core', version: 1, requestId: registrationRequestId })
-    startupTimer = setTimeout(() => fail(new Error('subprocess-local broker: start acceptance timed out')), 10_000)
-  } catch (error) {
-    fail(error instanceof Error ? error : new Error(String(error)))
-  }
+  })()
   const owner: ManagedProcessLaunch['owner'] = {
-    signal: sig => {
-      if (finished || protocolError !== undefined || connection.socket.destroyed) return
-      if (handleId.length === 0) pendingSignal = sig
-      else connection.send({ type: 'cancel', handle: handleId, signal: sig })
-    },
-    waitForExit: () => empty.promise,
-    terminateForHostExit: () => { if (!finished) connection.socket.destroy() },
-    cleanup: () => { dispose(); connection.socket.destroy() },
+    // The broker has no frame that signals one worker. A termination request cannot be delivered; the worker ends by
+    // exiting, or with its binding when that is revoked or the connection closes.
+    signal: () => {},
+    waitForExit: () => settled.promise,
+    terminateForHostExit: () => {},
+    cleanup: () => {},
   }
-  return { stdin, stdout, stderr, control: control ?? undefined, direct: direct.promise, owner }
-}
-
-/** Terminal implementation for the same framed broker protocol. */
-export class BrokerTerminalHandle implements SubprocessTerminalHandle {
-  readonly output = new PassThrough()
-  readonly done: Promise<SubprocessOutcome>
-  private pidValue = -1
-  private readonly accepted = Promise.withResolvers<void>()
-  private outcomeReceived = false
-  private startupTimer: ReturnType<typeof setTimeout> | undefined
-  private readonly connection: BrokerConnection
-  private readonly doneResult = Promise.withResolvers<SubprocessOutcome>()
-  private readonly quiescence = Promise.withResolvers<void>()
-  private readonly pending = new Map<string, ReturnType<typeof Promise.withResolvers<JsonRecord>>>()
-  private nextId = 0
-  private closed = false
-  private registered = false
-
-  constructor(config: SubprocessBrokerConfig, assignmentId: string, spec: SubprocessTerminalSpawnSpec, env: Record<string, string>) {
-    const registrationRequestId = randomUUID()
-    this.connection = new BrokerConnection(config.socketPath, spec.signal)
-    this.done = this.doneResult.promise
-    void this.done.catch(() => {})
-    void this.quiescence.promise.catch(() => {})
-    this.ready = this.accepted.promise
-    this.connection.onMessage(message => {
-      try {
-        if (message.type === 'registered') {
-          if (this.registered || this.handleId.length > 0 || message.requestId !== registrationRequestId
-            || !Number.isSafeInteger(message.revision) || (message.revision as number) < 1) {
-            throw new Error('invalid terminal Core registration event')
-          }
-          this.registered = true
-          this.connection.send({
-            type: 'start', version: 1, requestId: randomUUID(), mode: 'terminal',
-            assignmentId, argv: [...spec.argv], cwd: spec.cwd, env,
-            stdio: { stdin: { mode: 'pty' }, stdout: { mode: 'pty' }, stderr: { mode: 'pty' } },
-            rows: spec.rows, cols: spec.cols, terminalType: spec.terminalType,
-            graceMs: spec.graceMs, shellActivity: spec.shellActivity === true,
-          })
-          return
-        }
-        if (message.type !== 'accepted' && this.handleId.length > 0 && message.handle !== this.handleId) {
-          throw new Error('terminal event handle mismatch')
-        }
-        if (message.type === 'accepted') {
-          if (!this.registered || this.handleId.length > 0 || !Number.isInteger(message.pid) || (message.pid as number) <= 0) throw new Error('invalid terminal accepted event')
-          if (this.startupTimer !== undefined) clearTimeout(this.startupTimer)
-          this.pidValue = message.pid as number
-          this.handleId = message.handle as string
-          if (typeof message.handle !== 'string' || message.handle.length === 0) throw new Error('invalid terminal handle')
-          this.accepted.resolve()
-        } else if (message.type === 'output') {
-          if (!this.output.write(decodeBase64(message.data, 'terminal output'))) {
-            this.connection.socket.pause()
-            this.output.once('drain', () => this.connection.socket.resume())
-          }
-        } else if (message.type === 'outcome') {
-          this.outcomeReceived = true
-          this.doneResult.resolve(outcomeOf(message))
-        } else if (message.type === 'empty') {
-          if (!this.outcomeReceived) throw new Error('empty event arrived before terminal outcome')
-          this.closed = true
-          this.output.end()
-          this.quiescence.resolve()
-          this.connection.socket.end()
-        } else if (message.type === 'response' && typeof message.id === 'string') {
-          const waiter = this.pending.get(message.id)
-          if (waiter === undefined) throw new Error('unexpected terminal response')
-          this.pending.delete(message.id)
-          if (message.ok !== true) waiter.reject(new Error(typeof message.message === 'string' ? message.message : 'broker operation failed'))
-          else waiter.resolve(message)
-        } else if (message.type === 'error') throw new Error(typeof message.message === 'string' ? message.message : 'broker rejected request')
-        else throw new Error('unknown terminal event')
-      } catch (error) {
-        if (this.startupTimer !== undefined) clearTimeout(this.startupTimer)
-        this.accepted.reject(error)
-        this.doneResult.reject(error)
-        this.output.destroy()
-        this.quiescence.reject(error)
-        this.rejectPending(error instanceof Error ? error : new Error(String(error)))
-        this.connection.socket.destroy()
-      }
-    })
-    this.connection.onClosed.then(error => {
-      if (error !== undefined && !this.closed) {
-        if (this.startupTimer !== undefined) clearTimeout(this.startupTimer)
-        this.accepted.reject(error)
-        this.doneResult.reject(error)
-        this.quiescence.reject(error)
-        this.rejectPending(error)
-        this.output.destroy()
-      }
-    })
-    this.connection.send({ type: 'register-core', version: 1, requestId: registrationRequestId })
-    this.startupTimer = setTimeout(() => {
-      const error = new Error('subprocess-local broker: terminal start acceptance timed out')
-      this.accepted.reject(error)
-      this.doneResult.reject(error)
-      this.quiescence.reject(error)
-      this.connection.socket.destroy()
-    }, 10_000)
-    spec.signal?.addEventListener('abort', () => { void this.terminate().catch(() => {}) }, { once: true })
-  }
-
-  readonly ready: Promise<void>
-  private handleId = ''
-  get pid(): number { return this.pidValue }
-
-  private rejectPending(error: Error): void {
-    for (const waiter of this.pending.values()) waiter.reject(error)
-    this.pending.clear()
-  }
-
-  private async request(type: string, fields: JsonRecord = {}): Promise<JsonRecord> {
-    if (this.closed) throw new Error('terminal process has exited')
-    const id = String(++this.nextId)
-    const pending = Promise.withResolvers<JsonRecord>()
-    this.pending.set(id, pending)
-    const timer = setTimeout(() => {
-      if (!this.pending.delete(id)) return
-      const error = new Error(`subprocess-local broker: terminal ${type} request timed out`)
-      pending.reject(error)
-      // An unresponsive operation leaves PTY state unknown. Drop the
-      // connection; the broker contract requires disconnect teardown.
-      this.connection.socket.destroy(error)
-    }, 10_000)
-    void pending.promise.finally(() => clearTimeout(timer)).catch(() => {})
-    try {
-      this.connection.send({ type, id, handle: this.handleId, ...fields })
-    } catch (error) {
-      this.pending.delete(id)
-      pending.reject(error)
-    }
-    return pending.promise
-  }
-
-  async write(data: string): Promise<void> { await this.request('stdin', { data: Buffer.from(data).toString('base64') }) }
-  async resize(cols: number, rows: number): Promise<void> { await this.request('resize', { cols, rows }) }
-  async inspectForeground(): Promise<{ processGroupId: number; inputWaiting: boolean } | undefined> {
-    const result = await this.request('inspect-foreground')
-    if (result.processGroupId === null) return undefined
-    if (!Number.isInteger(result.processGroupId) || typeof result.inputWaiting !== 'boolean') throw new Error('subprocess-local broker: invalid foreground response')
-    return { processGroupId: result.processGroupId as number, inputWaiting: result.inputWaiting }
-  }
-  async inspectActivity(): Promise<{ state: 'idle' | 'busy' | 'unknown'; revision: number }> {
-    const result = await this.request('inspect-activity')
-    if (!['idle', 'busy', 'unknown'].includes(String(result.state)) || !Number.isInteger(result.revision)) throw new Error('subprocess-local broker: invalid activity response')
-    return { state: result.state as 'idle' | 'busy' | 'unknown', revision: result.revision as number }
-  }
-  async signalForeground(signal: SubprocessTerminalSignal): Promise<number> {
-    const result = await this.request('signal-foreground', { signal })
-    if (!Number.isInteger(result.processGroupId)) throw new Error('subprocess-local broker: invalid signal response')
-    return result.processGroupId as number
-  }
-  async terminate(): Promise<void> {
-    if (!this.closed) {
-      await this.ready
-      if (!this.closed) this.connection.send({ type: 'cancel', handle: this.handleId, signal: 'SIGTERM' })
-    }
-    await this.quiescence.promise
-  }
-
-  terminateForHostExit(): void {
-    if (!this.closed) this.connection.socket.destroy()
-  }
+  return { stdin, stdout, stderr, direct: direct.promise, owner }
 }
 
 export function bindBrokerProcess(
@@ -486,25 +178,6 @@ export function assertBrokerConfig(config: SubprocessBrokerConfig | undefined): 
     throw new Error('subprocess-local: invalid trusted broker configuration')
   }
   return config
-}
-
-export function resolveBrokerAssignment(
-  resolver: SubprocessBrokerAssignmentResolver | undefined,
-  sessionId: string | undefined,
-): string {
-  if (resolver === undefined) throw new Error('subprocess-local: broker assignment resolver is unavailable')
-  if (typeof sessionId !== 'string' || sessionId.length === 0) {
-    throw new Error('subprocess-local: broker launch requires a Core-attested agent session')
-  }
-  const assignmentId = resolver.resolve(sessionId)
-  if (typeof assignmentId !== 'string' || assignmentId.length === 0) {
-    throw new Error('subprocess-local: no broker assignment for the active session')
-  }
-  return assignmentId
-}
-
-export function terminalEnv(spec: SubprocessTerminalSpawnSpec, env: Record<string, string>): Record<string, string> {
-  return { ...env, PWD: spec.cwd, TERM: spec.terminalType }
 }
 
 /** Prevent caller environment from spoofing the identity used for assignment resolution. */

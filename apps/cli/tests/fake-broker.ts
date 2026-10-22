@@ -1,21 +1,25 @@
 import type {
-  AssignmentGrant, AssignRequest, BindingBrokerClient, BindingGrant, BindingRefusal, BindingRequest, RevokeRequest,
+  AssignmentGrant, AssignRequest, BindingBrokerClient, BindingGrant, BindingRefusal, BindingRequest, BrokerStatus,
+  RevokeRequest, StartGrant, StartRequest, WorkerExit,
 } from '../src/broker-binding.ts'
 
-/** The root broker, simulated. It owns ids, revisions, epochs and assignments; Core owns none of them. */
+/** The root broker, simulated. It owns ids, revisions and assignments; Core owns none of them. */
 export class FakeBroker implements BindingBrokerClient {
   readonly log: string[] = []
   readonly binds: BindingRequest[] = []
   readonly revokes: RevokeRequest[] = []
   readonly assigns: AssignRequest[] = []
-  readonly issuedAssignments = new Set<string>()
+  readonly starts: StartRequest[] = []
+  readonly issuedAssignments = new Map<string, string>()
   closed = 0
   /** Test hooks. */
   bindAnswer?: (request: BindingRequest) => Promise<unknown>
   assignAnswer?: (request: AssignRequest) => Promise<unknown>
   revokeAnswer?: (request: RevokeRequest) => Promise<unknown>
+  startAnswer?: (request: StartRequest) => Promise<unknown>
   onRevoke?: (request: RevokeRequest) => void
-  private epoch: string | undefined
+  /** Settle the worker started last, as the broker's `worker-exited` would. */
+  exitWorker: (exit: WorkerExit) => void = () => {}
   private counter = 0
   private readonly registry = new Map<string, { bindingId: string; revision: number }>()
 
@@ -23,8 +27,6 @@ export class FakeBroker implements BindingBrokerClient {
     this.log.push(`bind:${request.sessionId}`)
     this.binds.push(request)
     if (this.bindAnswer !== undefined) return await this.bindAnswer(request) as BindingGrant
-    // A new Core epoch empties the registry, exactly as the broker's CoreOwner revision change does.
-    if (this.epoch !== request.coreEpoch) { this.registry.clear(); this.epoch = request.coreEpoch }
     const grant = { bindingId: `binding-${++this.counter}`, revision: this.counter }
     this.registry.set(request.sessionId, grant)
     return { ok: true, ...grant }
@@ -44,11 +46,24 @@ export class FakeBroker implements BindingBrokerClient {
     this.assigns.push(request)
     if (this.assignAnswer !== undefined) return await this.assignAnswer(request) as AssignmentGrant
     const current = this.registry.get(request.sessionId)
-    if (request.coreEpoch !== this.epoch) return { ok: false, reason: 'stale-core-epoch' }
     if (current?.bindingId !== request.bindingId || current.revision !== request.revision) return { ok: false, reason: 'stale-binding' }
     const assignmentId = `assignment-${this.issuedAssignments.size + 1}-opaque`
-    this.issuedAssignments.add(assignmentId)
+    this.issuedAssignments.set(assignmentId, request.bindingId)
     return { ok: true, assignmentId, revision: current.revision }
+  }
+
+  async start(request: StartRequest): Promise<StartGrant | BindingRefusal> {
+    this.log.push(`start:${request.assignmentId}`)
+    this.starts.push(request)
+    if (this.startAnswer !== undefined) return await this.startAnswer(request) as StartGrant
+    if (!this.issuedAssignments.has(request.assignmentId)) return { ok: false, reason: 'no-lease' }
+    const exited = Promise.withResolvers<WorkerExit>()
+    this.exitWorker = (exit) => { exited.resolve(exit) }
+    return { ok: true, pid: 4242, workerId: `worker-${this.starts.length}`, exited: exited.promise }
+  }
+
+  status(): Promise<BrokerStatus | BindingRefusal> {
+    return Promise.resolve({ ok: true, status: { bindings: this.registry.size } })
   }
 
   closeControl(): void { this.closed += 1; this.log.push('close-control') }

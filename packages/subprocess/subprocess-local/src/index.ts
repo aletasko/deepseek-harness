@@ -56,14 +56,11 @@ import {
   assertBrokerConfig,
   assertNoBrokerIdentityOverride,
   bindBrokerProcess,
-  BrokerTerminalHandle,
   brokerModeDeclared,
   launchBrokerProcess,
-  readBrokerAssignmentResolver,
-  resolveBrokerAssignment,
-  terminalEnv,
+  readBrokerLauncher,
 } from './broker.ts'
-import type { SubprocessBrokerConfig } from './broker.ts'
+import type { SubprocessBrokerConfig, SubprocessBrokerLauncher } from './broker.ts'
 import { attestSubprocessExecution } from '@deepseek-ai/dsh-subprocess'
 
 const requireNodePty = createLazyRequire<typeof NodePty>('node-pty', import.meta.url)
@@ -80,7 +77,6 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   private live = new Set<LocalSubprocessHandle>()
   /** Live terminals retained through normal quiescence or host-exit finalization. */
   private terminals = new Set<LocalTerminalHandle>()
-  private brokerTerminals = new Set<BrokerTerminalHandle>()
   /** Caller endpoints retained until close, independently of managed process lifetime. */
   private controlChannels = new Set<Duplex>()
   /** Test hook: process, spill, and platform operations forwarded to spawnSubprocess. */
@@ -147,12 +143,29 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     return assertBrokerConfig(active)
   }
 
-  /** Resolve the assignment only from the exact Core-attested active session. */
-  private brokerAssignment(): string {
-    const { attestation } = attestSubprocessExecution(this.ctx)
-    // The resolver is the launcher's, defined on the root under a symbol key and locked; it is not a Context name
-    // a plugin could provide. Read for each launch; absence, or anything not locked, denies.
-    return resolveBrokerAssignment(readBrokerAssignmentResolver(this.ctx), attestation.sessionId)
+  /**
+   * The launcher's broker launcher and the active execution it will read the session from. The execution is
+   * attested here, in the caller's own synchronous turn; the launcher derives the session from it and from nothing
+   * else. The launcher is defined on the root under a symbol key and locked; it is not a Context name a plugin could
+   * provide. Read for each launch; absence, or anything not locked, denies.
+   */
+  private brokerLaunch(): { launcher: SubprocessBrokerLauncher; execution: unknown } {
+    const { execution, attestation } = attestSubprocessExecution(this.ctx)
+    if (typeof attestation.sessionId !== 'string' || attestation.sessionId.length === 0) {
+      throw new Error('subprocess-local: broker launch requires a Core-attested agent session')
+    }
+    const launcher = readBrokerLauncher(this.ctx)
+    if (launcher === undefined) throw new Error('subprocess-local: broker launcher is unavailable')
+    return { launcher, execution }
+  }
+
+  /** v1 starts every brokered worker with `ignore` stdio; tell the log once that what the caller asked for is dropped. */
+  private brokerStdioWarned = false
+  private warnBrokerStdio(): void {
+    // Output is never `ignore` in a spawn request, so every brokered launch loses its output; say so once.
+    if (this.brokerStdioWarned) return
+    this.brokerStdioWarned = true
+    this.ctx.logger.warn('subprocess-local: broker v1 starts processes with ignored stdio; their output is not captured and their input is discarded (the exit status is reported)')
   }
 
   private terminateForHostExit(): void {
@@ -170,7 +183,6 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
         // One terminal must not prevent final termination of another target.
       }
     }
-    for (const terminal of this.brokerTerminals) terminal.terminateForHostExit()
   }
 
   private async disposeManagedProcesses(): Promise<void> {
@@ -190,9 +202,6 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     }
     for (const terminal of this.terminals) {
       pending.push(terminal.terminate().then(() => { this.terminals.delete(terminal) }))
-    }
-    for (const terminal of this.brokerTerminals) {
-      pending.push(terminal.terminate().then(() => { this.brokerTerminals.delete(terminal) }))
     }
     const outcomes = await Promise.allSettled(pending)
     await Promise.all([...this.controlChannels].map(control => new Promise<void>((resolveClose) => {
@@ -261,10 +270,14 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     let handle: LocalSubprocessHandle
     const internals: SpawnInternals = { ...this.internals, onSpillFailure: this.reportSpillFailure }
     if (brokerConfig !== undefined) {
-      const assignmentId = this.brokerAssignment()
+      const { launcher, execution } = this.brokerLaunch()
       assertNoBrokerIdentityOverride(env)
+      if (spec.stdio.control !== undefined) {
+        throw new Error('subprocess-local: broker v1 has no control channel; refusing the launch')
+      }
+      this.warnBrokerStdio()
       const binding = prepareManagedProcessBinding(internals)
-      handle = bindBrokerProcess(spec, launchBrokerProcess(spec, env, brokerConfig, assignmentId, spec.signal), binding)
+      handle = bindBrokerProcess(spec, launchBrokerProcess(spec, env, launcher, execution), binding)
     } else if (containmentMode === 'fallback') {
       handle = spawnSubprocess(spec, internals)
     } else {
@@ -362,22 +375,8 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     this.authorizeStart({ kind: 'terminal', argv: spec.argv, cwd: spec.cwd })
     const brokerConfig = this.currentBrokerConfig()
     if (brokerConfig !== undefined) {
-      const assignmentId = this.brokerAssignment()
-      const env = targetEnvironment(spec)
-      assertNoBrokerIdentityOverride(env)
-      const handle = new BrokerTerminalHandle(brokerConfig, assignmentId, spec, terminalEnv(spec, env))
-      this.brokerTerminals.add(handle)
-      try {
-        await handle.ready
-      } catch (error) {
-        this.brokerTerminals.delete(handle)
-        throw error
-      }
-      const release = async (): Promise<void> => {
-        try { await handle.terminate() } finally { this.brokerTerminals.delete(handle) }
-      }
-      void handle.done.then(release, release).catch(() => {})
-      return handle
+      // The broker refuses lease mode `terminal` in v1 and Core never asks for it; there is no local fallback.
+      throw new Error('subprocess-local: terminal sessions are not available in broker mode (broker v1 supports mode "process" only)')
     }
     const inspector = this.terminalInspector ?? createProcessInspector()
     const containmentMode = this.selectContainmentMode('terminal')
@@ -458,5 +457,7 @@ function environmentValue(env: NodeJS.ProcessEnv, name: 'PATH' | 'PATHEXT'): str
 }
 
 export default LocalSubprocessRuntime
-export { BROKER_ASSIGNMENT_RESOLVER_KEY } from './broker.ts'
-export type { SubprocessBrokerAssignmentResolver, SubprocessBrokerConfig } from './broker.ts'
+export { BROKER_LAUNCHER_KEY } from './broker.ts'
+export type {
+  BrokerLaunchRequest, BrokerLaunchResult, BrokerWorkerExit, SubprocessBrokerConfig, SubprocessBrokerLauncher,
+} from './broker.ts'

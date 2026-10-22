@@ -14,8 +14,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   assertBrokerBootInputs, assertBrokerTree, auditBrokerTree, BROKER_SOCKET_ENV, readBrokerRequirement,
 } from '../src/broker-required.ts'
-import { assignmentUnavailableClient, createBindingHost, type BindingHost } from '../src/broker-binding.ts'
-import { ASSIGNMENT_RESOLVER_KEY, LIFECYCLE_HOOK_KEY, ROOM_PLUGIN_SPECIFIER } from '../src/broker-capabilities.ts'
+import { createBindingHost, type BindingHost } from '../src/broker-binding.ts'
+import { BrokerControlClient } from '../src/broker-client.ts'
+import { BROKER_LAUNCHER_KEY, LIFECYCLE_HOOK_KEY, ROOM_PLUGIN_SPECIFIER } from '../src/broker-capabilities.ts'
 import { claimBrokerControl } from '../src/broker-control.ts'
 import { runProfile } from '../src/profile-boot.ts'
 
@@ -728,7 +729,7 @@ describe('binding host in the launcher', () => {
     }
   })
 
-  it('closes the include override, claims the resolver slot and holds the control claim, only under the declaration', async () => {
+  it('closes the include override, claims the launcher slot and holds the control claim, only under the declaration', async () => {
     await useRealBoot()
     const fx = fixture([...probeRows, { id: 'room', name: ROOM_PLUGIN_SPECIFIER }])
     addRoomProbe(fx)
@@ -741,11 +742,12 @@ describe('binding host in the launcher', () => {
       expect(() => { (ctx as unknown as { loader: { builtins: unknown } }).loader.builtins = { include: Evil } }).toThrow(TypeError)
       expect(probe.applied).toHaveLength(1)
       expect(probe.applied[0]!.arity).toBe(3)
-      // The assignment resolver is the launcher's: a locked symbol property that answers nobody.
-      const descriptor = Object.getOwnPropertyDescriptor(ctx.root, ASSIGNMENT_RESOLVER_KEY)!
+      // The broker launcher is the launcher's: a locked symbol property. Outside an attested execution it refuses.
+      const descriptor = Object.getOwnPropertyDescriptor(ctx.root, BROKER_LAUNCHER_KEY)!
       expect(descriptor).toMatchObject({ writable: false, configurable: false, enumerable: false })
-      expect((descriptor.value as { resolve(id: string): unknown }).resolve('any-session')).toBeUndefined()
-      expect(Object.keys(ctx.reflect.props).filter(name => /resolver|assignment/iu.test(name))).toEqual([])
+      expect(await (descriptor.value as { launch(request: object): Promise<unknown> })
+        .launch({ execution: undefined, argv: ['/bin/true'], cwd: '/', env: {}, graceMs: 1 })).toMatchObject({ ok: false })
+      expect(Object.keys(ctx.reflect.props).filter(name => /resolver|assignment|launcher/iu.test(name))).toEqual([])
       // Limit 2: the launcher opened the control connection first, so a second opener in this process is refused.
       expect(() => claimBrokerControl()).toThrow(/already open in this process/)
     } finally {
@@ -759,7 +761,7 @@ describe('binding host in the launcher', () => {
     addRoomProbe(plain)
     const unguarded = await launch(plain, launchEnv({}))
     try {
-      expect(Object.hasOwn(unguarded.ctx.root, ASSIGNMENT_RESOLVER_KEY)).toBe(false)
+      expect(Object.hasOwn(unguarded.ctx.root, BROKER_LAUNCHER_KEY)).toBe(false)
       const free = claimBrokerControl()
       free()
     } finally {
@@ -796,14 +798,16 @@ describe('binding host in the launcher', () => {
     }
   })
 
-  it('is built only under the broker declaration, with the denying client, and armed only after the audit', async () => {
+  it('is built only under the broker declaration, with the real control client for the configured socket, and armed only after the audit', async () => {
     await useRealBoot()
     vi.mocked(createBindingHost).mockClear()
     const { ctx } = await launch(fixture(probeRows))
     try {
       expect(createBindingHost).toHaveBeenCalledTimes(1)
       const [options] = vi.mocked(createBindingHost).mock.calls[0]!
-      expect(options).toMatchObject({ broker: { socketPath: SOCKET }, client: assignmentUnavailableClient })
+      expect(options).toMatchObject({ broker: { socketPath: SOCKET } })
+      expect(options.client).toBeInstanceOf(BrokerControlClient)
+      expect((options.client as BrokerControlClient).socketPath).toBe(SOCKET)
       expect(options.ctx).toBe(ctx)
       expect(builtHost().gate.isActive()).toBe(true)
       // Held by the launcher alone: nothing about it is published on the Context.

@@ -5,7 +5,7 @@ kind: "package-reference"
 
 # @deepseek-ai/dsh-subprocess-local
 
-## Trusted broker route (draft)
+## Trusted broker route (v1)
 
 The local provider can opt into a host supplied Unix socket broker by providing
 `subprocessBrokerConfig` on the trusted Cordis context before loading this
@@ -15,57 +15,66 @@ provider:
 ctx.provide('subprocessBrokerConfig', {
   socketPath: '/run/dsh-subprocess-broker.sock',
 })
-ctx.provide('subprocessBrokerAssignmentResolver', {
-  // `sessionId` is returned by Core's attestation of the exact active tool body.
-  // Resolve it through a host-owned session-to-worktree registry.
-  resolve(sessionId) { return assignmentForSession(sessionId) },
-})
 ```
 
-The configuration is read on every launch, so a provider that registers or is
-replaced after this provider starts takes effect on the next `spawn` or
-`spawnTerminal`. Once the name has been provided in the Core process, a launch
-with no active valid configuration (provider still starting, invalid, or
-disposed) is denied instead of using the local path. The record is Cordis's
-`reflect.props` entry for the name, which survives provider disposal until the
-process ends. It is a same-process guard, not a security boundary: Host code
-sharing the process can edit `reflect.props`, and a Core restart forgets the
-declaration, so a profile that requires the broker must also be enforced
-statically. `@deepseek-ai/dsh-plugin-manager` and
-`@deepseek-ai/dsh-cordis-host-runner` apply the same check to profile
-mutations, `pnpm` reads, and Host code execution.
+This package does not open the socket and does not map sessions to assignments.
+The launcher (`dsh`, in broker-required mode) owns the one control connection to
+the broker and installs a broker launcher on the root context under the symbol
+`BROKER_LAUNCHER_KEY` (`Symbol.for('dsh.subprocess-local.broker-launcher')`), as
+an own, non-writable, non-configurable data property, once, before the tree
+mounts. It is **not** a Context name: a plugin cannot `provide` it, and
+`ctx.provide('subprocessBrokerAssignmentResolver', …)`, the name earlier drafts of
+this README showed, is never read. A slot that is absent, writable,
+configurable, inherited or an accessor denies the launch.
 
-When present, ordinary processes and PTY terminals use only that broker. A
-missing socket, rejected request, or invalid protocol event fails closed. The
+For each `spawn` the runtime attests the active ToolRuntime execution in the
+caller's own synchronous turn and hands that execution (not a session id) to
+`launcher.launch({ execution, argv, cwd, env, graceMs })`. The launcher derives
+the session from the execution alone, leases the session's binding with mode
+`process` and starts the worker over the same control connection, and the
+runtime waits for the broker's unsolicited `worker-exited` to settle the
+handle's outcome. Both steps are broker round trips, so the launcher is
+asynchronous; a refusal rejects `handle.done`.
+
+The configuration is read on every launch, so a provider that registers or is
+replaced after this provider starts takes effect on the next `spawn`. Once the
+name has been provided in the Core process, a launch with no active valid
+configuration (provider still starting, invalid, or disposed) is denied instead
+of using the local path. The record is Cordis's `reflect.props` entry for the
+name, which survives provider disposal until the process ends. It is a
+same-process guard, not a security boundary: Host code sharing the process can
+edit `reflect.props`, and a Core restart forgets the declaration, so a profile
+that requires the broker must also be enforced statically.
+`@deepseek-ai/dsh-plugin-manager` and `@deepseek-ai/dsh-cordis-host-runner`
+apply the same check to profile mutations, `pnpm` reads, and Host code
+execution. When broker mode is declared, ordinary processes use only the broker
+and a missing launcher, a refusal, or a lost connection fails closed. The
 provider does not fall back to `systemd-run`, `node:child_process.spawn`, or
-`node-pty`. The request carries literal `argv`, `cwd`, effective child `env`,
-stdio dispositions, and the trusted assignment identifier. It never carries
-the requested UID or path authorization policy; Core resolves the assignment
-from the exact active ToolRuntime session through a trusted host resolver. The
-broker must resolve UID and path policy from its own assignment table and
-authenticate the local Core peer. Static assignment IDs are not supported.
-The broker must canonicalize and validate `cwd` beneath the root named by the
-assignment, including symlinks and races. The requested `cwd` is an execution
-parameter, never the authorization rule.
+`node-pty`.
+
 The broker route rejects explicit `DSH_SESSION_ID` overrides. Other environment
 values are data only; neither the client nor broker may derive session identity
-or assignment selection from child environment variables.
+or assignment selection from child environment variables. The broker resolves
+UID, root and path policy from its own tables and authenticates the Core peer;
+the requested `cwd` is an execution parameter, never the authorization rule.
 
-The newline framed v1 client protocol is a draft. Process requests receive an
-`accepted` handle, stdout/stderr and PTY data events, one `outcome`, and an
-`empty` event after the managed range is quiescent. For both process and PTY,
-the broker may send output after the direct `outcome`; it must send `empty`
-only after the full managed range is quiescent, and the client closes output
-streams only at `empty`. PTY operations use request
-IDs and responses for input, resize, foreground inspection, activity
-inspection, and foreground signals. Cancellation asks the broker to terminate
-the full range; `waitForExit()` settles only on `empty`. A terminal cancel
-remains valid after `outcome` until `empty`, because descendants may remain.
-PTY RPCs time out after ten seconds and close the connection; the broker must
-tear down the managed range on disconnect. The broker must also
-terminate the range when the client disconnects, including protocol failure or
-host shutdown. A matching broker implementation and protocol review are
-required before deployment.
+### What a brokered launch loses in v1
+
+The broker's `start` accepts only `ignore` for stdin, stdout and stderr, and
+mode `process`. Consequently, for a launch routed through the broker:
+
+- **stdout and stderr are not captured.** `collect`, `pipe` and `inherit`
+  produce empty streams that end when the worker exits; a caller that reads
+  command output (the bash tool, for instance) sees none. The exit status and
+  terminating signal are real. The runtime logs a warning once.
+- **stdin is discarded.** Writes to `handle.stdin` go nowhere.
+- **No control channel and no terminal sessions.** A request with
+  `stdio.control` and every `spawnTerminal` is refused; lease mode `terminal`
+  is refused by the v1 broker.
+- **No per-process signal.** The broker has no frame to signal one worker, so
+  `terminate()` and an abort cannot end it. A worker ends by exiting, or when
+  its binding is revoked or the control connection closes, which makes the
+  broker kill the whole range.
 
 English | [中文](README.zh.md)
 

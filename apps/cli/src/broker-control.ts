@@ -58,7 +58,8 @@ export function claimBrokerControl(holder: object = globalThis): () => void {
  * throws. Call it before the plugin tree mounts and before anything else is built from the client.
  * @param ctx The root context the launch owns.
  * @param broker The trusted broker config.
- * @param connect Builds the client. Today the launcher passes the client that refuses everything.
+ * @param connect Builds the client: the real control client when a broker socket is configured, the deny client
+ *   otherwise (see `createBrokerClient`).
  * @param holder Test seam for the claim's location.
  * @returns The one client for this process.
  */
@@ -71,7 +72,8 @@ export function openBrokerControl(
   const release = claimBrokerControl(holder)
   try {
     const client = connect(broker)
-    ctx.effect(() => release, 'broker control connection')
+    // Closing the connection is itself the broker's cue to revoke everything, so it comes before the claim is freed.
+    ctx.effect(() => () => { try { client.closeControl() } finally { release() } }, 'broker control connection')
     return client
   } catch (error) {
     release()

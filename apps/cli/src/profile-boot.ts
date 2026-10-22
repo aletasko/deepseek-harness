@@ -40,10 +40,11 @@ import { provideCmdline, type AppReady } from '@deepseek-ai/dsh-cmdline'
 import {
   assertBrokerBootInputs, auditBrokerTree, brokerBootPatches, readBrokerRequirement,
 } from './broker-required.ts'
-import { assignmentUnavailableClient, createBindingHost, type BindingHost } from './broker-binding.ts'
+import { createBindingHost, type BindingHost } from './broker-binding.ts'
+import { createBrokerClient } from './broker-client.ts'
 import { openBrokerControl } from './broker-control.ts'
 import {
-  createRoomSeatPort, installAssignmentResolver, installCapabilityPorts, installLifecycleHook, ROOM_PLUGIN_SPECIFIER,
+  createRoomSeatPort, installBrokerLauncher, installCapabilityPorts, installLifecycleHook, ROOM_PLUGIN_SPECIFIER,
   type CapabilityPorts,
 } from './broker-capabilities.ts'
 import { createProcessShutdown, type ProcessShutdown } from './process-shutdown.ts'
@@ -356,15 +357,16 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
       if (broker !== undefined) {
         hostCtx.provide('subprocessBrokerConfig', broker)
         // The control connection is opened first, here, by the launcher alone: the one claim in this process is
-        // taken before any client exists, and the broker accepts a single Core control connection. The client
-        // shipped today refuses every request; no positive path exists.
-        const client = openBrokerControl(hostCtx, broker, () => assignmentUnavailableClient)
+        // taken before any client exists, and the broker accepts a single Core control connection. The client is
+        // the real one because a broker socket is configured (`createBrokerClient` returns the deny client
+        // otherwise); whether anything is granted is the broker's decision, and it grants only in staging.
+        const client = openBrokerControl(hostCtx, broker, config => createBrokerClient(config))
         bindingHost = createBindingHost({ ctx: hostCtx, broker, client })
         // All before the tree mounts. The agent loop reads the hook from a symbol key on the root, the local
-        // subprocess runtime reads its assignment resolver from another, and ROOM gets its closed port as the
+        // subprocess runtime reads its broker launcher from another, and ROOM gets its closed port as the
         // third `apply` argument. None is a Context name, an event or a config value.
         installLifecycleHook(hostCtx, bindingHost)
-        installAssignmentResolver(hostCtx)
+        installBrokerLauncher(hostCtx, bindingHost)
         capabilityPorts = installCapabilityPorts(hostCtx, { [ROOM_PLUGIN_SPECIFIER]: createRoomSeatPort(hostCtx, bindingHost) })
       }
       hostCtx.provide('profileContext', profileContext)

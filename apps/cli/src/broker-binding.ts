@@ -1,9 +1,10 @@
 /**
  * Host-only binding issuer and assignment resolver for a `dsh` started under the broker-required gate.
  *
- * Core states only the facts it created itself: which session exists, the workspace id minted here, its own
- * process epoch, the binding kind and parent, and the `realpath` of the session's header `cwd` as Core read it when
- * the binding was requested. It does not assert what only Orca or the broker can prove (worktree path of an
+ * Core states only the facts it created itself: which session exists, the workspace id minted here, the binding
+ * kind and parent, and the `realpath` of the session's header `cwd` as Core read it when the binding was requested.
+ * There is no Core-side epoch: the only epoch is the integer the broker returns when the control connection
+ * registers, and Core never sends one. It does not assert what only Orca or the broker can prove (worktree path of an
  * instance, `dev`/`ino`, execution host), and it never mints an `assignmentId`; the broker owns the registry, the
  * monotonic revision and every assignment. This module sends requests and relays the broker's answer.
  *
@@ -31,6 +32,7 @@ import { realpath } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-session'
+import { BindingLauncher } from './broker-launch.ts'
 import { auditBrokerTree, type BrokerConfig } from './broker-required.ts'
 
 /** Why Core produced no binding or assignment. Broker-supplied reasons are relayed as-is. */
@@ -49,6 +51,7 @@ export type BindingRefusalReason =
   | 'revoked'
   | 'stale-revision'
   | 'broker-malformed'
+  | 'invalid-label'
   | 'assignment-unavailable'
   | (string & {})
 
@@ -60,8 +63,9 @@ export interface BindingRefusal {
 export type BindingKind = 'room-seat' | 'attach' | 'child'
 
 /**
- * ROOM facts Core carries on behalf of the ROOM plugin. The key names are the design contract's own (BE03m1
- * design section 2) so the plugin and the broker read the same record. Core cannot verify them.
+ * ROOM facts Core carries on behalf of the ROOM plugin. These are Core's internal names (BE03m1 design section 2),
+ * which the plugin already speaks. The broker's wire names are `origin`, `roomId`, `agentId`, `installationId`;
+ * the rename happens only at the wire edge (`broker-wire.ts`). Core cannot verify them.
  */
 export interface RoomFacts {
   readonly origine: 'dsh'
@@ -75,8 +79,6 @@ export interface BindingRequest {
   readonly sessionId: string
   /** Minted by the issuer (inherited from the parent for `child`); never read from a request, header or cwd. */
   readonly workspaceId: string
-  /** This Core process's own epoch. A restart yields a new one. */
-  readonly coreEpoch: string
   readonly kind: BindingKind
   /** Broker-assigned id of the parent binding, `child` only. */
   readonly parentBindingId?: string
@@ -90,7 +92,10 @@ export interface BindingRequest {
    * an instance id that arrived through an unauthenticated channel to the session it is being bound to.
    */
   readonly cwd?: string
-  /** Locator only; the broker asks Orca itself for path, `dev`, `ino` and execution host. */
+  /**
+   * Locator only; the broker asks Orca itself for path, `dev`, `ino` and execution host. Present for `room-seat`
+   * and `attach` (the broker requires it); absent for `child`, which inherits its parent's attestation.
+   */
   readonly orca?: { readonly instanceId: string }
   readonly room?: RoomFacts
   readonly orgId?: string
@@ -105,17 +110,16 @@ export interface BindingGrant {
 }
 
 export interface RevokeRequest {
+  /** Core's own bookkeeping; the wire frame is `{bindingId, reason?}` and carries no session id. */
   readonly sessionId: string
   readonly bindingId: string
-  readonly coreEpoch: string
 }
 
 export interface AssignRequest {
-  /** Taken from `exec.agent.id` as attested by the ToolRuntime; nothing else identifies the caller. */
+  /** Taken from `exec.agent.id` as attested by the ToolRuntime. Not sent: the broker names the binding by id. */
   readonly sessionId: string
   readonly bindingId: string
   readonly revision: number
-  readonly coreEpoch: string
 }
 
 /** The broker's opaque answer to {@link AssignRequest}; Core relays it and never builds one. */
@@ -125,29 +129,80 @@ export interface AssignmentGrant {
   readonly revision: number
 }
 
-/** What Core needs from the root broker. Real implementations talk to the control socket; tests simulate it. */
+/** What `start` needs: the opaque assignment the broker issued, and the process to run inside the pinned root. */
+export interface StartRequest {
+  readonly assignmentId: string
+  readonly argv: readonly string[]
+  readonly cwd: string
+  readonly env: Readonly<Record<string, string>>
+  readonly graceMs: number
+}
+
+/** How a broker worker ended, from the broker's `worker-exited`, or why Core can no longer tell. */
+export type WorkerExit =
+  | { readonly ok: true; readonly code: number | null; readonly signal: string | null }
+  | { readonly ok: false; readonly reason: BindingRefusalReason }
+
+/** The broker started the worker. `exited` settles once, from the unsolicited `worker-exited` frame. */
+export interface StartGrant {
+  readonly ok: true
+  readonly pid: number
+  readonly workerId: string
+  readonly exited: Promise<WorkerExit>
+}
+
+/** The broker's read-back of its own state (`status`). Core relays it; nothing here is authority. */
+export interface BrokerStatus {
+  readonly ok: true
+  readonly status: Readonly<Record<string, unknown>>
+}
+
+/**
+ * What Core needs from the root broker: one control connection, requests correlated by id. Real implementations
+ * talk to the control socket (`broker-client.ts`); tests simulate it.
+ */
 export interface BindingBrokerClient {
   bind(request: BindingRequest): Promise<BindingGrant | BindingRefusal>
   /** Resolves only once the broker has acknowledged the revocation. */
   revoke(request: RevokeRequest): Promise<{ readonly ok: true } | BindingRefusal>
+  /** The wire frame is `lease` with `mode: "process"`; `terminal` stays refused in v1 and Core never asks for it. */
   assign(request: AssignRequest): Promise<AssignmentGrant | BindingRefusal>
+  /** Start a worker under a leased assignment, over the same connection. v1 stdio is `ignore` only. */
+  start(request: StartRequest): Promise<StartGrant | BindingRefusal>
+  status(): Promise<BrokerStatus | BindingRefusal>
   /** Drop the control connection, which the broker treats as revoking everything. Used when a revoke is not acked. */
   closeControl(): void
 }
 
 /**
- * The broker client this slice ships: it mirrors the daemon, which answers `assignment-unavailable` to everything.
- * No positive grant path exists until the broker slices land.
+ * The deny client: it mirrors the deny-all daemon, which answers `assignment-unavailable` to everything. It is what
+ * Core uses unless an explicit broker socket is configured (`createBrokerClient`), so production defaults to deny.
  */
 export const assignmentUnavailableClient: BindingBrokerClient = Object.freeze({
   bind: () => Promise.resolve(refusal('assignment-unavailable')),
   revoke: () => Promise.resolve(refusal('assignment-unavailable')),
   assign: () => Promise.resolve(refusal('assignment-unavailable')),
+  start: () => Promise.resolve(refusal('assignment-unavailable')),
+  status: () => Promise.resolve(refusal('assignment-unavailable')),
   closeControl: () => {},
 })
 
 function refusal(reason: BindingRefusalReason): BindingRefusal {
   return Object.freeze({ ok: false, reason })
+}
+
+/** The broker's identifier shape (`protocol.py` `_LABEL`): sessionId, roomId, agentId, installationId, instanceId, orgId. */
+export const BROKER_LABEL = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u
+
+/**
+ * Whether the broker would accept `value` as an identifier. Session ids reach Core from several generators
+ * (`session-N`, `session-<uuid>`, `<agent>-session-<uuid>`, ids an SDK or ACP client chose), so the shape is not
+ * guaranteed: an id that does not fit is refused here as `invalid-label` rather than sent to be rejected as a frame
+ * the broker cannot answer by request id. Ids are not rewritten, because the broker's binding table and every later
+ * lookup would then have to share the mapping.
+ */
+export function isBrokerLabel(value: unknown): value is string {
+  return typeof value === 'string' && BROKER_LABEL.test(value)
 }
 
 /** Services whose presence means model-defined Host code may run in this process. */
@@ -275,9 +330,13 @@ function validRoom(room: unknown): room is RoomFacts {
   return origine === 'dsh' && nonEmpty(stanzaId) && nonEmpty(agente) && nonEmpty(installazione)
 }
 
+function labelled(room: RoomFacts): boolean {
+  return isBrokerLabel(room.stanzaId) && isBrokerLabel(room.agente) && isBrokerLabel(room.installazione)
+}
+
 /**
- * Issues binding requests and revokes them. Bindings live in memory only: a restarted Core has a new
- * `coreEpoch` and an empty table, so nothing issued by a previous process is ever reused.
+ * Issues binding requests and revokes them. Bindings live in memory only: a restarted Core has an empty table and a
+ * new broker epoch (the broker's, from `registered`), so nothing issued by a previous process is ever reused.
  */
 export class BindingIssuer {
   private readonly records = new Map<string, Entry>()
@@ -286,7 +345,6 @@ export class BindingIssuer {
     private readonly ctx: Context,
     private readonly gate: BrokerGate,
     private readonly client: BindingBrokerClient,
-    readonly coreEpoch: string,
     readonly timeoutMs: number = DEFAULT_BROKER_TIMEOUT_MS,
   ) {}
 
@@ -313,6 +371,15 @@ export class BindingIssuer {
     if (input.orgId !== undefined && !nonEmpty(input.orgId)) return refusal('invalid-request')
     if (input.room !== undefined && !validRoom(input.room)) return refusal('invalid-request')
     if ((kind === 'child') !== (input.parentSessionId !== undefined)) return refusal('invalid-request')
+    // The broker requires an Orca locator for every kind but `child`, and a `child` takes its parent's attestation.
+    if ((kind === 'child') !== (input.orcaInstanceId === undefined)) return refusal('invalid-request')
+    // The broker's identifier shape, checked before anything is sent or recorded (see `isBrokerLabel`).
+    if (!isBrokerLabel(sessionId)
+      || (input.orcaInstanceId !== undefined && !isBrokerLabel(input.orcaInstanceId))
+      || (input.orgId !== undefined && !isBrokerLabel(input.orgId))
+      || (input.room !== undefined && !labelled(input.room))) {
+      return refusal('invalid-label')
+    }
     // Only a session that is live in this Core's store can be bound. A forged event cannot create one.
     const sessions = this.ctx.reflect.get('sessions') as { get(id: string): SessionView | undefined } | undefined
     const session = sessions?.get(sessionId)
@@ -365,7 +432,7 @@ export class BindingIssuer {
         }
       }
       const request: BindingRequest = Object.freeze({
-        sessionId, workspaceId, coreEpoch: this.coreEpoch, kind,
+        sessionId, workspaceId, kind,
         ...parentBindingId === undefined ? {} : { parentBindingId },
         ...cwd === undefined ? {} : { cwd },
         ...input.orcaInstanceId === undefined ? {} : { orca: Object.freeze({ instanceId: input.orcaInstanceId }) },
@@ -456,7 +523,7 @@ export class BindingIssuer {
 
   private async sendRevoke(sessionId: string, grant: BindingGrant): Promise<RevokeOutcome> {
     try {
-      const frame: RevokeRequest = { sessionId, bindingId: grant.bindingId, coreEpoch: this.coreEpoch }
+      const frame: RevokeRequest = { sessionId, bindingId: grant.bindingId }
       const answer = await withDeadline(this.timeoutMs, () => this.client.revoke(frame))
       if (answer.ok) return { ok: true }
       this.closeControl()
@@ -504,7 +571,7 @@ interface ToolAttestor {
  * the execution object is read: no path, cwd, header, alias, prefix or `DSH_SESSION_ID`. Used for the resolver and
  * for proving that a child is being created by its parent's own tool call.
  */
-function attestedSessionId(ctx: Context, execution?: unknown): string | undefined {
+export function attestedSessionId(ctx: Context, execution?: unknown): string | undefined {
   const tools = ctx.reflect.get('tools') as ToolAttestor | undefined
   try {
     const active = execution ?? tools?.currentActiveExecution()
@@ -542,7 +609,7 @@ export class BindingResolver {
     if (binding.revision !== revision) return refusal('stale-revision')
     let answer: unknown
     try {
-      const frame: AssignRequest = { sessionId, bindingId: binding.bindingId, revision, coreEpoch: this.issuer.coreEpoch }
+      const frame: AssignRequest = { sessionId, bindingId: binding.bindingId, revision }
       answer = await withDeadline(this.issuer.timeoutMs, () => this.client.assign(frame))
     } catch (error) {
       if (error instanceof BrokerSilence) {
@@ -558,6 +625,23 @@ export class BindingResolver {
     if (!isAssignment(answer) || answer.revision !== revision) return refusal('broker-malformed')
     return answer
   }
+
+  /**
+   * Lease the current revision of the binding of the session the execution attests. The attestation and the lookup
+   * happen before the first `await`, in the caller's own synchronous turn, so this is the call a launch path makes
+   * (see {@link BindingLauncher}); {@link BindingResolver.resolve} is the one for a caller that already knows the
+   * revision it expects.
+   * @param execution The active tool execution; defaults to the ToolRuntime's current one.
+   * @returns The broker's {@link AssignmentGrant} unchanged, or a refusal. Never throws.
+   */
+  lease(execution?: unknown): Promise<AssignmentGrant | BindingRefusal> {
+    if (!this.gate.isActive()) return Promise.resolve(refusal('gate-inactive'))
+    const sessionId = attestedSessionId(this.ctx, execution)
+    if (sessionId === undefined) return Promise.resolve(refusal('no-active-execution'))
+    const binding = this.issuer.lookup(sessionId)
+    if (!('bindingId' in binding)) return Promise.resolve(binding)
+    return this.resolve(binding.revision, execution)
+  }
 }
 
 function isAssignment(value: unknown): value is AssignmentGrant {
@@ -571,6 +655,7 @@ export interface BindingHost {
   readonly gate: BrokerGate
   readonly issuer: BindingIssuer
   readonly resolver: BindingResolver
+  readonly launcher: BindingLauncher
 }
 
 /**
@@ -583,15 +668,15 @@ export function createBindingHost(options: {
   ctx: Context
   broker: BrokerConfig
   client: BindingBrokerClient
-  coreEpoch?: string
   timeoutMs?: number
 }): BindingHost {
   const { ctx, broker, client } = options
   const gate = new BrokerGate(ctx, broker)
-  const issuer = new BindingIssuer(ctx, gate, client, options.coreEpoch ?? randomUUID(), options.timeoutMs)
+  const issuer = new BindingIssuer(ctx, gate, client, options.timeoutMs)
   const resolver = new BindingResolver(ctx, gate, issuer, client)
+  const launcher = new BindingLauncher(execution => attestedSessionId(ctx, execution), gate, issuer, resolver, client)
   // The only event this module listens to. A forged `session/disposed` can only revoke, never issue.
   ctx.on('session/disposed', (session) => { void issuer.revoke(session.id) })
   ctx.effect(() => () => void issuer.revokeAll(), 'binding-issuer teardown')
-  return Object.freeze({ gate, issuer, resolver })
+  return Object.freeze({ gate, issuer, resolver, launcher })
 }

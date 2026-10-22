@@ -42,7 +42,6 @@ afterEach(async () => { await Promise.all(live.splice(0).map(ctx => ctx.fiber.di
 interface EnvironmentOptions {
   arm?: boolean
   broker?: FakeBroker
-  coreEpoch?: string
   client?: BindingBrokerClient
   timeoutMs?: number
 }
@@ -63,7 +62,6 @@ async function environment(options: EnvironmentOptions = {}): Promise<Env> {
   const broker = options.broker ?? new FakeBroker()
   const host = createBindingHost({
     ctx, broker: BROKER, client: options.client ?? broker,
-    ...options.coreEpoch === undefined ? {} : { coreEpoch: options.coreEpoch },
     ...options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs },
   })
   if (options.arm !== false) host.gate.arm()
@@ -97,7 +95,9 @@ async function bound(env: Env, id: string, input: Partial<IssueInput> = {}, meta
         const session = inner.sessions.prepare(SessionId(id), options)
         yield inner.sessions.enter(session)
         inner.sessions.announce(session)
-        outcome = await env.host.issuer.issue({ sessionId: id, kind: 'attach', ...input })
+        outcome = await env.host.issuer.issue({
+          sessionId: id, kind: 'attach', ...input.kind === 'child' ? {} : { orcaInstanceId: 'instance-1' }, ...input,
+        })
       }, 'seat')
     },
   })
@@ -189,7 +189,7 @@ describe('the gate is a hard precondition, checked at the effect', () => {
 
 describe('issuance', () => {
   it('sends only facts Core created, with a workspace minted by the issuer, and drops everything else', async () => {
-    const env = await environment({ coreEpoch: 'epoch-A' })
+    const env = await environment()
     const forged = {
       cwd: '/etc', path: '/etc/shadow', workspaceId: 'attacker-workspace', executionHostId: 'host-x', dev: 1, ino: 2,
       assignmentId: 'forged', env: { DSH_SESSION_ID: 'other' }, headers: { cwd: '/' },
@@ -200,11 +200,11 @@ describe('issuance', () => {
     const { outcome } = await bound(env, 'session-1', { kind: 'room-seat', ...forged } as never)
     expect(outcome).toMatchObject({ ok: true })
     const [request] = env.broker.binds
-    expect(Object.keys(request!).sort()).toEqual(['coreEpoch', 'cwd', 'kind', 'orca', 'orgId', 'room', 'sessionId', 'workspaceId'])
+    expect(Object.keys(request!).sort()).toEqual(['cwd', 'kind', 'orca', 'orgId', 'room', 'sessionId', 'workspaceId'])
     // The forged `cwd: '/etc'` above is dropped; the value is Core's own realpath of the session header cwd.
     expect(request!.cwd).toBe(CWD)
     expect(request).toMatchObject({
-      sessionId: 'session-1', coreEpoch: 'epoch-A', kind: 'room-seat', orca: { instanceId: 'instance-9' }, orgId: 'org-1',
+      sessionId: 'session-1', kind: 'room-seat', orca: { instanceId: 'instance-9' }, orgId: 'org-1',
       room: { origine: 'dsh', stanzaId: 'room-1', agente: 'agent-1', installazione: 'inst-1' },
     })
     expect(Object.keys(request!.room!).sort()).toEqual(['agente', 'installazione', 'origine', 'stanzaId'])
@@ -231,7 +231,7 @@ describe('issuance', () => {
             const session = inner.sessions.prepare(SessionId(id), cwd === undefined ? undefined : { meta: { cwd } })
             yield inner.sessions.enter(session)
             inner.sessions.announce(session)
-            outcome = await env.host.issuer.issue({ sessionId: id, kind, ...extra })
+            outcome = await env.host.issuer.issue({ sessionId: id, kind, orcaInstanceId: 'i-0', ...extra })
           }, 'seat')
         },
       })
@@ -288,7 +288,7 @@ describe('issuance', () => {
       const root = scratch()
       const both = await Promise.all([
         issueWith(env, 'twice', 'attach', root),
-        (async () => { await Promise.resolve(); return await env.host.issuer.issue({ sessionId: 'twice', kind: 'attach' }) })(),
+        (async () => { await Promise.resolve(); return await env.host.issuer.issue({ sessionId: 'twice', kind: 'attach', orcaInstanceId: 'instance-1' }) })(),
       ])
       expect(both.filter(outcome => outcome.ok)).toHaveLength(1)
       expect(env.broker.binds).toHaveLength(1)
@@ -297,7 +297,7 @@ describe('issuance', () => {
 
   it('refuses a session that is not live in this Core, and malformed or contradictory requests', async () => {
     const env = await environment()
-    const issue = (input: Partial<IssueInput>) => env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach', ...input })
+    const issue = (input: Partial<IssueInput>) => env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach', orcaInstanceId: 'instance-1', ...input })
     expect(await issue({})).toEqual({ ok: false, reason: 'unknown-session' })
     await env.seat('session-1')
     expect(await issue({ kind: 'bogus' as never })).toEqual({ ok: false, reason: 'invalid-request' })
@@ -313,7 +313,7 @@ describe('issuance', () => {
     const env = await environment()
     const first = await bound(env, 'session-1')
     expect(first.outcome).toMatchObject({ ok: true })
-    expect(await env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach' })).toEqual({ ok: false, reason: 'already-bound' })
+    expect(await env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach', orcaInstanceId: 'instance-1' })).toEqual({ ok: false, reason: 'already-bound' })
     expect(env.broker.binds).toHaveLength(1)
   })
 
@@ -344,7 +344,7 @@ describe('issuance', () => {
 
 describe('resolver', () => {
   it('returns the broker answer unchanged and sends only the attested agent id, the binding and the revision', async () => {
-    const env = await environment({ coreEpoch: 'epoch-A' })
+    const env = await environment()
     const seated = await bound(env, 'session-7')
     const { bindingId, revision } = seated.outcome as BindingGrant
     const sentinel: AssignmentGrant = Object.freeze({ ok: true, assignmentId: 'opaque-from-broker', revision })
@@ -356,7 +356,7 @@ describe('resolver', () => {
       }, { path: '/etc/shadow', cwd: '/etc', alias: '#root', prefix: '/srv' })
       expect(answer).toBe(sentinel)
     } finally { vi.unstubAllEnvs() }
-    expect(env.broker.assigns).toEqual([{ sessionId: 'session-7', bindingId, revision, coreEpoch: 'epoch-A' }])
+    expect(env.broker.assigns).toEqual([{ sessionId: 'session-7', bindingId, revision }])
   })
 
   it('uses the ToolRuntime current execution when none is passed', async () => {
@@ -436,13 +436,169 @@ describe('resolver', () => {
   })
 })
 
+describe('identifier shape and Orca locator (S6 contract 3, 9)', () => {
+  const label = (length: number): string => `s${'x'.repeat(length - 1)}`
+  async function issue(env: Env, id: string, input: Partial<IssueInput>) {
+    return (await bound(env, id, input)).outcome
+  }
+
+  it.each([
+    ['a slash', 'agent/one-session-1'],
+    ['a space', 'agent one'],
+    ['a leading dot', '.hidden'],
+    ['a leading dash', '-x'],
+    ['a newline', 'abc\n'],
+    ['129 characters', 'a'.repeat(129)],
+    ['non-ASCII', 'sessione-è'],
+  ])('refuses a session id with %s locally as invalid-label, and never sends a bind', async (_name, id) => {
+    const env = await environment()
+    expect(await issue(env, id, {})).toEqual({ ok: false, reason: 'invalid-label' })
+    expect(env.broker.binds).toHaveLength(0)
+  })
+
+  it('accepts every shape the broker accepts: 128 characters, dots, colons, dashes, underscores', async () => {
+    const env = await environment()
+    for (const id of [label(128), 'a.b:c-d_e', 'agent-1-session-3f2b8f0e-9c1d-4b57-8a43-1d2e3f4a5b6c', 'session-12']) {
+      expect(await issue(env, id, {}), id).toMatchObject({ ok: true })
+    }
+  })
+
+  it('applies the same shape to the Orca instance id, the org id and every ROOM field', async () => {
+    const env = await environment()
+    const room = { origine: 'dsh' as const, stanzaId: 'room-1', agente: 'agent-1', installazione: 'inst-1' }
+    const cases: Array<Partial<IssueInput>> = [
+      { orcaInstanceId: 'instance/1' }, { orgId: 'org 1' },
+      { room: { ...room, stanzaId: 'room/1' } }, { room: { ...room, agente: 'a'.repeat(129) } }, { room: { ...room, installazione: '.x' } },
+    ]
+    for (const [index, input] of cases.entries()) {
+      expect(await issue(env, `s${index}`, { kind: 'room-seat', ...input }), JSON.stringify(input)).toEqual({ ok: false, reason: 'invalid-label' })
+    }
+    expect(env.broker.binds).toHaveLength(0)
+  })
+
+  it('requires the Orca locator for attach and room-seat, and forbids it on a child', async () => {
+    const env = await environment()
+    expect(await env.host.issuer.issue({ sessionId: 'x', kind: 'attach' })).toEqual({ ok: false, reason: 'invalid-request' })
+    expect(await env.host.issuer.issue({ sessionId: 'x', kind: 'room-seat' })).toEqual({ ok: false, reason: 'invalid-request' })
+    await bound(env, 'parent')
+    const kid = await boundChild(env, 'kid', 'parent', { orcaInstanceId: 'instance-1' })
+    expect(kid.outcome).toEqual({ ok: false, reason: 'invalid-request' })
+    expect(env.broker.binds.map(request => request.sessionId)).toEqual(['parent'])
+  })
+})
+
+describe('the launch bridge: lease then start, for the attested session only (W-2)', () => {
+  const spec = { argv: ['/bin/echo', 'hi'], cwd: '/srv/wt', env: { A: 'b' }, graceMs: 200 }
+
+  it('leases the session binding, starts under the broker assignment, and ends with the broker worker-exited', async () => {
+    const env = await environment()
+    const { outcome } = await bound(env, 'session-7')
+    const { bindingId, revision } = outcome as BindingGrant
+    const result = await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec }))
+    expect(result).toMatchObject({ ok: true, pid: 4242 })
+    expect(env.broker.assigns).toEqual([{ sessionId: 'session-7', bindingId, revision }])
+    expect(env.broker.starts).toEqual([{ assignmentId: 'assignment-1-opaque', ...spec }])
+    expect(env.broker.log).toEqual(['bind:session-7', 'assign:session-7', 'start:assignment-1-opaque'])
+    if (!result.ok) return
+    let settled = false
+    void result.exited.then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    env.broker.exitWorker({ ok: true, code: 2, signal: null })
+    expect(await result.exited).toEqual({ ok: true, code: 2, signal: null })
+  })
+
+  it('takes the session from the execution alone: a session id, cwd or assignment on the request changes nothing', async () => {
+    const env = await environment()
+    await bound(env, 'victim')
+    await bound(env, 'attacker')
+    const forged = { sessionId: 'victim', assignmentId: 'forged', bindingId: 'binding-1', ...spec }
+    await inTool(env, 'attacker', exec => env.host.launcher.launch({ execution: exec, ...forged } as never))
+    expect(env.broker.assigns.map(request => request.sessionId)).toEqual(['attacker'])
+    expect(env.broker.starts.map(request => request.assignmentId)).toEqual(['assignment-1-opaque'])
+  })
+
+  it('refuses without asking the broker when there is no attested execution, a cloned one, or no binding', async () => {
+    const env = await environment()
+    await bound(env, 'session-7')
+    expect(await env.host.launcher.launch({ execution: undefined, ...spec })).toEqual({ ok: false, reason: 'no-active-execution' })
+    expect(await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: { ...exec }, ...spec })))
+      .toEqual({ ok: false, reason: 'no-active-execution' })
+    expect(await inTool(env, 'session-8', exec => env.host.launcher.launch({ execution: exec, ...spec })))
+      .toEqual({ ok: false, reason: 'no-binding' })
+    expect(env.broker.assigns).toHaveLength(0)
+    expect(env.broker.starts).toHaveLength(0)
+  })
+
+  it('relays a refused lease and a refused start, and starts nothing after a refused lease', async () => {
+    const env = await environment()
+    await bound(env, 'session-7')
+    env.broker.assignAnswer = async () => ({ ok: false, reason: 'stale-binding' })
+    expect(await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec }))).toEqual({ ok: false, reason: 'stale-binding' })
+    expect(env.broker.starts).toHaveLength(0)
+    delete env.broker.assignAnswer
+    env.broker.startAnswer = async () => ({ ok: false, reason: 'stdio-unsupported' })
+    expect(await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec }))).toEqual({ ok: false, reason: 'stdio-unsupported' })
+  })
+
+  it('refuses a malformed request and never throws, even when the client does', async () => {
+    const env = await environment()
+    await bound(env, 'session-7')
+    expect(await env.host.launcher.launch(null as never)).toEqual({ ok: false, reason: 'invalid-request' })
+    expect(await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec, argv: 'echo' } as never)))
+      .toEqual({ ok: false, reason: 'invalid-request' })
+    env.broker.startAnswer = () => { throw new Error('socket exploded') }
+    expect(await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec })))
+      .toEqual({ ok: false, reason: 'assignment-unavailable' })
+  })
+
+  it('does not hand out a worker that started under a binding revoked meanwhile', async () => {
+    const env = await environment()
+    await bound(env, 'session-7')
+    const started = Promise.withResolvers<unknown>()
+    env.broker.startAnswer = () => started.promise
+    const launching = inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec }))
+    await vi.waitFor(() => { expect(env.broker.starts).toHaveLength(1) })
+    await env.host.issuer.revoke('session-7')
+    started.resolve({ ok: true, pid: 9, workerId: 'w', exited: new Promise(() => {}) })
+    expect(await launching).toEqual({ ok: false, reason: 'revoked' })
+  })
+
+  it('revokes the binding when the gate latched off while the broker was starting the worker', async () => {
+    const env = await environment()
+    await bound(env, 'session-7')
+    env.broker.startAnswer = async () => {
+      env.ctx.reflect.provide('pluginManager', {})
+      return { ok: true, pid: 9, workerId: 'w', exited: new Promise(() => {}) }
+    }
+    expect(await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec }))).toEqual({ ok: false, reason: 'gate-inactive' })
+    await vi.waitFor(() => { expect(env.broker.revokes.map(request => request.sessionId)).toEqual(['session-7']) })
+  })
+
+  it('refuses while the gate is closed', async () => {
+    const env = await environment({ arm: false })
+    expect(await env.host.launcher.launch({ execution: undefined, ...spec })).toEqual({ ok: false, reason: 'gate-inactive' })
+    expect(env.broker.assigns).toHaveLength(0)
+  })
+
+  it('lease() takes the current revision from the issuer, so a caller cannot name a stale or future one', async () => {
+    const env = await environment()
+    const { outcome } = await bound(env, 'session-7')
+    const { revision } = outcome as BindingGrant
+    expect(await inTool(env, 'session-7', exec => env.host.resolver.lease(exec))).toMatchObject({ ok: true, revision })
+    expect(env.broker.assigns.map(request => request.revision)).toEqual([revision])
+  })
+})
+
 describe('deny-safe shipped client', () => {
   it('answers assignment-unavailable to everything and has no positive path', async () => {
-    const request = { sessionId: 's', workspaceId: 'w', coreEpoch: 'e', kind: 'attach' } as const
+    const request = { sessionId: 's', workspaceId: 'w', kind: 'attach' } as const
     const answers = [
       await assignmentUnavailableClient.bind(request),
-      await assignmentUnavailableClient.revoke({ sessionId: 's', bindingId: 'b', coreEpoch: 'e' }),
-      await assignmentUnavailableClient.assign({ sessionId: 's', bindingId: 'b', revision: 1, coreEpoch: 'e' }),
+      await assignmentUnavailableClient.revoke({ sessionId: 's', bindingId: 'b' }),
+      await assignmentUnavailableClient.assign({ sessionId: 's', bindingId: 'b', revision: 1 }),
+      await assignmentUnavailableClient.start({ assignmentId: 'a', argv: ['/bin/true'], cwd: '/', env: {}, graceMs: 1 }),
+      await assignmentUnavailableClient.status(),
     ]
     for (const answer of answers) expect(answer).toEqual({ ok: false, reason: 'assignment-unavailable' })
     expect(Object.isFrozen(assignmentUnavailableClient)).toBe(true)
@@ -505,21 +661,21 @@ describe('revocation', () => {
     const grant = Promise.withResolvers<unknown>()
     env.broker.bindAnswer = () => grant.promise
     await env.seat('session-1')
-    const issuing = env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach' })
+    const issuing = env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach', orcaInstanceId: 'instance-1' })
     await vi.waitFor(() => { expect(env.broker.binds).toHaveLength(1) })
     const revoking = env.host.issuer.revoke('session-1')
     expect(env.broker.revokes).toHaveLength(0)
     grant.resolve({ ok: true, bindingId: 'binding-late', revision: 4 })
     expect(await issuing).toEqual({ ok: false, reason: 'revoked' })
     expect(await revoking).toEqual({ ok: true })
-    expect(env.broker.revokes).toEqual([{ sessionId: 'session-1', bindingId: 'binding-late', coreEpoch: env.host.issuer.coreEpoch }])
+    expect(env.broker.revokes).toEqual([{ sessionId: 'session-1', bindingId: 'binding-late' }])
   })
 
   it('sends nothing to the broker for a binding revoked while its cwd was still being resolved', async () => {
     const env = await environment()
     await env.seat('session-1')
     // No await between the two calls: the revoke lands during the path resolution, not during the broker call.
-    const issuing = env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach' })
+    const issuing = env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach', orcaInstanceId: 'instance-1' })
     const revoking = env.host.issuer.revoke('session-1')
     expect(await issuing).toEqual({ ok: false, reason: 'revoked' })
     expect(await revoking).toEqual({ ok: true })
@@ -557,7 +713,7 @@ describe('revocation', () => {
     expect(env.host.issuer.lookup('c')).toEqual({ ok: false, reason: 'no-binding' })
     const before = env.broker.revokes.length
     // The ids are bound again from scratch; the old child record does not come back under the new parent.
-    expect(await env.host.issuer.issue({ sessionId: 'p', kind: 'attach' })).toMatchObject({ ok: true })
+    expect(await env.host.issuer.issue({ sessionId: 'p', kind: 'attach', orcaInstanceId: 'instance-1' })).toMatchObject({ ok: true })
     await env.host.issuer.revoke('p')
     expect(env.broker.revokes.slice(before).map(request => request.sessionId)).toEqual(['p'])
   })
@@ -568,10 +724,10 @@ describe('revocation', () => {
     const ack = Promise.withResolvers<{ ok: true }>()
     env.broker.revokeAnswer = () => ack.promise
     const revoking = env.host.issuer.revoke('session-1')
-    expect(await env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach' })).toEqual({ ok: false, reason: 'revoking' })
+    expect(await env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach', orcaInstanceId: 'instance-1' })).toEqual({ ok: false, reason: 'revoking' })
     ack.resolve({ ok: true })
     await revoking
-    expect(await env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach' })).toMatchObject({ ok: true })
+    expect(await env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach', orcaInstanceId: 'instance-1' })).toMatchObject({ ok: true })
   })
 })
 
@@ -622,7 +778,7 @@ describe('the gate is checked again after the broker answers', () => {
     }
     const { outcome } = await bound(env, 'session-1')
     expect(outcome).toEqual({ ok: false, reason: 'gate-inactive' })
-    await vi.waitFor(() => { expect(env.broker.revokes).toEqual([{ sessionId: 'session-1', bindingId: 'binding-late', coreEpoch: env.host.issuer.coreEpoch }]) })
+    await vi.waitFor(() => { expect(env.broker.revokes).toEqual([{ sessionId: 'session-1', bindingId: 'binding-late' }]) })
     expect(env.host.issuer.lookup('session-1')).toMatchObject({ ok: false })
   })
 
@@ -676,28 +832,22 @@ describe('a child is bound only under a parent the caller owns', () => {
 })
 
 describe('Core restart', () => {
-  it('mints a new coreEpoch per host and never reuses a previous process binding', async () => {
-    const broker = new FakeBroker()
-    const first = await environment({ broker })
+  it('holds nothing from a previous process and sends no epoch of its own', async () => {
+    const first = await environment()
     const seated = await bound(first, 'session-7')
     const { revision } = seated.outcome as BindingGrant
     expect(await inTool(first, 'session-7', () => first.host.resolver.resolve(revision))).toMatchObject({ ok: true })
 
-    const second = await environment({ broker })
-    expect(second.host.issuer.coreEpoch).not.toBe(first.host.issuer.coreEpoch)
+    // A restarted Core is a new host on a new control connection: the broker's epoch is its own, and Core's table is empty.
+    const second = await environment()
     await second.seat('session-7')
-    const before = broker.assigns.length
     // The same session id and revision are known only to the dead process; the new one holds nothing.
     expect(await inTool(second, 'session-7', () => second.host.resolver.resolve(revision))).toEqual({ ok: false, reason: 'no-binding' })
-    expect(broker.assigns).toHaveLength(before)
+    expect(second.broker.assigns).toHaveLength(0)
 
-    // The session re-binds once, under the new epoch, and gets a fresh broker revision.
-    const rebound = await env2bind(second, 'session-7')
-    expect((rebound as BindingGrant).revision).not.toBe(revision)
-    expect(broker.binds.at(-1)?.coreEpoch).toBe(second.host.issuer.coreEpoch)
-    // The old process's binding no longer assigns anything, even if it were still asked.
-    expect(await broker.assign({ sessionId: 'session-7', bindingId: (seated.outcome as BindingGrant).bindingId, revision, coreEpoch: first.host.issuer.coreEpoch }))
-      .toEqual({ ok: false, reason: 'stale-core-epoch' })
+    // The session binds again, from scratch.
+    expect(await env2bind(second, 'session-7')).toMatchObject({ ok: true })
+    for (const request of [...first.broker.binds, ...second.broker.binds]) expect('coreEpoch' in request).toBe(false)
   })
 
   it('keeps the table in memory only', () => {
@@ -709,7 +859,7 @@ describe('Core restart', () => {
 })
 
 async function env2bind(env: Env, id: string) {
-  return await env.host.issuer.issue({ sessionId: id, kind: 'attach' })
+  return await env.host.issuer.issue({ sessionId: id, kind: 'attach', orcaInstanceId: 'instance-1' })
 }
 
 /** Every object reachable from `root` through own properties, bounded and cycle-safe. */
@@ -776,7 +926,7 @@ describe('not reachable from events, tools, plugins or model-defined code', () =
     expect(env.broker.binds).toHaveLength(0)
     expect(env.broker.log).toEqual([])
     for (const secret of secrets(env)) expect(reachable(received, 20_000).has(secret)).toBe(false)
-    expect(await env.host.issuer.issue({ sessionId: 'forged', kind: 'attach' })).toEqual({ ok: false, reason: 'unknown-session' })
+    expect(await env.host.issuer.issue({ sessionId: 'forged', kind: 'attach', orcaInstanceId: 'instance-1' })).toEqual({ ok: false, reason: 'unknown-session' })
   })
 
   it('lets a forged session/disposed event only revoke, never issue', async () => {
@@ -802,17 +952,17 @@ describe('not reachable from events, tools, plugins or model-defined code', () =
       if (!/\.(?:[cm]?[jt]sx?)$/u.test(file) || file === join(srcDir, 'broker-binding.ts')) return
       if (/broker-binding/u.test(readFileSync(file, 'utf8'))) importers.push(relative(repoRoot, file))
     })
-    expect(importers.sort()).toEqual([
-      'apps/cli/src/broker-capabilities.ts', 'apps/cli/src/broker-control.ts', 'apps/cli/src/profile-boot.ts',
-      'apps/cli/tests/broker-binding.spec.ts', 'apps/cli/tests/broker-capabilities.spec.ts', 'apps/cli/tests/broker-control.spec.ts',
-      'apps/cli/tests/broker-required.spec.ts', 'apps/cli/tests/fake-broker.ts',
+    // Nothing outside the launcher's own modules (and the specs next to them) names it.
+    expect(importers.filter(file => !file.startsWith('apps/cli/tests/')).sort()).toEqual([
+      'apps/cli/src/broker-capabilities.ts', 'apps/cli/src/broker-client.ts', 'apps/cli/src/broker-control.ts',
+      'apps/cli/src/broker-launch.ts', 'apps/cli/src/broker-wire.ts', 'apps/cli/src/profile-boot.ts',
     ])
 
     // The `./lib/*` pattern would otherwise name the emitted file; the named subpaths are mapped to null, which
     // Node resolves as "not exported" (checked by hand with `import('@deepseek-ai/dsh/lib/types/broker-binding.js')`).
     const manifest = JSON.parse(readFileSync(join(srcDir, '..', 'package.json'), 'utf8')) as { exports: Record<string, unknown> }
     expect(Object.keys(manifest.exports).filter(key => /binding/u.test(key) && manifest.exports[key] !== null)).toEqual([])
-    for (const file of ['broker-binding', 'broker-capabilities', 'broker-control']) {
+    for (const file of ['broker-binding', 'broker-capabilities', 'broker-control', 'broker-client', 'broker-launch', 'broker-wire']) {
       expect(manifest.exports[`./lib/types/${file}.js`]).toBeNull()
       expect(manifest.exports[`./lib/types/${file}.d.ts`]).toBeNull()
     }

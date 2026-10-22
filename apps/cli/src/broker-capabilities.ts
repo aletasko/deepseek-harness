@@ -9,10 +9,13 @@
  *    ROOM module as the Loader imports it, by exact package specifier, so no row, config value or event can ask
  *    for the port. A row under another name, a relative path or an agent-preset subtree gets none.
  *
- * A third slot, the assignment resolver the local subprocess runtime reads, is claimed the same way (a locked
- * symbol property on the root, `installAssignmentResolver`); it used to be a Context name any plugin could provide.
+ * A third slot, the broker launcher the local subprocess runtime reads, is claimed the same way (a locked symbol
+ * property on the root, `installBrokerLauncher`); the assignment resolver it replaces used to be a Context name any
+ * plugin could provide. The launcher leases and starts over the one control connection, and takes the session from
+ * the attested execution it is handed, never from a string the caller names.
  *
- * All are deny-only in effect: the shipped broker client refuses every bind, and the resolver answers nobody.
+ * Whether any of this grants anything is the broker's decision: the client in use is the deny client unless an
+ * explicit broker socket is configured, and the broker grants only in staging.
  * In-process isolation between trusted Host plugins is still not a goal (see `broker-binding.ts`): the closed
  * `builtins.include` override and the pinned ROOM module are speed bumps, and the broker verifying instance, path
  * and `(dev, ino)` itself is the boundary. The boot-deny gate is what keeps model-defined code out.
@@ -24,6 +27,7 @@ import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-session'
 import type { BindingHost, BindingRefusal, IssueOutcome, RevokeOutcome } from './broker-binding.ts'
+import type { LaunchRequest, LaunchResult } from './broker-launch.ts'
 
 /** Same registry symbol the agent loop reads (`SESSION_LIFECYCLE_HOOK` in `@deepseek-ai/dsh-agent-loop`). */
 export const LIFECYCLE_HOOK_KEY: unique symbol = Symbol.for('dsh.agent-loop.session-lifecycle-hook')
@@ -52,22 +56,20 @@ export function installLifecycleHook(ctx: Context, host: BindingHost): void {
   Object.defineProperty(root, LIFECYCLE_HOOK_KEY, { value: hook, writable: false, configurable: false, enumerable: false })
 }
 
-/** Same registry symbol `@deepseek-ai/dsh-subprocess-local` reads (`BROKER_ASSIGNMENT_RESOLVER_KEY`). */
-export const ASSIGNMENT_RESOLVER_KEY: unique symbol = Symbol.for('dsh.subprocess-local.broker-assignment-resolver')
+/** Same registry symbol `@deepseek-ai/dsh-subprocess-local` reads (`BROKER_LAUNCHER_KEY`). */
+export const BROKER_LAUNCHER_KEY: unique symbol = Symbol.for('dsh.subprocess-local.broker-launcher')
 
 /**
- * Claim the slot from which the local subprocess runtime reads the assignment resolver, on the root context, once,
- * before the tree mounts. The resolver there is the launcher's alone: no Context name for a plugin to provide, and
- * a property no later code can replace. It is installed even though nothing can be granted yet, because a slot
- * left empty is a slot the first plugin to define the symbol would own; the runtime also refuses a slot that is
- * not locked. The shipped resolver answers nobody, so a launch in broker mode is denied until a later slice
- * replaces it here. A second call throws.
+ * Define the broker launcher the local subprocess runtime reads on the root context, once, before the tree mounts.
+ * The launcher there is this process's alone: no Context name for a plugin to provide, and a property no later code
+ * can replace. It is installed at boot, before anything can be granted, because a slot left empty is a slot the first
+ * plugin to define the symbol would own; the runtime also refuses a slot that is not locked. A second call throws.
  */
-export function installAssignmentResolver(ctx: Context): void {
+export function installBrokerLauncher(ctx: Context, host: BindingHost): void {
   const root = ctx.root as unknown as object
-  if (Object.hasOwn(root, ASSIGNMENT_RESOLVER_KEY)) throw new Error('dsh: broker assignment resolver is already installed')
-  const resolver = Object.freeze({ resolve: (_sessionId: string): string | undefined => undefined })
-  Object.defineProperty(root, ASSIGNMENT_RESOLVER_KEY, { value: resolver, writable: false, configurable: false, enumerable: false })
+  if (Object.hasOwn(root, BROKER_LAUNCHER_KEY)) throw new Error('dsh: broker launcher is already installed')
+  const launcher = Object.freeze({ launch: (request: LaunchRequest): Promise<LaunchResult> => host.launcher.launch(request) })
+  Object.defineProperty(root, BROKER_LAUNCHER_KEY, { value: launcher, writable: false, configurable: false, enumerable: false })
 }
 
 function refused(reason: string): BindingRefusal {

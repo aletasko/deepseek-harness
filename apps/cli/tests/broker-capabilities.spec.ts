@@ -19,7 +19,8 @@ import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { assignmentUnavailableClient, createBindingHost, type BindingHost } from '../src/broker-binding.ts'
 import {
-  createRoomSeatPort, installCapabilityPorts, installLifecycleHook, LIFECYCLE_HOOK_KEY, ROOM_PLUGIN_SPECIFIER,
+  BROKER_LAUNCHER_KEY, createRoomSeatPort, installBrokerLauncher, installCapabilityPorts, installLifecycleHook, LIFECYCLE_HOOK_KEY,
+  ROOM_PLUGIN_SPECIFIER,
 } from '../src/broker-capabilities.ts'
 import type { BrokerConfig } from '../src/broker-required.ts'
 import { MockAdapter, textResponse } from '../../../packages/core/agent-loop/tests/mock-adapter.ts'
@@ -89,6 +90,32 @@ const seatRequest = (sessionId: string) => ({
   sessionId, instanceId: 'orca-instance-1', room: { stanzaId: '77', agente: 'agente-1', installazione: 'inst-1' },
 })
 
+describe('the broker launcher slot on the root context (W-2)', () => {
+  it('is defined once, unnamed, read-only and not replaceable, under the key subprocess-local reads', async () => {
+    const env = await environment()
+    installBrokerLauncher(env.ctx, env.host)
+    const root = env.ctx.root as unknown as Record<symbol, unknown>
+    const descriptor = Object.getOwnPropertyDescriptor(root, BROKER_LAUNCHER_KEY)!
+    expect(descriptor).toMatchObject({ writable: false, configurable: false, enumerable: false })
+    expect(BROKER_LAUNCHER_KEY).toBe(Symbol.for('dsh.subprocess-local.broker-launcher'))
+    expect(() => { installBrokerLauncher(env.ctx, env.host) }).toThrow(/already installed/)
+    expect(() => { root[BROKER_LAUNCHER_KEY] = { launch: async () => ({ ok: true }) } }).toThrow(TypeError)
+    expect(Reflect.defineProperty(root, BROKER_LAUNCHER_KEY, { value: {} })).toBe(false)
+    expect(Object.keys(descriptor.value as object)).toEqual(['launch'])
+    expect(Object.isFrozen(descriptor.value)).toBe(true)
+    expect(Object.keys(env.ctx.reflect.props).filter(name => /launcher|resolver|assign/iu.test(name))).toEqual([])
+  })
+
+  it('forwards launch to the host launcher: lease and start for the attested session, refusing anything else', async () => {
+    const env = await environment()
+    installBrokerLauncher(env.ctx, env.host)
+    const { launch } = (env.ctx.root as unknown as Record<symbol, { launch(request: object): Promise<{ ok: boolean; reason?: string }> }>)[BROKER_LAUNCHER_KEY]!
+    expect(await launch({ execution: undefined, argv: ['/bin/true'], cwd: '/srv', env: {}, graceMs: 1 })).toEqual({ ok: false, reason: 'no-active-execution' })
+    expect(env.broker.assigns).toHaveLength(0)
+    expect(env.broker.starts).toHaveLength(0)
+  })
+})
+
 describe('the lifecycle hook on the root context', () => {
   it('is defined once, unnamed, read-only and not replaceable', async () => {
     const env = await environment()
@@ -137,7 +164,7 @@ describe('the lifecycle hook on the root context', () => {
     it('revokes through the real teardown and waits for the broker ack before the agent leaves the registries (the order against a running tool is pinned in the agent-loop spec)', async () => {
       const env = await withLoop()
       const agent = await roomSession(env, 'root', tempDir())
-      expect(await env.host.issuer.issue({ sessionId: 'root', kind: 'attach' })).toMatchObject({ ok: true })
+      expect(await env.host.issuer.issue({ sessionId: 'root', kind: 'attach', orcaInstanceId: 'instance-1' })).toMatchObject({ ok: true })
       const order: string[] = []
       const ack = Promise.withResolvers<{ ok: true }>()
       env.broker.revokeAnswer = () => {
@@ -158,7 +185,7 @@ describe('the lifecycle hook on the root context', () => {
     it('binds a child created by its parent’s own tool call, under the parent binding, and revokes it with the parent', async () => {
       const env = await withLoop()
       const parent = await roomSession(env, 'parent', tempDir())
-      const granted = await env.host.issuer.issue({ sessionId: 'parent', kind: 'attach' })
+      const granted = await env.host.issuer.issue({ sessionId: 'parent', kind: 'attach', orcaInstanceId: 'instance-1' })
       expect(granted).toMatchObject({ ok: true })
       await inToolOf(env, parent, 'spawn', async () => {
         await parent.ctx.agents.create({
@@ -179,8 +206,8 @@ describe('the lifecycle hook on the root context', () => {
       const env = await withLoop()
       const victim = await roomSession(env, 'victim', tempDir())
       const other = await roomSession(env, 'other', tempDir())
-      await env.host.issuer.issue({ sessionId: 'victim', kind: 'attach' })
-      await env.host.issuer.issue({ sessionId: 'other', kind: 'attach' })
+      await env.host.issuer.issue({ sessionId: 'victim', kind: 'attach', orcaInstanceId: 'instance-1' })
+      await env.host.issuer.issue({ sessionId: 'other', kind: 'attach', orcaInstanceId: 'instance-1' })
       env.broker.binds.length = 0
 
       // 1. A plugin outside any tool call names the victim as parent, in both the registry and the header.
@@ -210,7 +237,7 @@ describe('the lifecycle hook on the root context', () => {
       const env = await environment({ client: assignmentUnavailableClient })
       installLifecycleHook(env.ctx, env.host)
       const root = await roomSession(env, 'root', tempDir())
-      expect(await env.host.issuer.issue({ sessionId: 'root', kind: 'attach' })).toEqual({ ok: false, reason: 'assignment-unavailable' })
+      expect(await env.host.issuer.issue({ sessionId: 'root', kind: 'attach', orcaInstanceId: 'instance-1' })).toEqual({ ok: false, reason: 'assignment-unavailable' })
       await inToolOf(env, root, 'spawn', async () => {
         await root.ctx.agents.create({ sessionId: SessionId('child'), agentOptions: model, parentAgent: root, meta: { parentSession: SessionId('root') } })
       })
@@ -237,7 +264,7 @@ describe('the ROOM seat port', () => {
     } as never)
     expect(outcome).toMatchObject({ ok: true })
     const [request] = env.broker.binds
-    expect(Object.keys(request!).sort()).toEqual(['coreEpoch', 'cwd', 'kind', 'orca', 'room', 'sessionId', 'workspaceId'])
+    expect(Object.keys(request!).sort()).toEqual(['cwd', 'kind', 'orca', 'room', 'sessionId', 'workspaceId'])
     // The forged `cwd: '/etc'` is dropped; the request carries Core's own realpath of the session header cwd (C-2).
     expect(request!.cwd).toBe(cwd)
     expect(request).toMatchObject({
@@ -298,7 +325,7 @@ describe('the ROOM seat port', () => {
     await roomSession(env, 'seated', tempDir())
     await roomSession(env, 'foreign', tempDir())
     await port.seat(seatRequest('seated'))
-    await env.host.issuer.issue({ sessionId: 'foreign', kind: 'attach' })
+    await env.host.issuer.issue({ sessionId: 'foreign', kind: 'attach', orcaInstanceId: 'instance-1' })
     expect(await port.revoke('foreign')).toEqual({ ok: true })
     expect(env.broker.revokes).toEqual([])
     expect(await port.revoke('seated')).toEqual({ ok: true })

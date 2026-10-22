@@ -5,14 +5,35 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import LocalSubprocessRuntime, { BROKER_ASSIGNMENT_RESOLVER_KEY, type SubprocessBrokerAssignmentResolver } from '@deepseek-ai/dsh-subprocess-local'
+import LocalSubprocessRuntime, {
+  BROKER_LAUNCHER_KEY, type BrokerLaunchRequest, type BrokerLaunchResult, type BrokerWorkerExit, type SubprocessBrokerLauncher,
+} from '@deepseek-ai/dsh-subprocess-local'
 import type { SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 
-/** Define the resolver the way the launcher does: on the root, own, data, non-writable and non-configurable. */
-function installResolver(ctx: Context, resolver: SubprocessBrokerAssignmentResolver): void {
-  Object.defineProperty(ctx.root, BROKER_ASSIGNMENT_RESOLVER_KEY, {
-    value: resolver, writable: false, configurable: false, enumerable: false,
+/** Define the launcher the way the CLI does: on the root, own, data, non-writable and non-configurable. */
+function installLauncher(ctx: Context, launcher: SubprocessBrokerLauncher): void {
+  Object.defineProperty(ctx.root, BROKER_LAUNCHER_KEY, {
+    value: launcher, writable: false, configurable: false, enumerable: false,
   })
+}
+
+/** A launcher that records what it was asked and answers from a script. */
+function scriptedLauncher(answer?: (request: BrokerLaunchRequest) => Promise<BrokerLaunchResult> | BrokerLaunchResult): {
+  launcher: SubprocessBrokerLauncher
+  requests: BrokerLaunchRequest[]
+} {
+  const requests: BrokerLaunchRequest[] = []
+  const launcher: SubprocessBrokerLauncher = Object.freeze({
+    launch: async (request: BrokerLaunchRequest): Promise<BrokerLaunchResult> => {
+      requests.push(request)
+      return answer === undefined ? exitingWith({ ok: true, code: 0, signal: null }) : await answer(request)
+    },
+  })
+  return { launcher, requests }
+}
+
+function exitingWith(exit: BrokerWorkerExit): BrokerLaunchResult {
+  return { ok: true, pid: 4242, workerId: 'w1', exited: Promise.resolve(exit) }
 }
 
 interface WireMessage { type: string; [key: string]: unknown }
@@ -84,7 +105,12 @@ function processSpec(overrides: Partial<SubprocessSpawnSpec> = {}): SubprocessSp
   }
 }
 
-async function withRuntime<T>(socketPath: string, run: (ctx: Context, fiber: Awaited<ReturnType<Context['plugin']>>) => Promise<T>, sessionId: string | null = 'session-7'): Promise<T> {
+async function withRuntime<T>(
+  socketPath: string,
+  run: (ctx: Context, fiber: Awaited<ReturnType<Context['plugin']>>) => Promise<T>,
+  sessionId: string | null = 'session-7',
+  launcher: SubprocessBrokerLauncher = scriptedLauncher().launcher,
+): Promise<T> {
   const ctx = new Context()
   ctx.provide('subprocessBrokerConfig', { socketPath })
   const execution = sessionId === null ? undefined : { active: true }
@@ -92,9 +118,7 @@ async function withRuntime<T>(socketPath: string, run: (ctx: Context, fiber: Awa
     currentActiveExecution: () => execution,
     attestActiveExecution: () => ({ direct: true, sessionId }),
   })
-  installResolver(ctx, {
-    resolve: (id: string) => id === 'session-7' ? 'trusted-assignment-7' : id === 'session-8' ? 'trusted-assignment-8' : undefined,
-  })
+  installLauncher(ctx, launcher)
   const fiber = await ctx.plugin(LocalSubprocessRuntime)
   try { return await run(ctx, fiber) } finally { await fiber.dispose() }
 }
@@ -207,16 +231,6 @@ describe('local subprocess broker with the plugin manager', () => {
   })
 })
 
-/** Broker that accepts one start and finishes the process or terminal immediately. */
-function acceptingBroker(label: string): ReturnType<typeof fakeBroker> {
-  return fakeBroker((message, peer) => {
-    if (message.type !== 'start') return
-    peer.send({ type: 'accepted', handle: label, pid: 4242 })
-    peer.send({ type: 'outcome', handle: label, exitCode: 0, signal: null })
-    peer.send({ type: 'empty', handle: label })
-  })
-}
-
 /** A started runtime that was constructed before any broker config existed. */
 async function constructedWithoutBroker(): Promise<{
   ctx: Context
@@ -229,7 +243,7 @@ async function constructedWithoutBroker(): Promise<{
     currentActiveExecution: () => ({ active: true }),
     attestActiveExecution: () => ({ direct: true, sessionId: 'session-7' }),
   })
-  installResolver(ctx, { resolve: (id: string) => id === 'session-7' ? 'trusted-assignment-7' : undefined })
+  installLauncher(ctx, scriptedLauncher().launcher)
   const fiber = await ctx.plugin(LocalSubprocessRuntime)
   const runtime = ctx.subprocess as LocalSubprocessRuntime
   const localSpawn = vi.fn()
@@ -241,21 +255,14 @@ async function constructedWithoutBroker(): Promise<{
 const TERMINAL_SPEC = { argv: ['/bin/sh'], cwd: '/assigned/tree', rows: 24, cols: 80, terminalType: 'xterm', graceMs: 100 }
 
 describe('local subprocess broker configured after construction', () => {
-  it('routes spawn and spawnTerminal through a config provided after the constructor', async () => {
-    const broker = await acceptingBroker('late-config')
+  it('routes spawn through a config provided after the constructor, and refuses spawnTerminal in broker mode', async () => {
     const { ctx, runtime, localSpawn, stop } = await constructedWithoutBroker()
     try {
-      ctx.reflect.provide('subprocessBrokerConfig', { socketPath: broker.socketPath })
+      ctx.reflect.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/broker.sock' })
       await expect(runtime.spawn(processSpec()).done).resolves.toEqual({ exitCode: 0, signal: null })
-      await expect(broker.peer.waitFor('start')).resolves.toMatchObject({ mode: 'process', assignmentId: 'trusted-assignment-7' })
-      const terminal = await runtime.spawnTerminal(TERMINAL_SPEC)
-      expect(terminal.pid).toBe(4242)
-      expect(broker.peer.messages.filter(message => message.type === 'start').map(message => message.mode)).toContain('process')
+      await expect(runtime.spawnTerminal(TERMINAL_SPEC)).rejects.toThrow(/terminal sessions are not available in broker mode/)
       expect(localSpawn).not.toHaveBeenCalled()
-    } finally {
-      await stop()
-      await broker.close()
-    }
+    } finally { await stop() }
   })
 
   it('denies spawn and spawnTerminal while a late config provider is registered but not yet active', async () => {
@@ -283,25 +290,17 @@ describe('local subprocess broker configured after construction', () => {
   })
 
   it('keeps denying after the provider is disposed and follows a replacement provider', async () => {
-    const first = await acceptingBroker('first')
-    const second = await acceptingBroker('second')
     const { ctx, runtime, localSpawn, stop } = await constructedWithoutBroker()
     try {
-      const disposeFirst = ctx.reflect.provide('subprocessBrokerConfig', { socketPath: first.socketPath })
+      const disposeFirst = ctx.reflect.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/first.sock' })
       await expect(runtime.spawn(processSpec()).done).resolves.toEqual({ exitCode: 0, signal: null })
       await disposeFirst()
       expect(() => runtime.spawn(processSpec())).toThrow(/broker configuration is not active/)
       await expect(runtime.spawnTerminal(TERMINAL_SPEC)).rejects.toThrow(/broker configuration is not active/)
-      ctx.reflect.provide('subprocessBrokerConfig', { socketPath: second.socketPath })
+      ctx.reflect.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/second.sock' })
       await expect(runtime.spawn(processSpec()).done).resolves.toEqual({ exitCode: 0, signal: null })
-      expect(first.peer.messages.filter(message => message.type === 'start')).toHaveLength(1)
-      expect(second.peer.messages.filter(message => message.type === 'start')).toHaveLength(1)
       expect(localSpawn).not.toHaveBeenCalled()
-    } finally {
-      await stop()
-      await first.close()
-      await second.close()
-    }
+    } finally { await stop() }
   })
 
   it.each([
@@ -398,373 +397,213 @@ describe('local subprocess broker configured after construction', () => {
   })
 })
 
-describe('local subprocess broker route', () => {
-  it('registers Core before start and refuses a forged registration receipt', async () => {
-    const broker = await fakeBroker(() => {}, 'invalid')
-    try {
-      await withRuntime(broker.socketPath, async ctx => {
-        const runtime = ctx.subprocess as LocalSubprocessRuntime
-        const directSpawn = vi.fn()
-        runtime.internals.spawn = directSpawn as never
-        const handle = runtime.spawn(processSpec())
-        await expect(handle.done).rejects.toThrow(/invalid Core registration event/)
-        expect(await broker.peer.waitFor('register-core')).toMatchObject({ type: 'register-core', version: 1 })
-        expect(broker.peer.messages.some(message => message.type === 'start')).toBe(false)
-        expect(directSpawn).not.toHaveBeenCalled()
-      })
-    } finally { await broker.close() }
+describe('local subprocess broker route (S6 bridge: lease and start through the launcher, no connection of its own)', () => {
+  async function inRuntime<T>(
+    launcher: SubprocessBrokerLauncher,
+    run: (ctx: Context, runtime: LocalSubprocessRuntime, localSpawn: ReturnType<typeof vi.fn>) => Promise<T> | T,
+    sessionId: string | null = 'session-7',
+  ): Promise<T> {
+    return await withRuntime('/run/dsh-broker/broker.sock', async (ctx) => {
+      const runtime = ctx.subprocess as LocalSubprocessRuntime
+      const localSpawn = vi.fn()
+      runtime.internals.spawn = localSpawn as never
+      return await run(ctx, runtime, localSpawn)
+    }, sessionId, launcher)
+  }
+
+  it('hands the launcher the attested execution and the literal request, and settles from the broker exit', async () => {
+    const { launcher, requests } = scriptedLauncher(() => exitingWith({ ok: true, code: 7, signal: null }))
+    await inRuntime(launcher, async (_ctx, runtime, localSpawn) => {
+      const handle = runtime.spawn(processSpec({ env: { A: 'b' }, graceMs: 250 }))
+      await expect(handle.done).resolves.toEqual({ exitCode: 7, signal: null })
+      expect(requests).toEqual([{ execution: { active: true }, argv: ['/bin/echo', 'hello'], cwd: '/assigned/tree', env: expect.objectContaining({ A: 'b' }) as object, graceMs: 250 }])
+      expect(localSpawn).not.toHaveBeenCalled()
+    })
   })
 
-  it('uses a resolver registered after startup and denies again after disposal', async () => {
-    const broker = await fakeBroker((message, peer) => {
-      if (message.type === 'start') {
-        peer.send({ type: 'accepted', handle: 'late-1' })
-        peer.send({ type: 'outcome', handle: 'late-1', exitCode: 0, signal: null })
-        peer.send({ type: 'empty', handle: 'late-1' })
-      }
+  it('reports a signal death by name', async () => {
+    const { launcher } = scriptedLauncher(() => exitingWith({ ok: true, code: null, signal: 'SIGKILL' }))
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      await expect(runtime.spawn(processSpec()).done).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' })
     })
+  })
+
+  it('does not name the session to the launcher: the request carries the execution and nothing that says who it is', async () => {
+    const { launcher, requests } = scriptedLauncher()
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      await runtime.spawn(processSpec()).done
+      expect(JSON.stringify(Object.keys(requests[0]!).sort())).toBe(JSON.stringify(['argv', 'cwd', 'env', 'execution', 'graceMs']))
+      expect(JSON.stringify(requests[0])).not.toContain('session-7')
+    })
+  })
+
+  it('returns a pending handle at once: lease and start finish behind it, then the exit', async () => {
+    const started = Promise.withResolvers<BrokerLaunchResult>()
+    const { launcher } = scriptedLauncher(() => started.promise)
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      const handle = runtime.spawn(processSpec())
+      let settled = false
+      void handle.done.then(() => { settled = true }, () => { settled = true })
+      await new Promise(resolve => setTimeout(resolve, 30))
+      expect(settled).toBe(false)
+      const exit = Promise.withResolvers<BrokerWorkerExit>()
+      started.resolve({ ok: true, pid: 9, workerId: 'w', exited: exit.promise })
+      await new Promise(resolve => setTimeout(resolve, 30))
+      expect(settled).toBe(false)
+      exit.resolve({ ok: true, code: 0, signal: null })
+      await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
+    })
+  })
+
+  it('rejects the handle when the broker refuses, with the reason, and never runs locally', async () => {
+    const { launcher } = scriptedLauncher(() => ({ ok: false, reason: 'no-binding' }))
+    await inRuntime(launcher, async (_ctx, runtime, localSpawn) => {
+      await expect(runtime.spawn(processSpec()).done).rejects.toThrow(/broker refused the launch \(no-binding\)/)
+      expect(localSpawn).not.toHaveBeenCalled()
+    })
+  })
+
+  it('rejects the handle when the connection is lost before the broker reported the end of the process', async () => {
+    const { launcher } = scriptedLauncher(() => exitingWith({ ok: false, reason: 'control-closed' }))
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      await expect(runtime.spawn(processSpec()).done).rejects.toThrow(/connection ended before the process was reported done \(control-closed\)/)
+    })
+  })
+
+  it('treats a launcher that throws as a refusal of the handle', async () => {
+    const { launcher } = scriptedLauncher(() => { throw new Error('boom') })
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      await expect(runtime.spawn(processSpec()).done).rejects.toThrow(/boom/)
+    })
+  })
+
+  it('loses stdout, stderr and stdin in v1: collected output is empty, the streams end, input is discarded, the status is real', async () => {
+    const { launcher } = scriptedLauncher(() => exitingWith({ ok: true, code: 3, signal: null }))
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      const piped = runtime.spawn(processSpec())
+      piped.stdin?.write('discarded')
+      const chunks: Buffer[] = []
+      piped.stdout?.on('data', (chunk: Buffer) => { chunks.push(chunk) })
+      piped.stderr?.resume()
+      await expect(piped.done).resolves.toEqual({ exitCode: 3, signal: null })
+      await piped.waitForExit()
+      // The streams end with the worker, so a reader that waits for the end is not left hanging.
+      await vi.waitFor(() => { expect(piped.stdout?.readableEnded).toBe(true) })
+      await vi.waitFor(() => { expect(piped.stderr?.readableEnded).toBe(true) })
+      expect(Buffer.concat(chunks).toString()).toBe('')
+      const collected = runtime.spawn(processSpec({ stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 }, stderr: { maxBytes: 1024 } } }))
+      await collected.done
+      await collected.waitForExit()
+      expect(collected.stdout?.readableEnded ?? true).toBe(true)
+    })
+  })
+
+  it('says once that output is not captured', async () => {
+    const { launcher } = scriptedLauncher()
+    await inRuntime(launcher, async (ctx, runtime) => {
+      const warn = vi.spyOn(ctx.logger, 'warn')
+      await runtime.spawn(processSpec()).done
+      await runtime.spawn(processSpec()).done
+      expect(warn.mock.calls.filter(([message]) => /not captured/.test(String(message)))).toHaveLength(1)
+    })
+  })
+
+  it('cannot signal one worker (the broker has no such frame): terminate waits for the broker exit rather than pretending', async () => {
+    const exit = Promise.withResolvers<BrokerWorkerExit>()
+    const { launcher } = scriptedLauncher(() => ({ ok: true, pid: 9, workerId: 'w', exited: exit.promise }))
+    await inRuntime(launcher, async (_ctx, runtime) => {
+      const handle = runtime.spawn(processSpec({ graceMs: 20 }))
+      await new Promise(resolve => setTimeout(resolve, 10))
+      handle.terminate()
+      let settled = false
+      void handle.done.then(() => { settled = true }, () => { settled = true })
+      await new Promise(resolve => setTimeout(resolve, 80))
+      expect(settled).toBe(false)
+      exit.resolve({ ok: true, code: null, signal: 'SIGKILL' })
+      await expect(handle.done).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' })
+    })
+  })
+
+  it('refuses a control channel, a terminal and a DSH_SESSION_ID override before the launcher is asked', async () => {
+    const { launcher, requests } = scriptedLauncher()
+    await inRuntime(launcher, async (_ctx, runtime, localSpawn) => {
+      expect(() => runtime.spawn(processSpec({ stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', control: 'pipe' } })))
+        .toThrow(/no control channel/)
+      expect(() => runtime.spawn(processSpec({ env: { DSH_SESSION_ID: 'session-8' } }))).toThrow(/DSH_SESSION_ID cannot be set for broker launches/)
+      await expect(runtime.spawnTerminal(TERMINAL_SPEC)).rejects.toThrow(/terminal sessions are not available in broker mode/)
+      expect(requests).toHaveLength(0)
+      expect(localSpawn).not.toHaveBeenCalled()
+    })
+  })
+
+  it('denies a missing active identity, and an attestation with no session, without asking the launcher', async () => {
+    const { launcher, requests } = scriptedLauncher()
+    await inRuntime(launcher, (ctx) => {
+      expect(() => ctx.subprocess.spawn(processSpec())).toThrow(/requires an active ToolRuntime execution/)
+    }, null)
     const ctx = new Context()
-    ctx.provide('subprocessBrokerConfig', { socketPath: broker.socketPath })
-    ctx.provide('tools', {
-      currentActiveExecution: () => ({ active: true }),
-      attestActiveExecution: () => ({ direct: true, sessionId: 'session-7' }),
-    })
+    ctx.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/broker.sock' })
+    ctx.provide('tools', { currentActiveExecution: () => ({ active: true }), attestActiveExecution: () => ({ direct: true, sessionId: '' }) })
+    installLauncher(ctx, launcher)
     const fiber = await ctx.plugin(LocalSubprocessRuntime)
     try {
-      const runtime = ctx.subprocess as LocalSubprocessRuntime
-      const directSpawn = vi.fn()
-      runtime.internals.spawn = directSpawn as never
-      expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/)
-      // The launcher may lock its resolver in after this plugin started; it is read for each launch.
-      let granting = true
-      installResolver(ctx, { resolve: (id: string) => granting && id === 'session-7' ? 'late-assignment' : undefined })
-      const handle = runtime.spawn(processSpec())
-      await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
-      expect(await broker.peer.waitFor('start')).toMatchObject({ assignmentId: 'late-assignment' })
-      granting = false
-      expect(() => runtime.spawn(processSpec())).toThrow(/no broker assignment/)
-      expect(directSpawn).not.toHaveBeenCalled()
-    } finally {
-      await fiber.dispose()
-      await broker.close()
-    }
+      expect(() => ctx.subprocess.spawn(processSpec())).toThrow(/Core-attested agent session/)
+    } finally { await fiber.dispose() }
+    expect(requests).toHaveLength(0)
   })
 
-  it('streams process stdio and holds ownership through broker quiescence', async () => {
-    const broker = await fakeBroker((message, peer) => {
-      if (message.type === 'start') peer.send({ type: 'accepted', handle: 'process-1' })
-      if (message.type === 'stdin-eof') {
-        peer.send({ type: 'stdout', handle: 'process-1', data: Buffer.from('broker-out').toString('base64') })
-        peer.send({ type: 'stderr', handle: 'process-1', data: Buffer.from('broker-err').toString('base64') })
-        peer.send({ type: 'outcome', handle: 'process-1', exitCode: 7, signal: null })
-        // A descendant in the managed range can still emit output after the
-        // direct process has exited. Stream EOF must follow `empty`.
-        setTimeout(() => peer.send({ type: 'stdout', handle: 'process-1', data: Buffer.from('descendant-out').toString('base64') }), 5)
-      }
-    })
+  it('opens no connection of its own: the broker socket is never touched by this package', async () => {
+    const broker = await fakeBroker(() => {})
     try {
-      await withRuntime(broker.socketPath, async ctx => {
-        const runtime = ctx.subprocess as LocalSubprocessRuntime
-        const localSpawn = vi.fn()
-        runtime.internals.spawn = localSpawn as never
-        const handle = ctx.subprocess.spawn(processSpec())
-        const stdout: Buffer[] = []; const stderr: Buffer[] = []
-        handle.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk))
-        handle.stderr?.on('data', (chunk: Buffer) => stderr.push(chunk))
-        handle.stdin?.write('input-from-core')
-        handle.stdin?.end()
-        await expect(handle.done).resolves.toEqual({ exitCode: 7, signal: null })
-        await expect(handle.waitForExit(AbortSignal.timeout(25))).resolves.toBe(false)
-        await new Promise(resolve => setTimeout(resolve, 10))
-        broker.peer.send({ type: 'empty', handle: 'process-1' })
-        await expect(handle.waitForExit()).resolves.toBe(true)
-        const start = await broker.peer.waitFor('start')
-        expect(broker.peer.messages[0]).toMatchObject({ type: 'register-core', version: 1 })
-        expect(broker.peer.messages[0]).not.toHaveProperty('assignmentId')
-        expect(start).toMatchObject({
-          version: 1, mode: 'process', assignmentId: 'trusted-assignment-7',
-          argv: ['/bin/echo', 'hello'], cwd: '/assigned/tree',
-          stdio: { stdin: { mode: 'pipe' }, stdout: { mode: 'pipe' }, stderr: { mode: 'pipe' } },
-        })
-        expect(start).not.toHaveProperty('uid')
-        expect(start).not.toHaveProperty('allowedRoot')
-        expect(start.env).toMatchObject({ DSH_EXAMPLE: 'label' })
-        expect(broker.peer.messages.find(message => message.type === 'stdin')).toMatchObject({
-          type: 'stdin', handle: 'process-1', data: Buffer.from('input-from-core').toString('base64'),
-        })
-        expect(Buffer.concat(stdout).toString()).toBe('broker-outdescendant-out')
-        expect(Buffer.concat(stderr).toString()).toBe('broker-err')
-        expect(localSpawn).not.toHaveBeenCalled()
-      })
-    } finally { await broker.close() }
-  })
-
-  it('uses the broker for PTY allocation, I/O, inspection, foreground signal, and cancellation', async () => {
-    const broker = await fakeBroker((message, peer) => {
-      if (message.type === 'start') peer.send({ type: 'accepted', handle: 'pty-1', pid: 777 })
-      if (['stdin', 'resize', 'inspect-foreground', 'inspect-activity', 'signal-foreground'].includes(message.type)) {
-        const result = message.type === 'inspect-foreground'
-          ? { processGroupId: 778, inputWaiting: true }
-          : message.type === 'inspect-activity' ? { state: 'busy', revision: 3 }
-            : message.type === 'signal-foreground' ? { processGroupId: 778 } : {}
-        peer.send({ type: 'response', id: message.id, handle: message.handle, ok: true, ...result })
-      }
-      if (message.type === 'cancel') {
-        peer.send({ type: 'outcome', handle: 'pty-1', exitCode: null, signal: 'SIGTERM' })
-        peer.send({ type: 'empty', handle: 'pty-1' })
-      }
-    })
-    try {
-      await withRuntime(broker.socketPath, async ctx => {
-        const runtime = ctx.subprocess as LocalSubprocessRuntime
-        const localSpawn = vi.fn(); runtime.internals.spawn = localSpawn as never
-        const ptySpawn = vi.fn(); runtime.terminalInspector = { snapshot: ptySpawn } as never
-        const handle = await ctx.subprocess.spawnTerminal({
-          argv: ['/bin/sh', '-i'], cwd: '/assigned/tree', rows: 24, cols: 80,
-          terminalType: 'xterm', graceMs: 200,
-        })
-        expect(handle.pid).toBe(777)
-        await handle.write('echo broker\n')
-        await handle.resize(100, 40)
-        await expect(handle.inspectForeground()).resolves.toEqual({ processGroupId: 778, inputWaiting: true })
-        await expect(handle.inspectActivity()).resolves.toEqual({ state: 'busy', revision: 3 })
-        await expect(handle.signalForeground('SIGINT')).resolves.toBe(778)
-        await handle.terminate()
-        await expect(handle.done).resolves.toEqual({ exitCode: null, signal: 'SIGTERM' })
-        const start = await broker.peer.waitFor('start')
-        expect(start).toMatchObject({
-          mode: 'terminal', assignmentId: 'trusted-assignment-7', argv: ['/bin/sh', '-i'],
-          cwd: '/assigned/tree', rows: 24, cols: 80,
-          stdio: { stdin: { mode: 'pty' }, stdout: { mode: 'pty' }, stderr: { mode: 'pty' } },
-        })
-        expect(broker.peer.messages.map(message => message.type)).toEqual(expect.arrayContaining([
-          'stdin', 'resize', 'inspect-foreground', 'inspect-activity', 'signal-foreground', 'cancel',
-        ]))
-        expect(localSpawn).not.toHaveBeenCalled()
-        expect(ptySpawn).not.toHaveBeenCalled()
-      })
-    } finally { await broker.close() }
-  })
-
-  it('forwards process cancellation and waits for broker-confirmed empty range', async () => {
-    const broker = await fakeBroker((message, peer) => {
-      if (message.type === 'start') peer.send({ type: 'accepted', handle: 'process-cancel-1' })
-      if (message.type === 'cancel') {
-        peer.send({ type: 'outcome', handle: 'process-cancel-1', exitCode: null, signal: 'SIGTERM' })
-        peer.send({ type: 'empty', handle: 'process-cancel-1' })
-      }
-    })
-    try {
-      await withRuntime(broker.socketPath, async ctx => {
-        const handle = ctx.subprocess.spawn(processSpec())
-        handle.terminate()
-        await expect(handle.done).resolves.toEqual({ exitCode: null, signal: 'SIGTERM' })
-        await expect(handle.waitForExit()).resolves.toBe(true)
-        expect(broker.peer.messages.some(message => message.type === 'cancel' && message.signal === 'SIGTERM')).toBe(true)
-      })
-    } finally { await broker.close() }
-  })
-
-  it('cancels a terminal range after direct outcome until broker confirms empty', async () => {
-    const broker = await fakeBroker((message, peer) => {
-      if (message.type === 'start') {
-        peer.send({ type: 'accepted', handle: 'pty-descendant-1', pid: 778 })
-        peer.send({ type: 'outcome', handle: 'pty-descendant-1', exitCode: 0, signal: null })
-      }
-      if (message.type === 'cancel') peer.send({ type: 'empty', handle: 'pty-descendant-1' })
-    })
-    try {
-      await withRuntime(broker.socketPath, async ctx => {
-        const handle = await ctx.subprocess.spawnTerminal({
-          argv: ['/bin/sh'], cwd: '/assigned/tree', rows: 24, cols: 80,
-          terminalType: 'xterm', graceMs: 100,
-        })
-        await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
-        const quiescence = handle.terminate()
-        await expect(broker.peer.waitFor('cancel')).resolves.toMatchObject({ handle: 'pty-descendant-1' })
-        await quiescence
-      })
-    } finally { await broker.close() }
-  })
-
-  it('times out a PTY RPC and fails the connection closed', async () => {
-    const broker = await fakeBroker((message, peer) => {
-      if (message.type === 'start') peer.send({ type: 'accepted', handle: 'pty-stalled-1', pid: 779 })
-      // Deliberately leave the socket open and never answer the RPC.
-    })
-    try {
-      await withRuntime(broker.socketPath, async ctx => {
-        const handle = await ctx.subprocess.spawnTerminal({
-          argv: ['/bin/sh'], cwd: '/assigned/tree', rows: 24, cols: 80,
-          terminalType: 'xterm', graceMs: 100,
-        })
-        const operation = handle.inspectForeground()
-        await expect(operation).rejects.toThrow(/request timed out/)
-        await expect(handle.done).rejects.toThrow()
-      })
-    } finally {
-      await broker.close()
-    }
-  }, 15_000)
-
-  it('resolves distinct broker assignments from the active Core session for process and PTY', async () => {
-    const processBroker = await fakeBroker((message, peer) => {
-      if (message.type === 'start') {
-        peer.send({ type: 'accepted', handle: 'session-8-process' })
-        peer.send({ type: 'outcome', handle: 'session-8-process', exitCode: 0, signal: null })
-        peer.send({ type: 'empty', handle: 'session-8-process' })
-      }
-    })
-    const terminalBroker = await fakeBroker((message, peer) => {
-      if (message.type === 'start') {
-        peer.send({ type: 'accepted', handle: 'session-7-terminal', pid: 781 })
-        peer.send({ type: 'outcome', handle: 'session-7-terminal', exitCode: 0, signal: null })
-        peer.send({ type: 'empty', handle: 'session-7-terminal' })
-      }
-    })
-    try {
-      await withRuntime(processBroker.socketPath, async ctx => {
-        const handle = ctx.subprocess.spawn(processSpec({ cwd: '/work/session-8' }))
-        await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
-        await expect(handle.waitForExit()).resolves.toBe(true)
-        expect(await processBroker.peer.waitFor('start')).toMatchObject({ assignmentId: 'trusted-assignment-8', cwd: '/work/session-8' })
-      }, 'session-8')
-      await withRuntime(terminalBroker.socketPath, async ctx => {
-        const handle = await ctx.subprocess.spawnTerminal({
-          argv: ['/bin/sh'], cwd: '/work/session-7', rows: 24, cols: 80,
-          terminalType: 'xterm', graceMs: 100,
-        })
-        await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
-        await handle.terminate()
-        expect(await terminalBroker.peer.waitFor('start')).toMatchObject({ assignmentId: 'trusted-assignment-7', cwd: '/work/session-7' })
-      }, 'session-7')
-    } finally {
-      await processBroker.close()
-      await terminalBroker.close()
-    }
-  })
-
-  it('denies missing active identity and rejects a cwd outside the selected assignment without fallback', async () => {
-    const broker = await fakeBroker((message, peer) => {
-      if (message.type === 'start') {
-        if (message.assignmentId !== 'trusted-assignment-7' || message.cwd !== '/work/session-7') {
-          peer.send({ type: 'error', message: 'cwd is outside the broker assignment' })
-          return
-        }
-        peer.send({ type: 'accepted', handle: 'scoped-process' })
-        peer.send({ type: 'outcome', handle: 'scoped-process', exitCode: 0, signal: null })
-        peer.send({ type: 'empty', handle: 'scoped-process' })
-      }
-    })
-    try {
-      await withRuntime(broker.socketPath, async ctx => {
-        const runtime = ctx.subprocess as LocalSubprocessRuntime
-        const localSpawn = vi.fn(); runtime.internals.spawn = localSpawn as never
-        expect(() => ctx.subprocess.spawn(processSpec())).toThrow(/requires an active ToolRuntime execution/)
-        await expect(ctx.subprocess.spawnTerminal({
-          argv: ['/bin/sh'], cwd: '/work/session-7', rows: 24, cols: 80,
-          terminalType: 'xterm', graceMs: 100,
-        })).rejects.toThrow(/requires an active ToolRuntime execution/)
-        expect(localSpawn).not.toHaveBeenCalled()
-        expect(broker.peer.messages).toHaveLength(0)
-      }, null)
-      await withRuntime(broker.socketPath, async ctx => {
-        const runtime = ctx.subprocess as LocalSubprocessRuntime
-        const localSpawn = vi.fn(); runtime.internals.spawn = localSpawn as never
-        const handle = ctx.subprocess.spawn(processSpec({ cwd: '/work/session-8' }))
-        await expect(handle.done).rejects.toThrow(/cwd is outside the broker assignment/)
-        expect(await broker.peer.waitFor('start')).toMatchObject({
-          assignmentId: 'trusted-assignment-7', cwd: '/work/session-8',
-        })
-        expect(() => ctx.subprocess.spawn(processSpec({ env: { DSH_SESSION_ID: 'session-8' } })))
-          .toThrow(/DSH_SESSION_ID cannot be set for broker launches/)
-        await expect(ctx.subprocess.spawnTerminal({
-          argv: ['/bin/sh'], cwd: '/work/session-8', rows: 24, cols: 80,
-          terminalType: 'xterm', graceMs: 100,
-        })).rejects.toThrow(/cwd is outside the broker assignment/)
-        await expect(ctx.subprocess.spawnTerminal({
-          argv: ['/bin/sh'], cwd: '/work/session-7', env: { DSH_SESSION_ID: 'session-8' },
-          rows: 24, cols: 80, terminalType: 'xterm', graceMs: 100,
-        })).rejects.toThrow(/DSH_SESSION_ID cannot be set for broker launches/)
-        expect(localSpawn).not.toHaveBeenCalled()
-      }, 'session-7')
-    } finally { await broker.close() }
-  })
-
-  it('fails closed when the broker socket is unavailable and never invokes local spawn', async () => {
-    const directory = mkdtempSync(join(tmpdir(), 'dsh-broker-missing-'))
-    const missingSocket = join(directory, 'missing.sock')
-    try {
-      await withRuntime(missingSocket, async ctx => {
-        const runtime = ctx.subprocess as LocalSubprocessRuntime
-        const localSpawn = vi.fn(); runtime.internals.spawn = localSpawn as never
-        const handle = ctx.subprocess.spawn(processSpec())
-        await expect(handle.done).rejects.toThrow()
-        expect(localSpawn).not.toHaveBeenCalled()
-        await expect(ctx.subprocess.spawnTerminal({
-          argv: ['/bin/sh'], cwd: '/assigned/tree', rows: 24, cols: 80,
-          terminalType: 'xterm', graceMs: 100,
-        })).rejects.toThrow()
-        expect(localSpawn).not.toHaveBeenCalled()
-      })
-    } finally { rmSync(directory, { recursive: true, force: true }) }
-  })
-
-  it('fails closed on malformed broker protocol without local fallback', async () => {
-    const broker = await fakeBroker((_message, peer) => { peer.socket.write('{not-json}\n') })
-    try {
-      await withRuntime(broker.socketPath, async ctx => {
-        const runtime = ctx.subprocess as LocalSubprocessRuntime
-        const localSpawn = vi.fn(); runtime.internals.spawn = localSpawn as never
-        const handle = ctx.subprocess.spawn(processSpec())
-        await expect(handle.done).rejects.toThrow(/invalid protocol frame/)
-        expect(localSpawn).not.toHaveBeenCalled()
-      })
+      const { launcher } = scriptedLauncher()
+      await withRuntime(broker.socketPath, async (ctx) => {
+        await ctx.subprocess.spawn(processSpec()).done
+      }, 'session-7', launcher)
+      expect(broker.peer.messages).toHaveLength(0)
     } finally { await broker.close() }
   })
 })
 
-describe('the assignment resolver belongs to the launcher, not to a plugin (S3 review, S2 part B)', () => {
-  /** A runtime in broker mode whose root has no resolver unless `prepare` defines one. */
+describe('the broker launcher belongs to the launcher, not to a plugin (S3 review, S2 part B; S6 bridge)', () => {
+  /** A runtime in broker mode whose root has no launcher unless `prepare` defines one. */
   async function runtimeWith(
     prepare: (ctx: Context) => void,
     run: (ctx: Context, runtime: LocalSubprocessRuntime) => void | Promise<void>,
   ) {
-    const broker = await fakeBroker(() => {})
+    const ctx = new Context()
+    ctx.provide('subprocessBrokerConfig', { socketPath: '/run/dsh-broker/broker.sock' })
+    ctx.provide('tools', {
+      currentActiveExecution: () => ({ active: true }),
+      attestActiveExecution: () => ({ direct: true, sessionId: 'session-7' }),
+    })
+    prepare(ctx)
+    const fiber = await ctx.plugin(LocalSubprocessRuntime)
     try {
-      const ctx = new Context()
-      ctx.provide('subprocessBrokerConfig', { socketPath: broker.socketPath })
-      ctx.provide('tools', {
-        currentActiveExecution: () => ({ active: true }),
-        attestActiveExecution: () => ({ direct: true, sessionId: 'session-7' }),
-      })
-      prepare(ctx)
-      const fiber = await ctx.plugin(LocalSubprocessRuntime)
-      try {
-        const runtime = ctx.subprocess as LocalSubprocessRuntime
-        runtime.internals.spawn = vi.fn() as never
-        await run(ctx, runtime)
-      } finally { await fiber.dispose() }
-    } finally { await broker.close() }
+      const runtime = ctx.subprocess as LocalSubprocessRuntime
+      runtime.internals.spawn = vi.fn() as never
+      await run(ctx, runtime)
+    } finally { await fiber.dispose() }
   }
 
-  it('never asks a resolver a plugin provides under the old Context name, with or without the launcher resolver', async () => {
-    const hostile = { resolve: vi.fn(() => 'attacker-assignment') }
+  it('never asks a launcher or resolver a plugin provides under a Context name, with or without the real one', async () => {
+    const hostile = { launch: vi.fn(() => Promise.resolve({ ok: true })), resolve: vi.fn(() => 'attacker-assignment') }
     await runtimeWith(() => {}, (ctx, runtime) => {
-      ctx.reflect.provide('subprocessBrokerAssignmentResolver', hostile)
-      expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/)
+      for (const name of ['subprocessBrokerLauncher', 'subprocessBrokerAssignmentResolver']) ctx.reflect.provide(name as never, hostile as never)
+      expect(() => runtime.spawn(processSpec())).toThrow(/launcher is unavailable/)
     })
-    await runtimeWith(ctx => { installResolver(ctx, { resolve: () => undefined }) }, (ctx, runtime) => {
-      ctx.provide('subprocessBrokerAssignmentResolver' as never, hostile as never)
-      expect(() => runtime.spawn(processSpec())).toThrow(/no broker assignment/)
+    const real = scriptedLauncher(() => ({ ok: false, reason: 'no-binding' }))
+    await runtimeWith(ctx => { installLauncher(ctx, real.launcher) }, async (ctx, runtime) => {
+      for (const name of ['subprocessBrokerLauncher', 'subprocessBrokerAssignmentResolver']) ctx.reflect.provide(name as never, hostile as never)
+      await expect(runtime.spawn(processSpec()).done).rejects.toThrow(/no-binding/)
     })
+    expect(hostile.launch).not.toHaveBeenCalled()
     expect(hostile.resolve).not.toHaveBeenCalled()
   })
 
   it('accepts only an own, locked data property of the root: not a replaceable, accessor or inherited one', async () => {
-    const hostile = { resolve: vi.fn(() => 'attacker-assignment') }
+    const hostile = { launch: vi.fn(() => Promise.resolve({ ok: true })) }
     const define = (ctx: Context, descriptor: PropertyDescriptor): void => {
-      Object.defineProperty(ctx.root, BROKER_ASSIGNMENT_RESOLVER_KEY, descriptor)
+      Object.defineProperty(ctx.root, BROKER_LAUNCHER_KEY, descriptor)
     }
     for (const descriptor of [
       { value: hostile, writable: true, configurable: false },
@@ -772,32 +611,32 @@ describe('the assignment resolver belongs to the launcher, not to a plugin (S3 r
       { get: () => hostile, configurable: false },
     ] as PropertyDescriptor[]) {
       await runtimeWith(ctx => { define(ctx, descriptor) }, (_ctx, runtime) => {
-        expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/)
+        expect(() => runtime.spawn(processSpec())).toThrow(/launcher is unavailable/)
       })
     }
     await runtimeWith(ctx => {
-      Object.defineProperty(Object.getPrototypeOf(ctx.root) as object, BROKER_ASSIGNMENT_RESOLVER_KEY, {
+      Object.defineProperty(Object.getPrototypeOf(ctx.root) as object, BROKER_LAUNCHER_KEY, {
         value: hostile, writable: false, configurable: true,
       })
     }, (ctx, runtime) => {
-      try { expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/) }
-      finally { Reflect.deleteProperty(Object.getPrototypeOf(ctx.root) as object, BROKER_ASSIGNMENT_RESOLVER_KEY) }
+      try { expect(() => runtime.spawn(processSpec())).toThrow(/launcher is unavailable/) }
+      finally { Reflect.deleteProperty(Object.getPrototypeOf(ctx.root) as object, BROKER_LAUNCHER_KEY) }
     })
-    await runtimeWith(ctx => { define(ctx, { value: { resolve: 'not a function' }, writable: false, configurable: false }) }, (_ctx, runtime) => {
-      expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/)
+    await runtimeWith(ctx => { define(ctx, { value: { launch: 'not a function' }, writable: false, configurable: false }) }, (_ctx, runtime) => {
+      expect(() => runtime.spawn(processSpec())).toThrow(/launcher is unavailable/)
     })
-    expect(hostile.resolve).not.toHaveBeenCalled()
+    expect(hostile.launch).not.toHaveBeenCalled()
   })
 
   it('cannot be replaced after the launcher defined it', async () => {
-    const hostile = { resolve: vi.fn(() => 'attacker-assignment') }
-    await runtimeWith(ctx => { installResolver(ctx, { resolve: () => undefined }) }, (ctx, runtime) => {
+    const hostile = { launch: vi.fn(() => Promise.resolve({ ok: true })) }
+    await runtimeWith(ctx => { installLauncher(ctx, scriptedLauncher(() => ({ ok: false, reason: 'no-binding' })).launcher) }, async (ctx, runtime) => {
       const root = ctx.root as unknown as Record<symbol, unknown>
-      expect(() => { root[BROKER_ASSIGNMENT_RESOLVER_KEY] = hostile }).toThrow(TypeError)
-      expect(() => Object.defineProperty(root, BROKER_ASSIGNMENT_RESOLVER_KEY, { value: hostile })).toThrow(TypeError)
-      expect(Reflect.deleteProperty(root, BROKER_ASSIGNMENT_RESOLVER_KEY)).toBe(false)
-      expect(() => runtime.spawn(processSpec())).toThrow(/no broker assignment/)
+      expect(() => { root[BROKER_LAUNCHER_KEY] = hostile }).toThrow(TypeError)
+      expect(() => Object.defineProperty(root, BROKER_LAUNCHER_KEY, { value: hostile })).toThrow(TypeError)
+      expect(Reflect.deleteProperty(root, BROKER_LAUNCHER_KEY)).toBe(false)
+      await expect(runtime.spawn(processSpec()).done).rejects.toThrow(/no-binding/)
     })
-    expect(hostile.resolve).not.toHaveBeenCalled()
+    expect(hostile.launch).not.toHaveBeenCalled()
   })
 })
