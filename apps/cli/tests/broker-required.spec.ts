@@ -181,6 +181,8 @@ describe('composed tree check', () => {
     '@deepseek-ai/dsh-hmr',
     '@deepseek-ai/dsh-config-editor',
     '@deepseek-ai/dsh-settings',
+    '@deepseek-ai/cordis-plugin-include',
+    '@deepseek-ai/cordis-plugin-include/src/index.ts',
   ]
 
   it.each(forbidden)('rejects an active %s', (name) => {
@@ -219,6 +221,27 @@ describe('composed tree check', () => {
     'rejects the unidentifiable module specifier %s', (name) => {
       expect(() => assertBrokerTree([{ id: 'x', name }])).toThrow(/not a package specifier/)
     })
+
+  it.each(['#hmr', '#internal/include', '#'])('rejects the import alias %s', (name) => {
+    expect(() => assertBrokerTree([{ id: 'x', name }])).toThrow(/import alias/)
+    expect(() => assertBrokerTree([{ id: 'x', name, disabled: false }])).toThrow(/import alias/)
+    expect(() => assertBrokerTree([{ id: 'x', name, disabled: true }])).not.toThrow()
+  })
+
+  it('rejects a forbidden child of a nested group, at any depth', () => {
+    const child = { id: 'inc', name: '@deepseek-ai/cordis-plugin-include' }
+    const inner = { id: 'inner', name: '@deepseek-ai/cordis-plugin-group', group: true, config: [child] }
+    expect(() => assertBrokerTree([{ id: 'outer', name: 'cordis:group', group: true, config: [inner] }]))
+      .toThrow(/outer\/inner\/inc/)
+    const alias = { id: 'inner', name: 'cordis:group', group: true, config: [{ id: 'a', name: '#hmr' }] }
+    expect(() => assertBrokerTree([{ id: 'outer', name: 'cordis:group', group: true, disabled: true, config: [alias] }]))
+      .toThrow(/outer\/inner\/a/)
+  })
+
+  it('admits @deepseek-ai/dsh-client-hmr: a different package from dsh-hmr, documented as outside the forbidden set', () => {
+    expect(() => assertBrokerTree([{ id: 'c', name: '@deepseek-ai/dsh-client-hmr' }])).not.toThrow()
+    expect(() => assertBrokerTree([{ id: 'c', name: '@deepseek-ai/dsh-hmr-client' }])).not.toThrow()
+  })
 
   it('rejects a row without a string module specifier', () => {
     expect(() => assertBrokerTree([{ id: 'x' } as never])).toThrow(/plain string/)
@@ -316,6 +339,43 @@ describe('runProfile refuses before anything mounts', () => {
     ['settings', '@deepseek-ai/dsh-settings'],
   ])('rejects an active %s inserted by the base layer', async (_label, name) => {
     await expectRefused(fixture([...probeRows, { id: 'forbidden', name }]), new RegExp(name))
+  })
+
+  it('rejects the Include plugin by package name', async () => {
+    await expectRefused(fixture([...probeRows, { id: 'inc', name: '@deepseek-ai/cordis-plugin-include', config: { path: 'x.yml' } }]),
+      /cordis-plugin-include is not allowed/)
+  })
+
+  it.each(['#hmr', '#internal/include'])('rejects the import alias %s', async (name) => {
+    await expectRefused(fixture([...probeRows, { id: 'alias', name }]), /import alias/)
+  })
+
+  it('rejects the Include plugin or an alias introduced by a command-line overlay', async () => {
+    const fx = fixture(probeRows)
+    const overlay = fx.overlay('overlay.json', [{ insert: [{ id: 'inc', name: '@deepseek-ai/cordis-plugin-include' }] }])
+    await expectRefused(fx, /cordis-plugin-include is not allowed/, brokerEnv, [overlay])
+    const aliasOverlay = fx.overlay('alias.json', [{ insert: [{ id: 'alias', name: '#hmr' }] }])
+    await expectRefused(fx, /#hmr is an import alias/, brokerEnv, [aliasOverlay])
+  })
+
+  it('rejects a forbidden child inside a nested group', async () => {
+    const group = {
+      id: 'outer', name: 'cordis:group', group: true,
+      config: [{ id: 'inner', name: '@deepseek-ai/cordis-plugin-group', group: true, config: [{ id: 'm', name: '@deepseek-ai/dsh-plugin-manager' }] }],
+    }
+    await expectRefused(fixture([...probeRows, group as never]), /outer\/inner\/m: .*dsh-plugin-manager/)
+  })
+
+  it('admits dsh-client-hmr, which is outside the forbidden set', async () => {
+    const seen = await useRealBoot()
+    const fx = fixture([...probeRows, { id: 'client-hmr', name: '@deepseek-ai/dsh-client-hmr', disabled: true }])
+    const { ctx } = await launch(fx)
+    try {
+      expect(seen.contexts).toHaveLength(1)
+      expect(probe.constructed.map(row => row.id).sort()).toEqual(['a', 'b'])
+    } finally {
+      await ctx.fiber.dispose()
+    }
   })
 
   it('rejects a forbidden row inserted by a command-line overlay', async () => {
@@ -424,6 +484,27 @@ describe('pre-ready audit (abort after mount only)', () => {
       expect(() => auditBrokerTree(ctx, { socketPath: '/other.sock' })).toThrow(/replaced/)
       ctx.set('subprocessBrokerConfig', undefined)
       expect(() => auditBrokerTree(ctx, { socketPath: SOCKET })).toThrow(/missing or pending/)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('does not skip a forbidden row that has no running fiber unless it is literally disabled', async () => {
+    const actual = await vi.importActual<typeof import('@deepseek-ai/dsh-app-boot')>('@deepseek-ai/dsh-app-boot')
+    const root = mkdtempSync(join(tmpdir(), 'dsh-broker-audit-'))
+    homes.push(root)
+    writeFileSync(join(root, 'cordis.yml'), '[]\n')
+    // dsh-hmr is not installed here, so its import fails and the row stays without a fiber that could start later.
+    writePackage(root, 'broker-probe-a', 'a')
+    const ctx = await actual.boot('audit', join(root, 'cordis.yml'), [
+      { insert: [{ id: 'hmr', name: '@deepseek-ai/dsh-hmr' }, { id: 'ok', name: 'broker-probe-a' }] },
+    ], (hostCtx) => { hostCtx.provide('subprocessBrokerConfig', { socketPath: SOCKET }) })
+    try {
+      const entry = ctx.get('loader')!.entries().find(row => row.options.id === 'hmr')!
+      expect(entry.fiber).toBeUndefined()
+      expect(() => auditBrokerTree(ctx, { socketPath: SOCKET })).toThrow(/hmr: .*no running fiber/)
+      entry.options.disabled = true
+      expect(() => auditBrokerTree(ctx, { socketPath: SOCKET })).not.toThrow()
     } finally {
       await ctx.fiber.dispose()
     }

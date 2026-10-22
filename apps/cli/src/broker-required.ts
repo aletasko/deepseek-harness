@@ -36,14 +36,36 @@ export interface BrokerConfig {
 
 const TELEMETRY_ROW_ID = 'session-telemetry-otel'
 
-/** Packages that can run or edit Host code in-process, or rewrite the composition after boot. */
+/**
+ * Packages that can run or edit Host code in-process, or rewrite the composition after boot.
+ *
+ * Matching is by module specifier, never by resolved entry: the pre-mount check must not import or resolve
+ * anything. A package that re-exports one of these under another name, or a `#` alias that resolves to one,
+ * is therefore not recognised by name; `#` specifiers are refused outright for that reason (see
+ * {@link ALLOWED_IMPORT_ALIASES}).
+ *
+ * Known and deliberately admitted (F2): `@deepseek-ai/dsh-client-hmr` is a different package from
+ * `@deepseek-ai/dsh-hmr`. It only polls bundle files for the browser client and serves an SSE channel; it
+ * does not reload Host plugins or edit the composition, so it is not in this set. Do not read "hmr" in a name
+ * as membership.
+ */
 const FORBIDDEN_PACKAGES = [
   '@deepseek-ai/dsh-cordis-host-runner',
   '@deepseek-ai/dsh-plugin-manager',
   '@deepseek-ai/dsh-hmr',
   '@deepseek-ai/dsh-config-editor',
   '@deepseek-ai/dsh-settings',
+  // The Loader imports a bare specifier as-is (no shorthand), so this name loads the real Include plugin, whose
+  // `config.path` mounts rows the pre-mount check never saw. The `cordis:include` builtin is refused below.
+  '@deepseek-ai/cordis-plugin-include',
 ] as const
+
+/**
+ * `#` subpath-import aliases admitted in broker mode. Empty on purpose: an alias is resolved through the
+ * `imports` map of whichever package owns the Loader base URL, so its target cannot be known without resolving it,
+ * and no shipped bundle needs one. Adding an entry is a deliberate act that must name a reviewed target.
+ */
+const ALLOWED_IMPORT_ALIASES: ReadonlySet<string> = new Set()
 
 /** Tree carriers whose `config` list this guard descends into. */
 const GROUP_NAMES = new Set(['cordis:group', '@deepseek-ai/cordis-plugin-group'])
@@ -78,6 +100,9 @@ function inadmissibleName(options: { name?: unknown; group?: unknown; config?: u
   if (GROUP_NAMES.has(name)) return undefined
   for (const pkg of FORBIDDEN_PACKAGES) {
     if (name === pkg || name.startsWith(`${pkg}/`)) return `${name} is not allowed in broker mode`
+  }
+  if (name.startsWith('#') && !ALLOWED_IMPORT_ALIASES.has(name)) {
+    return `${name} is an import alias this guard cannot resolve`
   }
   // Paths, URLs and builtins such as `cordis:include` load code or rows this guard cannot identify.
   if (name.startsWith('.') || name.startsWith('/') || name.startsWith('\\') || name.includes(':')) {
@@ -168,7 +193,7 @@ export function brokerBootPatches(binName: string, context: ProfileContext, prof
  * happened, so this can only abort startup; it admits nothing.
  * @param ctx Booted root context.
  * @param expected The config provided before the tree mounted.
- * @throws when the broker config is missing, pending, replaced, or a forbidden row has a running fiber.
+ * @throws when the broker config is missing, pending, replaced, or a forbidden row is running or could still start.
  */
 export function auditBrokerTree(ctx: Context, expected: BrokerConfig): void {
   const failures: string[] = []
@@ -185,9 +210,15 @@ export function auditBrokerTree(ctx: Context, expected: BrokerConfig): void {
       const { options } = entry
       // The launcher's own bootstrap include is the root of the composed tree, not a configured row.
       if (options.id === 'include' && options.name === 'cordis:include' && entry.parent.ctx.fiber.entry === undefined) continue
-      if (entry.fiber === undefined || entry.fiber.state === FiberState.DISPOSED) continue
       const reason = inadmissibleName(options)
-      if (reason !== undefined) failures.push(`${entry.id}: ${reason}`)
+      if (reason === undefined) continue
+      const live = entry.fiber !== undefined && entry.fiber.state !== FiberState.DISPOSED
+      // A row without a live fiber may still be pending or have a failed import, and `Entry.refresh()` or an
+      // update can start it after readiness is committed. Only the literal `true` is a proven-off row.
+      if (live) failures.push(`${entry.id}: ${reason}`)
+      else if (options.disabled !== true) {
+        failures.push(`${entry.id}: ${reason} (no running fiber, but not literally disabled, so it could still start)`)
+      }
     }
   }
   if (failures.length > 0) throw brokerError(`live tree audit failed after mount:\n  ${failures.join('\n  ')}`)
