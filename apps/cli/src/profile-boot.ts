@@ -21,6 +21,7 @@ import {
   createRuntimeResolution,
   initProfile,
   installFailLoud,
+  loadOptionalPatches,
   loadOverlayPatches,
   loadProfile,
   reportSkippedBundles,
@@ -36,6 +37,9 @@ import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { installProxyFromEnvironment } from '@deepseek-ai/dsh-http-proxy'
 import { DSH_LAUNCH_ENVIRONMENT_KEY, type LaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment'
 import { provideCmdline, type AppReady } from '@deepseek-ai/dsh-cmdline'
+import {
+  assertBrokerBootInputs, auditBrokerTree, brokerBootPatches, readBrokerRequirement,
+} from './broker-required.ts'
 import { createProcessShutdown, type ProcessShutdown } from './process-shutdown.ts'
 
 const NAME = 'dsh'
@@ -269,6 +273,9 @@ export interface RunProfileOptions {
  * @throws after disposing startup resources; cleanup failures retain the original error.
  */
 export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Context; shutdown: ProcessShutdown }> {
+  // An opt-in declaration in the inherited environment, read before anything starts: it only tightens this
+  // process (see broker-required.ts). A malformed value refuses the launch before the proxy or any file is touched.
+  const broker = readBrokerRequirement(options.environment)
   // Before the first plugin mounts and before anything can issue a request: Node's fetch ignores the
   // proxy environment on its own, so every profile would otherwise connect directly. Resolving from
   // the launcher's snapshot — not `process.env` — is what lets a proxy declared in a `.env` layer
@@ -320,8 +327,23 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
       cwd: process.cwd(), home: resolveDshHome(),
       overlays: composed.overlays, telemetryDisabledEnv: process.env.DSH_TELEMETRY_DISABLED,
     }
-    const ctx = await boot(NAME, rootConfig, readProfilePatches(NAME, profileContext, composed.profile), async (hostCtx) => {
+    let patches: PatchOptions[]
+    if (broker === undefined) {
+      patches = readProfilePatches(NAME, profileContext, composed.profile)
+    } else {
+      // Deny-only: refuse before the Loader exists. The home layer is read once, here, and never mounted.
+      assertBrokerBootInputs({
+        profilePatches: composed.profile.patches,
+        homePatches: loadOptionalPatches(NAME, join(profileContext.home, PROFILE_PATCH_FILENAME)),
+        resolution: composed.resolution,
+      })
+      patches = brokerBootPatches(NAME, profileContext, composed.profile)
+    }
+    const ctx = await boot(NAME, rootConfig, patches, async (hostCtx) => {
       app.current = hostCtx
+      // Before PluginPackages and every tree row, so the broker-mode gates in subprocess-local, the Host runner
+      // and the plugin manager see the declaration from their constructors on.
+      if (broker !== undefined) hostCtx.provide('subprocessBrokerConfig', broker)
       hostCtx.provide('profileContext', profileContext)
       // Before any config-tree entry mounts, so plugins resolve all launch-time
       // environment values from the same immutable launch snapshot.
@@ -341,6 +363,8 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
     if (!signalShutdown.signal.aborted
       && ctx.fiber.state === FiberState.ACTIVE
       && ctx.get('loader') !== undefined) {
+      // Secondary abort only: every row has already mounted by now.
+      if (broker !== undefined) auditBrokerTree(ctx, broker)
       appReady.commit()
     }
     return { ctx, shutdown }
