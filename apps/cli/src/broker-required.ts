@@ -88,11 +88,20 @@ function isPackage(name: string, pkg: string): boolean {
   return folded === pkg || folded.startsWith(`${pkg}/`)
 }
 
-/** The entry list an agent preset row mounts, `undefined` when this row is not a preset carrier. */
-function presetPlugins(row: { name?: unknown; config?: unknown }): { plugins: unknown } | undefined {
+/** The `config` an agent preset row mounts from, `undefined` when this row is not a preset carrier. */
+function presetConfig(row: { name?: unknown; config?: unknown }): { config: unknown } | undefined {
   if (typeof row.name !== 'string' || !PRESET_PACKAGES.some(pkg => isPackage(row.name as string, pkg))) return undefined
-  const { config } = row
-  return { plugins: config !== null && typeof config === 'object' ? (config as { plugins?: unknown }).plugins : undefined }
+  return { config: row.config }
+}
+
+/**
+ * Whether `value` is an object literal as YAML or JSON produces it: a plain object (not an array, a class instance
+ * or a `!!js` expression node, which the Loader evaluates before the preset sees its config).
+ */
+function isLiteralObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const prototype: unknown = Object.getPrototypeOf(value)
+  return (prototype === Object.prototype || prototype === null) && !('__jsExpr' in value)
 }
 
 function brokerError(message: string): Error {
@@ -136,8 +145,18 @@ function inadmissibleName(options: { name?: unknown; group?: unknown; config?: u
   return undefined
 }
 
-/** Check the `plugins` list of a preset row: absent is a preset that mounts nothing, anything else must be a list. */
-function walkPreset(plugins: unknown, label: string, failures: string[]): void {
+/**
+ * Check what a preset row mounts. An absent config is a preset that mounts nothing. Any other config must be a
+ * literal object, because the Loader evaluates `!!js` nodes before the preset reads it: a config that is itself an
+ * expression, a string or a list hides its `plugins` from this check. Its `plugins` must then be a list.
+ */
+function walkPreset(config: unknown, label: string, failures: string[]): void {
+  if (config === undefined || config === null) return
+  if (!isLiteralObject(config)) {
+    failures.push(`${label}: agent preset config is not a literal object`)
+    return
+  }
+  const { plugins } = config
   if (plugins === undefined || plugins === null) return
   if (!Array.isArray(plugins)) {
     failures.push(`${label}: agent preset plugins is not a literal entry list`)
@@ -161,9 +180,9 @@ function walkComposed(rows: readonly EntryOptions[], trail: string, failures: st
       }
     }
     // A disabled preset stays inspected for the same reason as a disabled group, and so do its nested rows.
-    const preset = presetPlugins(row)
+    const preset = presetConfig(row)
     if (preset !== undefined) {
-      walkPreset(preset.plugins, label, failures)
+      walkPreset(preset.config, label, failures)
       continue
     }
     // A disabled group stays inspected: refusing a forbidden child costs nothing and a skipped one could mount.
@@ -250,8 +269,8 @@ export function auditBrokerTree(ctx: Context, expected: BrokerConfig): void {
     for (const entry of loader.entries()) {
       const { options } = entry
       // A preset's own rows live in a tree the Loader does not list; read them from the row that declares them.
-      const preset = presetPlugins(options)
-      if (preset !== undefined) walkPreset(preset.plugins, entry.id, failures)
+      const preset = presetConfig(options)
+      if (preset !== undefined) walkPreset(preset.config, entry.id, failures)
       // The launcher's own bootstrap include is the root of the composed tree, not a configured row.
       if (options.id === 'include' && options.name === 'cordis:include' && entry.parent.ctx.fiber.entry === undefined) continue
       const reason = inadmissibleName(options)

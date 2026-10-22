@@ -283,6 +283,45 @@ describe('composed tree check', () => {
       expect(() => assertBrokerTree([preset([])])).not.toThrow()
     })
 
+    describe('a config that is not a literal object hides its plugin list (S5a review M-1)', () => {
+      const jsExpr = { __jsExpr: "({ id: 'x', plugins: [{ id: 'hmr', name: '@deepseek-ai/dsh-hmr' }] })" }
+      class Config { plugins = [{ id: 'x', name: '@deepseek-ai/dsh-hmr' }] }
+      const hidden: Array<[string, unknown]> = [
+        ['a !!js expression', jsExpr],
+        ['a string', "({ plugins: [{ name: '@deepseek-ai/dsh-hmr' }] })"],
+        ['an array', [{ id: 'x', name: '@deepseek-ai/dsh-hmr' }]],
+        ['a number', 7],
+        ['a boolean', true],
+        ['a class instance', new Config()],
+      ]
+
+      it.each(hidden)('refuses a preset whose config is %s, flagged or not', (_name, config) => {
+        const row = { id: 'preset', name: PRESET, config }
+        expect(() => assertBrokerTree([row])).toThrow(/preset: agent preset config is not a literal object/)
+        expect(() => assertBrokerTree([{ ...row, disabled: true }])).toThrow(/preset: agent preset config is not a literal object/)
+        expect(() => assertBrokerTree([{ ...row, disabled: dynamicOff }])).toThrow(/agent preset config is not a literal object/)
+      })
+
+      it('refuses it inside a group and inside a preset nested in a preset, and names the row', () => {
+        const nested = { id: 'inner', name: PRESET, config: jsExpr }
+        expect(() => assertBrokerTree([{ id: 'g', name: 'cordis:group', config: [nested] }])).toThrow(/g\/inner: agent preset config is not a literal object/)
+        expect(() => assertBrokerTree([preset([nested])])).toThrow(/preset\/inner: agent preset config is not a literal object/)
+        expect(() => assertBrokerTree([{ ...nested, name: '@DeepSeek-AI/dsh-Agent-Preset' }])).toThrow(/inner: agent preset config is not a literal object/)
+      })
+
+      it('still admits a literal object, one with no prototype, an absent config and a null one', () => {
+        expect(() => assertBrokerTree([preset([{ id: 'ok', name: '@deepseek-ai/dsh-persona' }])])).not.toThrow()
+        expect(() => assertBrokerTree([{ id: 'preset', name: PRESET, config: Object.assign(Object.create(null) as object, { id: 'p', plugins: [] }) }])).not.toThrow()
+        expect(() => assertBrokerTree([{ id: 'preset', name: PRESET }])).not.toThrow()
+        expect(() => assertBrokerTree([{ id: 'preset', name: PRESET, config: null }])).not.toThrow()
+        expect(() => assertBrokerTree([{ id: 'preset', name: PRESET, config: {} }])).not.toThrow()
+      })
+
+      it('does not treat a config that merely contains an expression elsewhere as a hidden list', () => {
+        expect(() => assertBrokerTree([{ id: 'preset', name: PRESET, config: { id: 'p', model: jsExpr, plugins: [] } }])).not.toThrow()
+      })
+    })
+
     it('admits what the shipped presets carry: ordinary tools, and the plugin manager only literally disabled', () => {
       const rows = [
         { id: 'persona', name: '@deepseek-ai/dsh-persona' },
@@ -599,6 +638,25 @@ describe('pre-ready audit (abort after mount only)', () => {
       const entry = rows.find(row => row.options.id === 'preset')!
       ;(entry.options.config as { plugins: { disabled?: boolean }[] }).plugins[0]!.disabled = true
       expect(() => auditBrokerTree(ctx, { socketPath: SOCKET })).not.toThrow()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it.each([
+    ['a !!js expression', { __jsExpr: "({ id: 'p', plugins: [{ id: 'hmr', name: '@deepseek-ai/dsh-hmr' }] })" }],
+    ['an array', [{ id: 'hmr', name: '@deepseek-ai/dsh-hmr' }]],
+    ['a string', "({ plugins: [{ name: '@deepseek-ai/dsh-hmr' }] })"],
+  ])('refuses a booted preset row whose declared config is %s (M-1, post-mount)', async (_name, config) => {
+    const actual = await vi.importActual<typeof import('@deepseek-ai/dsh-app-boot')>('@deepseek-ai/dsh-app-boot')
+    const root = mkdtempSync(join(tmpdir(), 'dsh-broker-audit-'))
+    homes.push(root)
+    writeFileSync(join(root, 'cordis.yml'), '[]\n')
+    const ctx = await actual.boot('audit', join(root, 'cordis.yml'), [{
+      insert: [{ id: 'preset', name: '@deepseek-ai/dsh-agent-preset', disabled: true, config }],
+    }], (hostCtx) => { hostCtx.provide('subprocessBrokerConfig', { socketPath: SOCKET }) })
+    try {
+      expect(() => auditBrokerTree(ctx, { socketPath: SOCKET })).toThrow(/preset: agent preset config is not a literal object/)
     } finally {
       await ctx.fiber.dispose()
     }
