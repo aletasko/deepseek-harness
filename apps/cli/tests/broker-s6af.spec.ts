@@ -351,6 +351,48 @@ describe('bounded reconnect', () => {
   })
 })
 
+describe('bounded reconnect, state kept between attempts', () => {
+  it('refuses calls while a replacement connection has not registered yet, and sends nothing on it', async () => {
+    let connections = 0
+    const server = await broker({ register: (frame, self) => {
+      connections += 1
+      if (connections === 1) self.send({ type: 'registered', requestId: frame.requestId, revision: 7 })
+    } })
+    const control = reconnecting(server, { baseDelayMs: 10 }, { registerTimeoutMs: 5000 })
+    await vi.waitFor(() => { expect(control.epoch).toBe(7) })
+    server.peer().destroy()
+    await connected(server, 2)
+    expect(await control.bind(bindRequest)).toEqual({ ok: false, reason: 'control-reconnecting' })
+    expect(await control.status()).toEqual({ ok: false, reason: 'control-reconnecting' })
+    expect(server.frames.map(frame => frame.type)).toEqual(['register-core', 'register-core'])
+  })
+
+  it('counts the attempts again after each successful reconnect', async () => {
+    const server = await broker()
+    const control = reconnecting(server, { baseDelayMs: 10, attempts: 1 })
+    await vi.waitFor(() => { expect(control.epoch).toBe(7) })
+    server.peer().destroy()
+    await connected(server, 2)
+    await vi.waitFor(() => { expect(control.epoch).toBe(7) })
+    server.peer().destroy()
+    await connected(server, 3)
+    await vi.waitFor(() => { expect(control.epoch).toBe(7) })
+    expect(control.closed).toBe(false)
+  })
+
+  it('connects once a socket that was open to others has been fixed, instead of giving up on it', async () => {
+    const server = await broker()
+    chmodSync(server.socketPath, 0o666)
+    const control = reconnecting(server, { baseDelayMs: 40, attempts: 6 })
+    cleanups.push(() => { control.closeControl() })
+    await new Promise(resolve => setTimeout(resolve, 60))
+    expect(server.connections).toHaveLength(0)
+    expect(await control.bind(bindRequest)).toMatchObject({ ok: false, reason: 'untrusted-socket' })
+    chmodSync(server.socketPath, 0o660)
+    await vi.waitFor(() => { expect(control.epoch).toBe(7) }, { timeout: 5000 })
+  })
+})
+
 describe('the socket path is checked before every connection (F9)', () => {
   function scratch(): string {
     const directory = mkdtempSync(join(tmpdir(), 'dsh-trust-'))

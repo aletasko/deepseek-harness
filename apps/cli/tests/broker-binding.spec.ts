@@ -610,7 +610,7 @@ describe('the launch bridge: lease then start, for the attested session only (W-
   it('refuses a signal that is not an AbortSignal', async () => {
     const env = await environment()
     await bound(env, 'session-7')
-    expect(await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec, signal: { aborted: false } }))
+    expect(await inTool(env, 'session-7', exec => env.host.launcher.launch({ execution: exec, ...spec, signal: { aborted: false } })))
       .toEqual({ ok: false, reason: 'invalid-request' })
     expect(env.broker.assigns).toHaveLength(0)
   })
