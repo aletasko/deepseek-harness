@@ -2,7 +2,8 @@
  * Host-only binding issuer and resolver. Everything here is deny-first: the broker is a fake that records what
  * Core sent, and the assertions are about what Core refuses, what it never sends, and what it never invents.
  */
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context, FiberState } from '@deepseek-ai/cordis'
@@ -21,6 +22,8 @@ import type { BrokerConfig } from '../src/broker-required.ts'
 import { FakeBroker } from './fake-broker.ts'
 
 const BROKER: BrokerConfig = Object.freeze({ socketPath: '/run/dsh/broker.sock' })
+/** A real directory, already canonical, standing in for a session's working directory. */
+const CWD = realpathSync(tmpdir())
 const signal = new AbortController().signal
 
 interface Env {
@@ -70,7 +73,7 @@ async function environment(options: EnvironmentOptions = {}): Promise<Env> {
       name: `seat-${id}`,
       inject: ['sessions'],
       apply: async (inner: Context) => {
-        const session = inner.sessions.create(SessionId(id))
+        const session = inner.sessions.create(SessionId(id), { meta: { cwd: CWD } })
         await run?.(inner, session)
       },
     }),
@@ -90,7 +93,7 @@ async function bound(env: Env, id: string, input: Partial<IssueInput> = {}, meta
     apply: async (inner: Context) => {
       await inner.effect(async function* () {
         const parent = meta?.parentSession
-        const options = parent === undefined ? undefined : { meta: { parentSession: SessionId(parent) } }
+        const options = { meta: { cwd: CWD, ...parent === undefined ? {} : { parentSession: SessionId(parent) } } }
         const session = inner.sessions.prepare(SessionId(id), options)
         yield inner.sessions.enter(session)
         inner.sessions.announce(session)
@@ -197,7 +200,9 @@ describe('issuance', () => {
     const { outcome } = await bound(env, 'session-1', { kind: 'room-seat', ...forged } as never)
     expect(outcome).toMatchObject({ ok: true })
     const [request] = env.broker.binds
-    expect(Object.keys(request!).sort()).toEqual(['coreEpoch', 'kind', 'orca', 'orgId', 'room', 'sessionId', 'workspaceId'])
+    expect(Object.keys(request!).sort()).toEqual(['coreEpoch', 'cwd', 'kind', 'orca', 'orgId', 'room', 'sessionId', 'workspaceId'])
+    // The forged `cwd: '/etc'` above is dropped; the value is Core's own realpath of the session header cwd.
+    expect(request!.cwd).toBe(CWD)
     expect(request).toMatchObject({
       sessionId: 'session-1', coreEpoch: 'epoch-A', kind: 'room-seat', orca: { instanceId: 'instance-9' }, orgId: 'org-1',
       room: { origine: 'dsh', stanzaId: 'room-1', agente: 'agent-1', installazione: 'inst-1' },
@@ -205,6 +210,89 @@ describe('issuance', () => {
     expect(Object.keys(request!.room!).sort()).toEqual(['agente', 'installazione', 'origine', 'stanzaId'])
     expect(request!.workspaceId).toMatch(/^workspace-[0-9a-f-]{36}$/)
     expect(Object.isFrozen(request)).toBe(true)
+  })
+
+  describe('the cwd assertion (C-2)', () => {
+    const roots: string[] = []
+    afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
+    const scratch = (): string => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-cwd-')))
+      roots.push(root)
+      return root
+    }
+    /** Create `id` with an explicit header cwd and ask for a binding of `kind`. */
+    async function issueWith(env: Env, id: string, kind: 'attach' | 'room-seat', cwd: string | undefined, extra: object = {}) {
+      let outcome: Awaited<ReturnType<BindingIssuer['issue']>> | undefined
+      await env.ctx.plugin({
+        name: `cwd-${id}`,
+        inject: ['sessions'],
+        apply: async (inner: Context) => {
+          await inner.effect(async function* () {
+            const session = inner.sessions.prepare(SessionId(id), cwd === undefined ? undefined : { meta: { cwd } })
+            yield inner.sessions.enter(session)
+            inner.sessions.announce(session)
+            outcome = await env.host.issuer.issue({ sessionId: id, kind, ...extra })
+          }, 'seat')
+        },
+      })
+      return outcome!
+    }
+
+    it('sends the realpath of the session header cwd, resolved through symlinks, for room-seat and attach', async () => {
+      const env = await environment()
+      const root = scratch()
+      mkdirSync(join(root, 'real'))
+      symlinkSync(join(root, 'real'), join(root, 'link'))
+      expect(await issueWith(env, 'a', 'attach', join(root, 'link'))).toMatchObject({ ok: true })
+      expect(await issueWith(env, 'b', 'room-seat', join(root, 'real', '..', 'real'), { orcaInstanceId: 'i-1' })).toMatchObject({ ok: true })
+      expect(env.broker.binds.map(request => request.cwd)).toEqual([join(root, 'real'), join(root, 'real')])
+    })
+
+    it('takes it from Core alone: nothing on the input, and not from a plugin, can supply or replace it', async () => {
+      const env = await environment()
+      const root = scratch()
+      const outcome = await issueWith(env, 'a', 'attach', root, { cwd: '/etc', path: '/etc', root: '/' })
+      expect(outcome).toMatchObject({ ok: true })
+      expect(env.broker.binds[0]!.cwd).toBe(root)
+    })
+
+    it('refuses a session whose cwd is missing or cannot be resolved, without asking the broker', async () => {
+      const env = await environment()
+      const root = scratch()
+      expect(await issueWith(env, 'none', 'attach', undefined)).toEqual({ ok: false, reason: 'invalid-workspace' })
+      expect(await issueWith(env, 'gone', 'room-seat', join(root, 'does-not-exist'), { orcaInstanceId: 'i-1' }))
+        .toEqual({ ok: false, reason: 'invalid-workspace' })
+      expect(env.broker.binds).toHaveLength(0)
+    })
+
+    it('omits it for a child, whose root is the parent binding pinned root', async () => {
+      const env = await environment()
+      expect((await bound(env, 'parent')).outcome).toMatchObject({ ok: true })
+      expect((await boundChild(env, 'kid', 'parent')).outcome).toMatchObject({ ok: true })
+      const [parent, kid] = env.broker.binds
+      expect(parent!.cwd).toBe(CWD)
+      expect(kid!.kind).toBe('child')
+      expect('cwd' in kid!).toBe(false)
+    })
+
+    it('is the bind frame JSON key "cwd"', async () => {
+      const env = await environment()
+      await bound(env, 'session-1')
+      const frame = JSON.parse(JSON.stringify(env.broker.binds[0])) as Record<string, unknown>
+      expect(frame['cwd']).toBe(CWD)
+      expect(Object.keys(frame)).toContain('cwd')
+    })
+
+    it('still binds a session once when two requests race through the path resolution', async () => {
+      const env = await environment()
+      const root = scratch()
+      const both = await Promise.all([
+        issueWith(env, 'twice', 'attach', root),
+        (async () => { await Promise.resolve(); return await env.host.issuer.issue({ sessionId: 'twice', kind: 'attach' }) })(),
+      ])
+      expect(both.filter(outcome => outcome.ok)).toHaveLength(1)
+      expect(env.broker.binds).toHaveLength(1)
+    })
   })
 
   it('refuses a session that is not live in this Core, and malformed or contradictory requests', async () => {
@@ -418,12 +506,26 @@ describe('revocation', () => {
     env.broker.bindAnswer = () => grant.promise
     await env.seat('session-1')
     const issuing = env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach' })
+    await vi.waitFor(() => { expect(env.broker.binds).toHaveLength(1) })
     const revoking = env.host.issuer.revoke('session-1')
     expect(env.broker.revokes).toHaveLength(0)
     grant.resolve({ ok: true, bindingId: 'binding-late', revision: 4 })
     expect(await issuing).toEqual({ ok: false, reason: 'revoked' })
     expect(await revoking).toEqual({ ok: true })
     expect(env.broker.revokes).toEqual([{ sessionId: 'session-1', bindingId: 'binding-late', coreEpoch: env.host.issuer.coreEpoch }])
+  })
+
+  it('sends nothing to the broker for a binding revoked while its cwd was still being resolved', async () => {
+    const env = await environment()
+    await env.seat('session-1')
+    // No await between the two calls: the revoke lands during the path resolution, not during the broker call.
+    const issuing = env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach' })
+    const revoking = env.host.issuer.revoke('session-1')
+    expect(await issuing).toEqual({ ok: false, reason: 'revoked' })
+    expect(await revoking).toEqual({ ok: true })
+    expect(env.broker.binds).toHaveLength(0)
+    expect(env.broker.revokes).toHaveLength(0)
+    expect(env.host.issuer.lookup('session-1')).toEqual({ ok: false, reason: 'no-binding' })
   })
 
   it('revokes children before the parent, and revokeAll covers everything at shutdown', async () => {
@@ -600,7 +702,9 @@ describe('Core restart', () => {
 
   it('keeps the table in memory only', () => {
     const source = readFileSync(join(srcDir, 'broker-binding.ts'), 'utf8')
-    expect(source).not.toMatch(/node:fs|writeFile|readFile|sqlite|localStorage/u)
+    // The one filesystem call is `realpath` of the session cwd; nothing is written or read back.
+    expect(source).not.toMatch(/node:fs(?!\/promises)|writeFile|readFile|sqlite|localStorage/u)
+    expect([...source.matchAll(/import \{([^}]*)\} from 'node:fs\/promises'/gu)].map(match => match[1]!.trim())).toEqual(['realpath'])
   })
 })
 
@@ -699,15 +803,16 @@ describe('not reachable from events, tools, plugins or model-defined code', () =
       if (/broker-binding/u.test(readFileSync(file, 'utf8'))) importers.push(relative(repoRoot, file))
     })
     expect(importers.sort()).toEqual([
-      'apps/cli/src/broker-capabilities.ts', 'apps/cli/src/profile-boot.ts', 'apps/cli/tests/broker-binding.spec.ts',
-      'apps/cli/tests/broker-capabilities.spec.ts', 'apps/cli/tests/broker-required.spec.ts', 'apps/cli/tests/fake-broker.ts',
+      'apps/cli/src/broker-capabilities.ts', 'apps/cli/src/broker-control.ts', 'apps/cli/src/profile-boot.ts',
+      'apps/cli/tests/broker-binding.spec.ts', 'apps/cli/tests/broker-capabilities.spec.ts', 'apps/cli/tests/broker-control.spec.ts',
+      'apps/cli/tests/broker-required.spec.ts', 'apps/cli/tests/fake-broker.ts',
     ])
 
     // The `./lib/*` pattern would otherwise name the emitted file; the named subpaths are mapped to null, which
     // Node resolves as "not exported" (checked by hand with `import('@deepseek-ai/dsh/lib/types/broker-binding.js')`).
     const manifest = JSON.parse(readFileSync(join(srcDir, '..', 'package.json'), 'utf8')) as { exports: Record<string, unknown> }
     expect(Object.keys(manifest.exports).filter(key => /binding/u.test(key) && manifest.exports[key] !== null)).toEqual([])
-    for (const file of ['broker-binding', 'broker-capabilities']) {
+    for (const file of ['broker-binding', 'broker-capabilities', 'broker-control']) {
       expect(manifest.exports[`./lib/types/${file}.js`]).toBeNull()
       expect(manifest.exports[`./lib/types/${file}.d.ts`]).toBeNull()
     }

@@ -2,8 +2,9 @@
  * Host-only binding issuer and assignment resolver for a `dsh` started under the broker-required gate.
  *
  * Core states only the facts it created itself: which session exists, the workspace id minted here, its own
- * process epoch, the binding kind and parent. It does not assert what only Orca or the broker can prove (worktree
- * path, `dev`/`ino`, execution host), and it never mints an `assignmentId`; the broker owns the registry, the
+ * process epoch, the binding kind and parent, and the `realpath` of the session's header `cwd` as Core read it when
+ * the binding was requested. It does not assert what only Orca or the broker can prove (worktree path of an
+ * instance, `dev`/`ino`, execution host), and it never mints an `assignmentId`; the broker owns the registry, the
  * monotonic revision and every assignment. This module sends requests and relays the broker's answer.
  *
  * Trust rests on the boot-deny gate in `broker-required.ts`: an in-process issuer is only meaningful while no
@@ -12,7 +13,9 @@
  * needs the gate.
  *
  * Reachability. Nothing here is provided on a Context, registered as a tool, or exposed on the event bus. The only
- * holder is the launcher (`profile-boot.ts`). The `./lib/*` pattern of the package `exports` can still name the
+ * direct holder is the launcher (`profile-boot.ts`); the lifecycle hook it defines on the root, which any code in this
+ * process can read, closes over `revoke` and over `issue` for kind `child` only, and the issuer checks every child
+ * itself. The `./lib/*` pattern of the package `exports` can still name the
  * emitted file, so the named subpath is blocked there; that is a speed bump, not a boundary. The one event this
  * module listens to, `session/disposed`, can only revoke. In-process isolation between trusted Host plugins is not
  * a goal: a plugin that imports the launcher's source is outside this guarantee, and that is why the gate must
@@ -24,6 +27,8 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { realpath } from 'node:fs/promises'
+import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-session'
 import { auditBrokerTree, type BrokerConfig } from './broker-required.ts'
@@ -33,6 +38,7 @@ export type BindingRefusalReason =
   | 'gate-inactive'
   | 'invalid-request'
   | 'unknown-session'
+  | 'invalid-workspace'
   | 'already-bound'
   | 'unknown-parent'
   | 'not-parent-execution'
@@ -74,6 +80,16 @@ export interface BindingRequest {
   readonly kind: BindingKind
   /** Broker-assigned id of the parent binding, `child` only. */
   readonly parentBindingId?: string
+  /**
+   * Core's own `realpath` of the session header `cwd`, taken here at issue time. It is an assertion about what Core
+   * read from the session it holds, never a value from the request, a plugin or ROOM, and it is the JSON key
+   * `"cwd"` of the bind frame. Present for `room-seat` and `attach`; absent for `child`, whose root is the parent
+   * binding's pinned root. The broker compares it with the path Orca attests for `orca.instanceId` and with that
+   * path's `(dev, ino)`, and grants only on a match; Core asserts nothing else about the path, in particular not
+   * that it is a worktree, that `instanceId` owns it, or that it still is what it was when read. This is what ties
+   * an instance id that arrived through an unauthenticated channel to the session it is being bound to.
+   */
+  readonly cwd?: string
   /** Locator only; the broker asks Orca itself for path, `dev`, `ino` and execution host. */
   readonly orca?: { readonly instanceId: string }
   readonly room?: RoomFacts
@@ -231,6 +247,22 @@ async function withDeadline<T>(ms: number, run: () => Promise<T>): Promise<T> {
   }
 }
 
+interface SessionView {
+  readonly header?: { readonly parentSession?: string; readonly cwd?: string }
+}
+
+/** The session header's `cwd` resolved through every symlink, or `undefined` when it is missing or unusable. */
+async function assertedCwd(session: SessionView): Promise<string | undefined> {
+  const declared = session.header?.cwd
+  if (typeof declared !== 'string' || declared.length === 0 || declared.includes('\0') || !isAbsolute(declared)) return undefined
+  try {
+    const resolved = await realpath(declared)
+    return isAbsolute(resolved) ? resolved : undefined
+  } catch {
+    return undefined
+  }
+}
+
 const KINDS: ReadonlySet<string> = new Set<BindingKind>(['room-seat', 'attach', 'child'])
 
 function nonEmpty(value: unknown): value is string {
@@ -262,6 +294,10 @@ export class BindingIssuer {
    * Ask the broker to bind a live session. Revocation needs no pairing by the caller: the agent loop awaits
    * {@link BindingIssuer.revoke} first thing in an agent's teardown, and `session/disposed` is the backstop.
    *
+   * `cwd` is never an input: for `room-seat` and `attach` the issuer resolves the live session's own header `cwd`
+   * and sends that (see {@link BindingRequest.cwd}); a session without a usable `cwd` is refused
+   * `invalid-workspace`. A field of that name on `input` is dropped like any other.
+   *
    * A `child` is bound only when all of these hold: the session is live and its header names `parentSessionId` as
    * its `parentSession`; the parent holds a live granted binding here; and the call runs inside the parent's own
    * direct tool execution, as attested by the ToolRuntime. A session that merely names someone else as its parent
@@ -278,7 +314,7 @@ export class BindingIssuer {
     if (input.room !== undefined && !validRoom(input.room)) return refusal('invalid-request')
     if ((kind === 'child') !== (input.parentSessionId !== undefined)) return refusal('invalid-request')
     // Only a session that is live in this Core's store can be bound. A forged event cannot create one.
-    const sessions = this.ctx.reflect.get('sessions') as { get(id: string): { header?: { parentSession?: string } } | undefined } | undefined
+    const sessions = this.ctx.reflect.get('sessions') as { get(id: string): SessionView | undefined } | undefined
     const session = sessions?.get(sessionId)
     if (session === undefined) return refusal('unknown-session')
     // A record stays until its revocation has finished, so a session cannot be re-bound while the old one dies.
@@ -296,19 +332,6 @@ export class BindingIssuer {
       workspaceId = parent.workspaceId
     }
 
-    const request: BindingRequest = Object.freeze({
-      sessionId, workspaceId, coreEpoch: this.coreEpoch, kind,
-      ...parentBindingId === undefined ? {} : { parentBindingId },
-      ...input.orcaInstanceId === undefined ? {} : { orca: Object.freeze({ instanceId: input.orcaInstanceId }) },
-      ...input.room === undefined ? {} : {
-        room: Object.freeze({
-          origine: 'dsh' as const, stanzaId: input.room.stanzaId, agente: input.room.agente,
-          installazione: input.room.installazione,
-        }),
-      },
-      ...input.orgId === undefined ? {} : { orgId: input.orgId },
-    })
-
     const done = Promise.withResolvers<void>()
     const record: Entry = {
       sessionId, workspaceId, revoked: false, settled: done.promise,
@@ -321,6 +344,40 @@ export class BindingIssuer {
       if (this.records.get(sessionId) === record) this.records.delete(sessionId)
     }
     try {
+      // The record exists before the first await, so a revoke that arrives while the path is resolved, or while
+      // the broker thinks, finds it. A child has no path to resolve and so no await before its record: its
+      // tool-execution attestation above is read in the caller's own synchronous turn.
+      let cwd: string | undefined
+      if (kind !== 'child') {
+        cwd = await assertedCwd(session)
+        if (cwd === undefined) {
+          forget()
+          return refusal('invalid-workspace')
+        }
+        // Gone or replaced while the path was resolved, or revoked meanwhile: nothing is sent to the broker.
+        if (sessions?.get(sessionId) !== session) {
+          forget()
+          return refusal('unknown-session')
+        }
+        if (record.revoked) {
+          forget()
+          return refusal('revoked')
+        }
+      }
+      const request: BindingRequest = Object.freeze({
+        sessionId, workspaceId, coreEpoch: this.coreEpoch, kind,
+        ...parentBindingId === undefined ? {} : { parentBindingId },
+        ...cwd === undefined ? {} : { cwd },
+        ...input.orcaInstanceId === undefined ? {} : { orca: Object.freeze({ instanceId: input.orcaInstanceId }) },
+        ...input.room === undefined ? {} : {
+          room: Object.freeze({
+            origine: 'dsh' as const, stanzaId: input.room.stanzaId, agente: input.room.agente,
+            installazione: input.room.installazione,
+          }),
+        },
+        ...input.orgId === undefined ? {} : { orgId: input.orgId },
+      })
+
       const answer = await withDeadline(this.timeoutMs, () => this.client.bind(request))
       if (!isGrant(answer)) {
         forget()

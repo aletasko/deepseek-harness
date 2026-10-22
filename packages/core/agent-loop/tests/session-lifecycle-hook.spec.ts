@@ -83,7 +83,7 @@ describe('revocation comes first in teardown', () => {
     expect(ctx.sessions.get(SessionId('s1'))).toBeUndefined()
   })
 
-  it('runs once per agent however many owners race the teardown, and for an agent that never published', async () => {
+  it('runs once per agent however many owners race the teardown, and not for an agent that never entered', async () => {
     const ctx = await harness(new MockAdapter([textResponse('ok')]))
     const revoked: string[] = []
     install(ctx, { revoke: async (id) => { revoked.push(id) }, childPublished: idle })
@@ -98,7 +98,28 @@ describe('revocation comes first in teardown', () => {
       sessionId: SessionId('s2'), agentOptions: model,
       setup: () => { throw new Error('setup failed') },
     })).rejects.toThrow('setup failed')
-    expect(rolledBack).toEqual(['s2'])
+    // Nothing was entered under 's2', so nothing of this instance's can be bound there.
+    expect(rolledBack).toEqual([])
+  })
+
+  it('does not revoke the live winner when a racing create with the same id loses', async () => {
+    const ctx = await harness(new MockAdapter([textResponse('ok'), textResponse('ok')]))
+    const revoked: string[] = []
+    install(ctx, { revoke: async (id) => { revoked.push(id) }, childPublished: idle })
+    const slow = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 20))
+    // Both pass the pre-publication duplicate check because their async setup overlaps; the second one's
+    // `sessions.enter` then fails and its rollback runs the full teardown.
+    const outcomes = await Promise.allSettled([
+      ctx.agents.create({ sessionId: SessionId('race'), agentOptions: model, setup: slow }),
+      ctx.agents.create({ sessionId: SessionId('race'), agentOptions: model, setup: slow }),
+    ])
+    expect(outcomes.map(outcome => outcome.status).sort()).toEqual(['fulfilled', 'rejected'])
+    expect(ctx.agents.get(SessionId('race'))).toBeDefined()
+    expect(revoked).toEqual([])
+    // The winner's own teardown still revokes, once.
+    const winner = outcomes.find(outcome => outcome.status === 'fulfilled') as PromiseFulfilledResult<{ dispose(): Promise<void> }>
+    await winner.value.dispose()
+    expect(revoked).toEqual(['race'])
   })
 
   it('does not stop the teardown when the hook fails, and the failure is reported', async () => {

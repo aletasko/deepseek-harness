@@ -172,6 +172,8 @@
     "./lib/types/broker-binding.d.ts": null,
     "./lib/types/broker-capabilities.js": null,
     "./lib/types/broker-capabilities.d.ts": null,
+    "./lib/types/broker-control.js": null,
+    "./lib/types/broker-control.d.ts": null,
     "./package.json": "./package.json"
   }
 }

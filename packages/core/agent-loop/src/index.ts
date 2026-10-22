@@ -570,7 +570,11 @@ export class AgentLoop extends Service implements AgentFactory {
       // A host that gates this process (the broker-required launcher) revokes what it bound to this session
       // BEFORE anything is cancelled or unwound: while the loop drains, tools stay resolvable, so the revoke
       // must be acknowledged first. Absent hook: nothing happens, not even an extra tick before the cancel below.
-      const lifecycleHook = readSessionLifecycleHook(loopCtx)
+      // Only an instance that actually entered the session registry can own a binding under this id. A create
+      // that lost a same-id race (its `sessions.enter` threw) never did, and revoking by id would kill the
+      // winner's binding. `publish()` runs its enter calls synchronously, so `detachSession` is already final
+      // here: either the session was entered, or the abort above makes every later `publish()` throw first.
+      const lifecycleHook = detachSession === undefined ? undefined : readSessionLifecycleHook(loopCtx)
       if (lifecycleHook !== undefined) {
         try {
           await lifecycleHook.revoke(id)

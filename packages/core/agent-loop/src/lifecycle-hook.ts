@@ -23,8 +23,10 @@ export interface PublishedChild {
 
 export interface SessionLifecycleHook {
   /**
-   * Awaited as the very first step of the agent's teardown, before the loop is cancelled, so that nothing keeps
-   * running or stays resolvable under a binding the host has not yet revoked. Resolves when acknowledged.
+   * Awaited as the very first step of the teardown of an agent that entered the session registry, before the loop
+   * is cancelled, so that nothing keeps running or stays resolvable under a binding the host has not yet revoked.
+   * Resolves when acknowledged. Not called for an instance that never entered (a create that lost a same-id race
+   * or failed in setup): it owns no binding, and the id may belong to a live session of another instance.
    */
   revoke(sessionId: string): Promise<unknown>
   /** Called synchronously after a child enters the registries; the result is not awaited by publication. */

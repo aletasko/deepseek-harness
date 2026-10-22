@@ -15,7 +15,8 @@ import {
   assertBrokerBootInputs, assertBrokerTree, auditBrokerTree, BROKER_SOCKET_ENV, readBrokerRequirement,
 } from '../src/broker-required.ts'
 import { assignmentUnavailableClient, createBindingHost, type BindingHost } from '../src/broker-binding.ts'
-import { LIFECYCLE_HOOK_KEY, ROOM_PLUGIN_SPECIFIER } from '../src/broker-capabilities.ts'
+import { ASSIGNMENT_RESOLVER_KEY, LIFECYCLE_HOOK_KEY, ROOM_PLUGIN_SPECIFIER } from '../src/broker-capabilities.ts'
+import { claimBrokerControl } from '../src/broker-control.ts'
 import { runProfile } from '../src/profile-boot.ts'
 
 const probe = vi.hoisted(() => ({
@@ -250,6 +251,70 @@ describe('composed tree check', () => {
   it('admits @deepseek-ai/dsh-client-hmr: a different package from dsh-hmr, documented as outside the forbidden set', () => {
     expect(() => assertBrokerTree([{ id: 'c', name: '@deepseek-ai/dsh-client-hmr' }])).not.toThrow()
     expect(() => assertBrokerTree([{ id: 'c', name: '@deepseek-ai/dsh-hmr-client' }])).not.toThrow()
+  })
+
+  describe('agent preset rows, which carry a second plugin list (S2 review A-1)', () => {
+    const PRESET = '@deepseek-ai/dsh-agent-preset'
+    const preset = (plugins: unknown, extra: object = {}) => ({ id: 'preset', name: PRESET, config: { id: 'p', plugins }, ...extra })
+
+    it.each(forbidden)('rejects an active %s inside a preset, however the preset itself is flagged', (name) => {
+      expect(() => assertBrokerTree([preset([{ id: 'x', name }])])).toThrow(new RegExp(`preset/x: .*${name.replaceAll('/', '\\/')}`))
+      expect(() => assertBrokerTree([preset([{ id: 'x', name }], { disabled: true })])).toThrow(/preset\/x/)
+      expect(() => assertBrokerTree([preset([{ id: 'x', name, disabled: dynamicOff }])])).toThrow(/dynamic expression/)
+    })
+
+    it('rejects the loader rows a preset could mount: Include by name or builtin, a # alias, a path', () => {
+      for (const name of ['cordis:include', '@deepseek-ai/cordis-plugin-include', '#hmr', './plugin.js']) {
+        expect(() => assertBrokerTree([preset([{ id: 'x', name }])])).toThrow(/preset\/x/)
+      }
+    })
+
+    it('descends through groups and presets nested in presets', () => {
+      const inner = preset([{ id: 'deep', name: '@deepseek-ai/dsh-hmr' }], { id: 'inner' })
+      const group = { id: 'g', name: 'cordis:group', group: true, config: [inner] }
+      expect(() => assertBrokerTree([preset([group])])).toThrow(/preset\/g\/inner\/deep/)
+    })
+
+    it('rejects a preset whose plugin list is not a literal list, and admits one that mounts nothing', () => {
+      expect(() => assertBrokerTree([{ id: 'preset', name: PRESET, config: { id: 'p', plugins: dynamicOff } }]))
+        .toThrow(/preset: agent preset plugins is not a literal entry list/)
+      expect(() => assertBrokerTree([{ id: 'preset', name: PRESET, config: { id: 'p', plugins: 'nope' } }])).toThrow(/literal entry list/)
+      expect(() => assertBrokerTree([{ id: 'preset', name: PRESET }])).not.toThrow()
+      expect(() => assertBrokerTree([preset([])])).not.toThrow()
+    })
+
+    it('admits what the shipped presets carry: ordinary tools, and the plugin manager only literally disabled', () => {
+      const rows = [
+        { id: 'persona', name: '@deepseek-ai/dsh-persona' },
+        { id: 'tool-bash', name: '@deepseek-ai/dsh-tool-bash', disabled: dynamicOff },
+        { id: 'tool-plugin-manager', name: '@deepseek-ai/dsh-plugin-manager/tools', disabled: true },
+        { id: 'tool-plugin-market', name: '@deepseek-ai/dsh-plugin-market/tools', disabled: true },
+      ]
+      expect(() => assertBrokerTree([preset(rows)])).not.toThrow()
+      expect(() => assertBrokerTree([preset(rows.map(row => row.id === 'tool-plugin-manager' ? { ...row, disabled: false } : row))]))
+        .toThrow(/tool-plugin-manager/)
+    })
+
+    it('matches the preset package name case-insensitively too', () => {
+      expect(() => assertBrokerTree([{ ...preset([{ id: 'x', name: '@deepseek-ai/dsh-hmr' }]), name: '@DeepSeek-AI/dsh-Agent-Preset' }]))
+        .toThrow(/preset\/x/)
+    })
+  })
+
+  describe('names that differ only by case (S2 review A-2)', () => {
+    const alternating = (name: string): string => name.replace(
+      /[a-z]/gu, (letter, index: number) => index % 2 === 0 ? letter.toUpperCase() : letter,
+    )
+    it.each(forbidden.map(name => [name, alternating(name)] as const))(
+      'rejects %s spelled %s', (_name, spelled) => {
+        expect(() => assertBrokerTree([{ id: 'x', name: spelled }])).toThrow(spelled)
+        expect(() => assertBrokerTree([{ id: 'x', name: spelled, disabled: false }])).toThrow(spelled)
+        expect(() => assertBrokerTree([{ id: 'x', name: spelled, disabled: true }])).not.toThrow()
+      })
+
+    it('still admits an ordinary package, and dsh-client-hmr in any case', () => {
+      expect(() => assertBrokerTree([{ id: 'a', name: '@DeepSeek-AI/dsh-Session' }, { id: 'c', name: '@DeepSeek-AI/dsh-Client-HMR' }])).not.toThrow()
+    })
   })
 
   it('rejects a row without a string module specifier', () => {
@@ -519,6 +584,26 @@ describe('pre-ready audit (abort after mount only)', () => {
     }
   })
 
+  it('reads the plugin list of a preset row in a booted tree, where the Loader does not list its rows', async () => {
+    const actual = await vi.importActual<typeof import('@deepseek-ai/dsh-app-boot')>('@deepseek-ai/dsh-app-boot')
+    const root = mkdtempSync(join(tmpdir(), 'dsh-broker-audit-'))
+    homes.push(root)
+    writeFileSync(join(root, 'cordis.yml'), '[]\n')
+    const preset = (plugins: unknown) => ({ id: 'preset', name: '@deepseek-ai/dsh-agent-preset', config: { id: 'p', plugins } })
+    const ctx = await actual.boot('audit', join(root, 'cordis.yml'), [{
+      insert: [preset([{ id: 'hmr', name: '@DeepSeek-AI/dsh-hmr' }, { id: 'ok', name: '@deepseek-ai/dsh-persona' }])],
+    }], (hostCtx) => { hostCtx.provide('subprocessBrokerConfig', { socketPath: SOCKET }) })
+    try {
+      expect(() => auditBrokerTree(ctx, { socketPath: SOCKET })).toThrow(/preset\/hmr: .*not allowed/)
+      const rows = (ctx.get('loader') as unknown as { entries(): { options: { id?: string; config: unknown } }[] }).entries()
+      const entry = rows.find(row => row.options.id === 'preset')!
+      ;(entry.options.config as { plugins: { disabled?: boolean }[] }).plugins[0]!.disabled = true
+      expect(() => auditBrokerTree(ctx, { socketPath: SOCKET })).not.toThrow()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('passes a clean tree without counting the bootstrap include as a row', async () => {
     const actual = await vi.importActual<typeof import('@deepseek-ai/dsh-app-boot')>('@deepseek-ai/dsh-app-boot')
     const root = mkdtempSync(join(tmpdir(), 'dsh-broker-audit-'))
@@ -582,6 +667,74 @@ describe('binding host in the launcher', () => {
       expect(Object.hasOwn(unguarded.ctx.root, LIFECYCLE_HOOK_KEY)).toBe(false)
     } finally {
       await unguarded.ctx.fiber.dispose()
+    }
+  })
+
+  it('closes the include override, claims the resolver slot and holds the control claim, only under the declaration', async () => {
+    await useRealBoot()
+    const fx = fixture([...probeRows, { id: 'room', name: ROOM_PLUGIN_SPECIFIER }])
+    addRoomProbe(fx)
+    const { ctx } = await launch(fx)
+    try {
+      const builtins = (ctx as unknown as { loader: { builtins: Record<string, unknown> } }).loader.builtins
+      const Evil = Object.freeze({ hostile: true })
+      // C-1: no plugin can swap the include any more, nor the dictionary it lives in.
+      expect(() => { builtins['include'] = Evil }).toThrow(/sealed/)
+      expect(() => { (ctx as unknown as { loader: { builtins: unknown } }).loader.builtins = { include: Evil } }).toThrow(TypeError)
+      expect(probe.applied).toHaveLength(1)
+      expect(probe.applied[0]!.arity).toBe(3)
+      // The assignment resolver is the launcher's: a locked symbol property that answers nobody.
+      const descriptor = Object.getOwnPropertyDescriptor(ctx.root, ASSIGNMENT_RESOLVER_KEY)!
+      expect(descriptor).toMatchObject({ writable: false, configurable: false, enumerable: false })
+      expect((descriptor.value as { resolve(id: string): unknown }).resolve('any-session')).toBeUndefined()
+      expect(Object.keys(ctx.reflect.props).filter(name => /resolver|assignment/iu.test(name))).toEqual([])
+      // Limit 2: the launcher opened the control connection first, so a second opener in this process is refused.
+      expect(() => claimBrokerControl()).toThrow(/already open in this process/)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+    // Disposal releases the claim; the next launch of the same process may open again.
+    const release = claimBrokerControl()
+    release()
+
+    const plain = fixture([...probeRows, { id: 'room', name: ROOM_PLUGIN_SPECIFIER }])
+    addRoomProbe(plain)
+    const unguarded = await launch(plain, launchEnv({}))
+    try {
+      expect(Object.hasOwn(unguarded.ctx.root, ASSIGNMENT_RESOLVER_KEY)).toBe(false)
+      const free = claimBrokerControl()
+      free()
+    } finally {
+      await unguarded.ctx.fiber.dispose()
+    }
+  })
+
+  it('opens the control connection before anything else is built from the client, and refuses a second launch at once', async () => {
+    await useRealBoot()
+    const real = await vi.importActual<typeof import('../src/broker-binding.ts')>('../src/broker-binding.ts')
+    const heldWhenBuilt: boolean[] = []
+    vi.mocked(createBindingHost).mockClear()
+    vi.mocked(createBindingHost).mockImplementation((options) => {
+      // By the time anything is built from the client, the process's one control claim is already taken.
+      try {
+        claimBrokerControl()()
+        heldWhenBuilt.push(false)
+      } catch {
+        heldWhenBuilt.push(true)
+      }
+      return real.createBindingHost(options)
+    })
+    try {
+      const { ctx } = await launch(fixture(probeRows))
+      try {
+        expect(heldWhenBuilt).toEqual([true])
+        // A second launch while the first is alive in this process cannot take the control connection.
+        await expect(launch(fixture(probeRows))).rejects.toThrow(/already open in this process/)
+      } finally {
+        await ctx.fiber.dispose()
+      }
+    } finally {
+      vi.mocked(createBindingHost).mockImplementation(real.createBindingHost)
     }
   })
 

@@ -41,8 +41,10 @@ import {
   assertBrokerBootInputs, auditBrokerTree, brokerBootPatches, readBrokerRequirement,
 } from './broker-required.ts'
 import { assignmentUnavailableClient, createBindingHost, type BindingHost } from './broker-binding.ts'
+import { openBrokerControl } from './broker-control.ts'
 import {
-  createRoomSeatPort, installCapabilityPorts, installLifecycleHook, ROOM_PLUGIN_SPECIFIER,
+  createRoomSeatPort, installAssignmentResolver, installCapabilityPorts, installLifecycleHook, ROOM_PLUGIN_SPECIFIER,
+  type CapabilityPorts,
 } from './broker-capabilities.ts'
 import { createProcessShutdown, type ProcessShutdown } from './process-shutdown.ts'
 
@@ -346,17 +348,24 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
     // Held only here and never provided on a Context; armed after the post-mount audit, so nothing but revocation
     // works before then. The shipped broker client denies everything.
     let bindingHost: BindingHost | undefined
+    let capabilityPorts: CapabilityPorts | undefined
     const ctx = await boot(NAME, rootConfig, patches, async (hostCtx) => {
       app.current = hostCtx
       // Before PluginPackages and every tree row, so the broker-mode gates in subprocess-local, the Host runner
       // and the plugin manager see the declaration from their constructors on.
       if (broker !== undefined) {
         hostCtx.provide('subprocessBrokerConfig', broker)
-        bindingHost = createBindingHost({ ctx: hostCtx, broker, client: assignmentUnavailableClient })
-        // Both before the tree mounts. The agent loop reads the hook from a symbol key on the root; ROOM gets its
-        // closed port as the third `apply` argument. Neither is a Context name, an event or a config value.
+        // The control connection is opened first, here, by the launcher alone: the one claim in this process is
+        // taken before any client exists, and the broker accepts a single Core control connection. The client
+        // shipped today refuses every request; no positive path exists.
+        const client = openBrokerControl(hostCtx, broker, () => assignmentUnavailableClient)
+        bindingHost = createBindingHost({ ctx: hostCtx, broker, client })
+        // All before the tree mounts. The agent loop reads the hook from a symbol key on the root, the local
+        // subprocess runtime reads its assignment resolver from another, and ROOM gets its closed port as the
+        // third `apply` argument. None is a Context name, an event or a config value.
         installLifecycleHook(hostCtx, bindingHost)
-        installCapabilityPorts(hostCtx, { [ROOM_PLUGIN_SPECIFIER]: createRoomSeatPort(hostCtx, bindingHost) })
+        installAssignmentResolver(hostCtx)
+        capabilityPorts = installCapabilityPorts(hostCtx, { [ROOM_PLUGIN_SPECIFIER]: createRoomSeatPort(hostCtx, bindingHost) })
       }
       hostCtx.provide('profileContext', profileContext)
       // Before any config-tree entry mounts, so plugins resolve all launch-time
@@ -365,6 +374,9 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
       await hostCtx.plugin(PluginPackages, {
         resolution: composed.resolution,
       })
+      // The package resolution the Loader imports through is now in place and no row has run: ROOM's module is
+      // pinned to the file it resolves to here.
+      capabilityPorts?.pin()
       // The command line and bounded exit request are launcher facts available
       // to every app plugin that injects the argument snapshot.
       provideCmdline(hostCtx, {
@@ -374,6 +386,9 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
       })
     })
     app.current = ctx
+    // The root Include has mounted: the `builtins.include` override takes no further write (boot's own single
+    // write already closed it; this covers a launch where it never came).
+    capabilityPorts?.seal()
     if (!signalShutdown.signal.aborted
       && ctx.fiber.state === FiberState.ACTIVE
       && ctx.get('loader') !== undefined) {

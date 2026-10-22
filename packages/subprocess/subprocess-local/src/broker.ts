@@ -29,8 +29,33 @@ export interface SubprocessBrokerAssignmentResolver {
 declare module '@deepseek-ai/cordis' {
   interface Context {
     subprocessBrokerConfig?: SubprocessBrokerConfig
-    subprocessBrokerAssignmentResolver?: SubprocessBrokerAssignmentResolver
   }
+}
+
+/**
+ * Registry-wide key under which the launcher defines the assignment resolver on the ROOT context. The resolver is
+ * deliberately not a Context name: any plugin can `provide` a name, and whichever provider Cordis picks would
+ * decide which `assignmentId` a launch carries. A symbol-keyed own property that the launcher defines once, before
+ * the tree mounts, as non-writable and non-configurable, cannot be shadowed by `ctx.provide` or replaced
+ * afterwards. Anything in this process can still read it, and code that runs before the launcher could define it
+ * first, which is why {@link readBrokerAssignmentResolver} only accepts a locked property and the launcher claims
+ * the slot even while it has nothing to grant (see `installAssignmentResolver` in the CLI's `broker-capabilities`).
+ */
+export const BROKER_ASSIGNMENT_RESOLVER_KEY: unique symbol = Symbol.for('dsh.subprocess-local.broker-assignment-resolver')
+
+/**
+ * The launcher-installed resolver, or `undefined` (deny) when the root has none, or one that is replaceable, inherited,
+ * an accessor, or not an object with a `resolve` function. Read per launch, never cached.
+ * @param ctx Any context of this process; the root is consulted.
+ */
+export function readBrokerAssignmentResolver(ctx: Context): SubprocessBrokerAssignmentResolver | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(ctx.root, BROKER_ASSIGNMENT_RESOLVER_KEY)
+  if (descriptor === undefined || !('value' in descriptor) || descriptor.writable !== false || descriptor.configurable !== false) {
+    return undefined
+  }
+  const value: unknown = descriptor.value
+  if (value === null || typeof value !== 'object' || typeof (value as { resolve?: unknown }).resolve !== 'function') return undefined
+  return value as SubprocessBrokerAssignmentResolver
 }
 
 type JsonRecord = Record<string, unknown>

@@ -5,8 +5,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
+import LocalSubprocessRuntime, { BROKER_ASSIGNMENT_RESOLVER_KEY, type SubprocessBrokerAssignmentResolver } from '@deepseek-ai/dsh-subprocess-local'
 import type { SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
+
+/** Define the resolver the way the launcher does: on the root, own, data, non-writable and non-configurable. */
+function installResolver(ctx: Context, resolver: SubprocessBrokerAssignmentResolver): void {
+  Object.defineProperty(ctx.root, BROKER_ASSIGNMENT_RESOLVER_KEY, {
+    value: resolver, writable: false, configurable: false, enumerable: false,
+  })
+}
 
 interface WireMessage { type: string; [key: string]: unknown }
 interface Peer { socket: Socket; messages: WireMessage[]; waitFor(type: string): Promise<WireMessage>; send(value: object): void }
@@ -85,7 +92,7 @@ async function withRuntime<T>(socketPath: string, run: (ctx: Context, fiber: Awa
     currentActiveExecution: () => execution,
     attestActiveExecution: () => ({ direct: true, sessionId }),
   })
-  ctx.provide('subprocessBrokerAssignmentResolver', {
+  installResolver(ctx, {
     resolve: (id: string) => id === 'session-7' ? 'trusted-assignment-7' : id === 'session-8' ? 'trusted-assignment-8' : undefined,
   })
   const fiber = await ctx.plugin(LocalSubprocessRuntime)
@@ -222,7 +229,7 @@ async function constructedWithoutBroker(): Promise<{
     currentActiveExecution: () => ({ active: true }),
     attestActiveExecution: () => ({ direct: true, sessionId: 'session-7' }),
   })
-  ctx.provide('subprocessBrokerAssignmentResolver', { resolve: (id: string) => id === 'session-7' ? 'trusted-assignment-7' : undefined })
+  installResolver(ctx, { resolve: (id: string) => id === 'session-7' ? 'trusted-assignment-7' : undefined })
   const fiber = await ctx.plugin(LocalSubprocessRuntime)
   const runtime = ctx.subprocess as LocalSubprocessRuntime
   const localSpawn = vi.fn()
@@ -428,14 +435,14 @@ describe('local subprocess broker route', () => {
       const directSpawn = vi.fn()
       runtime.internals.spawn = directSpawn as never
       expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/)
-      const disposeResolver = ctx.reflect.provide('subprocessBrokerAssignmentResolver', {
-        resolve: (id: string) => id === 'session-7' ? 'late-assignment' : undefined,
-      })
+      // The launcher may lock its resolver in after this plugin started; it is read for each launch.
+      let granting = true
+      installResolver(ctx, { resolve: (id: string) => granting && id === 'session-7' ? 'late-assignment' : undefined })
       const handle = runtime.spawn(processSpec())
       await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
       expect(await broker.peer.waitFor('start')).toMatchObject({ assignmentId: 'late-assignment' })
-      await disposeResolver()
-      expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/)
+      granting = false
+      expect(() => runtime.spawn(processSpec())).toThrow(/no broker assignment/)
       expect(directSpawn).not.toHaveBeenCalled()
     } finally {
       await fiber.dispose()
@@ -714,5 +721,83 @@ describe('local subprocess broker route', () => {
         expect(localSpawn).not.toHaveBeenCalled()
       })
     } finally { await broker.close() }
+  })
+})
+
+describe('the assignment resolver belongs to the launcher, not to a plugin (S3 review, S2 part B)', () => {
+  /** A runtime in broker mode whose root has no resolver unless `prepare` defines one. */
+  async function runtimeWith(
+    prepare: (ctx: Context) => void,
+    run: (ctx: Context, runtime: LocalSubprocessRuntime) => void | Promise<void>,
+  ) {
+    const broker = await fakeBroker(() => {})
+    try {
+      const ctx = new Context()
+      ctx.provide('subprocessBrokerConfig', { socketPath: broker.socketPath })
+      ctx.provide('tools', {
+        currentActiveExecution: () => ({ active: true }),
+        attestActiveExecution: () => ({ direct: true, sessionId: 'session-7' }),
+      })
+      prepare(ctx)
+      const fiber = await ctx.plugin(LocalSubprocessRuntime)
+      try {
+        const runtime = ctx.subprocess as LocalSubprocessRuntime
+        runtime.internals.spawn = vi.fn() as never
+        await run(ctx, runtime)
+      } finally { await fiber.dispose() }
+    } finally { await broker.close() }
+  }
+
+  it('never asks a resolver a plugin provides under the old Context name, with or without the launcher resolver', async () => {
+    const hostile = { resolve: vi.fn(() => 'attacker-assignment') }
+    await runtimeWith(() => {}, (ctx, runtime) => {
+      ctx.reflect.provide('subprocessBrokerAssignmentResolver', hostile)
+      expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/)
+    })
+    await runtimeWith(ctx => { installResolver(ctx, { resolve: () => undefined }) }, (ctx, runtime) => {
+      ctx.provide('subprocessBrokerAssignmentResolver' as never, hostile as never)
+      expect(() => runtime.spawn(processSpec())).toThrow(/no broker assignment/)
+    })
+    expect(hostile.resolve).not.toHaveBeenCalled()
+  })
+
+  it('accepts only an own, locked data property of the root: not a replaceable, accessor or inherited one', async () => {
+    const hostile = { resolve: vi.fn(() => 'attacker-assignment') }
+    const define = (ctx: Context, descriptor: PropertyDescriptor): void => {
+      Object.defineProperty(ctx.root, BROKER_ASSIGNMENT_RESOLVER_KEY, descriptor)
+    }
+    for (const descriptor of [
+      { value: hostile, writable: true, configurable: false },
+      { value: hostile, writable: false, configurable: true },
+      { get: () => hostile, configurable: false },
+    ] as PropertyDescriptor[]) {
+      await runtimeWith(ctx => { define(ctx, descriptor) }, (_ctx, runtime) => {
+        expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/)
+      })
+    }
+    await runtimeWith(ctx => {
+      Object.defineProperty(Object.getPrototypeOf(ctx.root) as object, BROKER_ASSIGNMENT_RESOLVER_KEY, {
+        value: hostile, writable: false, configurable: true,
+      })
+    }, (ctx, runtime) => {
+      try { expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/) }
+      finally { Reflect.deleteProperty(Object.getPrototypeOf(ctx.root) as object, BROKER_ASSIGNMENT_RESOLVER_KEY) }
+    })
+    await runtimeWith(ctx => { define(ctx, { value: { resolve: 'not a function' }, writable: false, configurable: false }) }, (_ctx, runtime) => {
+      expect(() => runtime.spawn(processSpec())).toThrow(/resolver is unavailable/)
+    })
+    expect(hostile.resolve).not.toHaveBeenCalled()
+  })
+
+  it('cannot be replaced after the launcher defined it', async () => {
+    const hostile = { resolve: vi.fn(() => 'attacker-assignment') }
+    await runtimeWith(ctx => { installResolver(ctx, { resolve: () => undefined }) }, (ctx, runtime) => {
+      const root = ctx.root as unknown as Record<symbol, unknown>
+      expect(() => { root[BROKER_ASSIGNMENT_RESOLVER_KEY] = hostile }).toThrow(TypeError)
+      expect(() => Object.defineProperty(root, BROKER_ASSIGNMENT_RESOLVER_KEY, { value: hostile })).toThrow(TypeError)
+      expect(Reflect.deleteProperty(root, BROKER_ASSIGNMENT_RESOLVER_KEY)).toBe(false)
+      expect(() => runtime.spawn(processSpec())).toThrow(/no broker assignment/)
+    })
+    expect(hostile.resolve).not.toHaveBeenCalled()
   })
 })

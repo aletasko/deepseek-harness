@@ -237,7 +237,9 @@ describe('the ROOM seat port', () => {
     } as never)
     expect(outcome).toMatchObject({ ok: true })
     const [request] = env.broker.binds
-    expect(Object.keys(request!).sort()).toEqual(['coreEpoch', 'kind', 'orca', 'room', 'sessionId', 'workspaceId'])
+    expect(Object.keys(request!).sort()).toEqual(['coreEpoch', 'cwd', 'kind', 'orca', 'room', 'sessionId', 'workspaceId'])
+    // The forged `cwd: '/etc'` is dropped; the request carries Core's own realpath of the session header cwd (C-2).
+    expect(request!.cwd).toBe(cwd)
     expect(request).toMatchObject({
       kind: 'room-seat', sessionId: 'room-1', orca: { instanceId: 'orca-instance-1' },
       room: { origine: 'dsh', stanzaId: '77', agente: 'agente-1', installazione: 'inst-1' },
@@ -345,7 +347,7 @@ describe('delivery of the port through the Loader', () => {
     writeFileSync(join(root, 'cordis.yml'), '[]\n')
     for (const name of [ROOM_PLUGIN_SPECIFIER, 'other-room-plugin']) writeRoomPackage(root, name)
     const ctx = await boot('capability', join(root, 'cordis.yml'), [{ insert: rows as never }], (hostCtx) => {
-      installCapabilityPorts(hostCtx, ports)
+      installCapabilityPorts(hostCtx, ports, bareBase === true ? { parentURL: `file://${root}/` } : {}).pin()
     }, bareBase === true ? `file://${root}/` : undefined)
     live.push(ctx)
     return ctx
@@ -404,16 +406,159 @@ describe('delivery of the port through the Loader', () => {
     live.push(ctx)
     const builtins = Object.create(null) as Record<string, unknown>
     class Base { import(name: string): unknown { return Promise.resolve({ apply: () => undefined, name }) } }
-    builtins['include'] = Base
     ;(ctx as unknown as { loader: unknown }).loader = { builtins }
-    installCapabilityPorts(ctx, { [ROOM_PLUGIN_SPECIFIER]: port })
+    const ports = installCapabilityPorts(ctx, { [ROOM_PLUGIN_SPECIFIER]: port }, { resolveModule: name => `file:///pinned/${name}.mjs` })
+    ports.pin()
+    // Boot assigns its root include once, after `prepare`; it is wrapped, and that is the last write accepted.
+    builtins['include'] = Base
     const Ported = builtins['include'] as new () => Base
     expect(Ported).not.toBe(Base)
-    builtins['include'] = Ported
     expect(builtins['include']).toBe(Ported)
     const instance = new Ported()
     const first = await instance.import(ROOM_PLUGIN_SPECIFIER) as { apply: unknown }
     expect(first).not.toBeNull()
     expect(await instance.import('cordis:group')).toMatchObject({ name: 'cordis:group' })
+  })
+})
+
+describe('the include override is closed and ROOM is pinned (S3 review C-1)', () => {
+  const realPort = Object.freeze({ seat: async () => ({ ok: false }), revoke: async () => ({ ok: true }) })
+  class Base { import(name: string): unknown { return Promise.resolve({ apply: () => undefined, name }) } }
+  const pinnedAt = (url: string) => ({ resolveModule: () => url })
+
+  /** A bare Loader-shaped context as the launcher sees it right after `prepare`: no include assigned yet. */
+  function bare(): { ctx: Context; loader: { builtins: Record<string, unknown> }; builtins: Record<string, unknown> } {
+    const ctx = new Context()
+    live.push(ctx)
+    const builtins = Object.create(null) as Record<string, unknown>
+    const loader = { builtins }
+    ;(ctx as unknown as { loader: unknown }).loader = loader
+    return { ctx, loader, builtins }
+  }
+
+  it('accepts boot\'s one write and then refuses every other: assignment, redefinition, deletion, swapping the dictionary', () => {
+    const { ctx, loader, builtins } = bare()
+    installCapabilityPorts(ctx, { [ROOM_PLUGIN_SPECIFIER]: realPort }, pinnedAt('file:///pinned/room.mjs')).pin()
+    builtins['include'] = Base
+    const Ported = builtins['include']
+    class Evil extends Base {}
+    expect(() => { builtins['include'] = Evil }).toThrow(/sealed/)
+    expect(() => { builtins['include'] = undefined }).toThrow(/sealed/)
+    expect(() => Object.defineProperty(builtins, 'include', { value: Evil })).toThrow(TypeError)
+    expect(Reflect.deleteProperty(builtins, 'include')).toBe(false)
+    expect(() => { loader.builtins = { include: Evil } }).toThrow(TypeError)
+    expect(Reflect.defineProperty(loader, 'builtins', { value: { include: Evil } })).toBe(false)
+    expect(builtins['include']).toBe(Ported)
+    expect(loader.builtins).toBe(builtins)
+  })
+
+  it('is closed by seal() even if boot never assigned an include', () => {
+    const { ctx, builtins } = bare()
+    const ports = installCapabilityPorts(ctx, { [ROOM_PLUGIN_SPECIFIER]: realPort }, pinnedAt('file:///pinned/room.mjs'))
+    ports.seal()
+    expect(() => { builtins['include'] = Base }).toThrow(/sealed/)
+    ports.seal()
+  })
+
+  it('cannot be written at all when an include is already there at install time', () => {
+    const { ctx, builtins } = bare()
+    builtins['include'] = Base
+    installCapabilityPorts(ctx, { [ROOM_PLUGIN_SPECIFIER]: realPort }, pinnedAt('file:///pinned/room.mjs'))
+    expect(() => { builtins['include'] = Base }).toThrow(/sealed/)
+  })
+
+  it('does not hand the port to the reviewer\'s hostile include: it cannot be swapped in any more', async () => {
+    // The sonde of the S3 review (p1.mts): subclass the include class, swap it through the setter, ask for ROOM.
+    const { ctx, builtins } = bare()
+    installCapabilityPorts(ctx, { [ROOM_PLUGIN_SPECIFIER]: realPort }, pinnedAt('file:///pinned/room.mjs')).pin()
+    builtins['include'] = Base
+    let stolen: unknown
+    class Evil extends Base {
+      override import(_name: string): unknown { return Promise.resolve({ apply(_c: unknown, _cfg: unknown, p: unknown) { stolen = p } }) }
+    }
+    expect(() => { builtins['include'] = Evil }).toThrow(/sealed/)
+    // What a plugin can still do: build the installed include and ask it. It gets ROOM's wrapper, never the port.
+    const Installed = builtins['include'] as new () => Base
+    const loaded = await new Installed().import(ROOM_PLUGIN_SPECIFIER) as { apply(ctx: unknown, config: unknown): void }
+    loaded.apply({}, {})
+    expect(stolen).toBeUndefined()
+  })
+
+  /** A base include whose modules record the third argument their `apply` gets. */
+  function recordingBase(received: unknown[]) {
+    return class Recording {
+      import(name: string): unknown {
+        return Promise.resolve({ name, apply: (_ctx: unknown, _config: unknown, ...rest: unknown[]) => { received.push(rest[0]) } })
+      }
+    }
+  }
+  const load = async (Installed: unknown): Promise<void> => {
+    const mod = await new (Installed as new () => Base)().import(ROOM_PLUGIN_SPECIFIER) as { apply(ctx: unknown, config: unknown): void }
+    mod.apply({}, {})
+  }
+
+  it('refuses an import that resolves to a different file than the one pinned at boot', async () => {
+    const { ctx, builtins } = bare()
+    const received: unknown[] = []
+    let resolvesTo: string | undefined = 'file:///pinned/room.mjs'
+    installCapabilityPorts(ctx, { [ROOM_PLUGIN_SPECIFIER]: realPort }, { resolveModule: () => resolvesTo }).pin()
+    builtins['include'] = recordingBase(received)
+    await load(builtins['include'])
+    expect(received).toEqual([realPort])
+    resolvesTo = 'file:///elsewhere/evil.mjs'
+    await expect(load(builtins['include'])).rejects.toThrow(/not the file pinned at boot/)
+    resolvesTo = undefined
+    await expect(load(builtins['include'])).rejects.toThrow(/resolves to nothing/)
+    expect(received).toEqual([realPort])
+  })
+
+  it('gives no port before the pin is taken, and none to a specifier that did not resolve when pinning', async () => {
+    const received: unknown[] = []
+    const early = bare()
+    installCapabilityPorts(early.ctx, { [ROOM_PLUGIN_SPECIFIER]: realPort }, pinnedAt('file:///pinned/room.mjs'))
+    early.builtins['include'] = recordingBase(received)
+    await load(early.builtins['include'])
+    expect(received).toEqual([undefined])
+
+    const unresolved = bare()
+    installCapabilityPorts(unresolved.ctx, { [ROOM_PLUGIN_SPECIFIER]: realPort }, { resolveModule: () => undefined }).pin()
+    unresolved.builtins['include'] = recordingBase(received)
+    await load(unresolved.builtins['include'])
+    expect(received).toEqual([undefined, undefined])
+  })
+
+  it('keeps the first pin: a second pin() after the resolution moved does not re-pin', async () => {
+    const { ctx, builtins } = bare()
+    const received: unknown[] = []
+    let resolvesTo = 'file:///pinned/room.mjs'
+    const ports = installCapabilityPorts(ctx, { [ROOM_PLUGIN_SPECIFIER]: realPort }, { resolveModule: () => resolvesTo })
+    ports.pin()
+    resolvesTo = 'file:///elsewhere/evil.mjs'
+    ports.pin()
+    builtins['include'] = recordingBase(received)
+    await expect(load(builtins['include'])).rejects.toThrow(/not the file pinned at boot/)
+    expect(received).toEqual([])
+  })
+
+  it('pins in a real boot with the Loader\'s own resolution, and a copy under the same name from another directory is refused', async () => {
+    const root = tempDir()
+    writeFileSync(join(root, 'cordis.yml'), '[]\n')
+    writeRoomPackage(root, ROOM_PLUGIN_SPECIFIER)
+    // A different file answering to the same bare name, reachable only from `nested/`.
+    mkdirSync(join(root, 'nested'))
+    writeRoomPackage(join(root, 'nested'), ROOM_PLUGIN_SPECIFIER)
+    writeFileSync(join(root, 'nested', 'rows.yml'), `- id: room-copy\n  name: '${ROOM_PLUGIN_SPECIFIER}'\n`)
+    ;(globalThis as { __capabilityProbe?: unknown }).__capabilityProbe = probe
+    probe.calls.length = 0
+    const rows = [{ id: 'inc', name: 'cordis:include', config: { path: './nested/rows.yml' } }]
+    const port = Object.freeze({ seat: async () => ({ ok: false }), revoke: async () => ({ ok: true }) })
+    const ctx = await boot('capability', join(root, 'cordis.yml'), [{ insert: rows }], (hostCtx) => {
+      installCapabilityPorts(hostCtx, { [ROOM_PLUGIN_SPECIFIER]: port }).pin()
+    })
+    live.push(ctx)
+    // The Loader reports a failed import and leaves the row without a fiber; the substitute never ran.
+    const entries = (ctx.get('loader') as unknown as { entries(): { options: { id?: string }; fiber?: unknown }[] }).entries()
+    expect(entries.find(entry => entry.options.id === 'room-copy')?.fiber).toBeUndefined()
+    expect(probe.calls).toEqual([])
   })
 })

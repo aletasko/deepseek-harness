@@ -59,10 +59,11 @@ import {
   BrokerTerminalHandle,
   brokerModeDeclared,
   launchBrokerProcess,
+  readBrokerAssignmentResolver,
   resolveBrokerAssignment,
   terminalEnv,
 } from './broker.ts'
-import type { SubprocessBrokerAssignmentResolver, SubprocessBrokerConfig } from './broker.ts'
+import type { SubprocessBrokerConfig } from './broker.ts'
 import { attestSubprocessExecution } from '@deepseek-ai/dsh-subprocess'
 
 const requireNodePty = createLazyRequire<typeof NodePty>('node-pty', import.meta.url)
@@ -149,10 +150,9 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   /** Resolve the assignment only from the exact Core-attested active session. */
   private brokerAssignment(): string {
     const { attestation } = attestSubprocessExecution(this.ctx)
-    // ROOM may register or revoke its host-owned resolver after this plugin
-    // starts. Read the current provider for each launch; absence denies.
-    const resolver = this.ctx.reflect.get('subprocessBrokerAssignmentResolver') as SubprocessBrokerAssignmentResolver | undefined
-    return resolveBrokerAssignment(resolver, attestation.sessionId)
+    // The resolver is the launcher's, defined on the root under a symbol key and locked; it is not a Context name
+    // a plugin could provide. Read for each launch; absence, or anything not locked, denies.
+    return resolveBrokerAssignment(readBrokerAssignmentResolver(this.ctx), attestation.sessionId)
   }
 
   private terminateForHostExit(): void {
@@ -458,4 +458,5 @@ function environmentValue(env: NodeJS.ProcessEnv, name: 'PATH' | 'PATHEXT'): str
 }
 
 export default LocalSubprocessRuntime
+export { BROKER_ASSIGNMENT_RESOLVER_KEY } from './broker.ts'
 export type { SubprocessBrokerAssignmentResolver, SubprocessBrokerConfig } from './broker.ts'

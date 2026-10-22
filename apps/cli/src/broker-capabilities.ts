@@ -9,9 +9,13 @@
  *    ROOM module as the Loader imports it, by exact package specifier, so no row, config value or event can ask
  *    for the port. A row under another name, a relative path or an agent-preset subtree gets none.
  *
- * Both are deny-only in effect: the shipped broker client refuses every bind, and the resolver relays refusals.
- * In-process isolation between trusted Host plugins is still not a goal (see `broker-binding.ts`); the boot-deny
- * gate is what keeps model-defined code out.
+ * A third slot, the assignment resolver the local subprocess runtime reads, is claimed the same way (a locked
+ * symbol property on the root, `installAssignmentResolver`); it used to be a Context name any plugin could provide.
+ *
+ * All are deny-only in effect: the shipped broker client refuses every bind, and the resolver answers nobody.
+ * In-process isolation between trusted Host plugins is still not a goal (see `broker-binding.ts`): the closed
+ * `builtins.include` override and the pinned ROOM module are speed bumps, and the broker verifying instance, path
+ * and `(dev, ino)` itself is the boundary. The boot-deny gate is what keeps model-defined code out.
  * @module @deepseek-ai/dsh/broker-capabilities
  */
 
@@ -46,6 +50,24 @@ export function installLifecycleHook(ctx: Context, host: BindingHost): void {
     },
   })
   Object.defineProperty(root, LIFECYCLE_HOOK_KEY, { value: hook, writable: false, configurable: false, enumerable: false })
+}
+
+/** Same registry symbol `@deepseek-ai/dsh-subprocess-local` reads (`BROKER_ASSIGNMENT_RESOLVER_KEY`). */
+export const ASSIGNMENT_RESOLVER_KEY: unique symbol = Symbol.for('dsh.subprocess-local.broker-assignment-resolver')
+
+/**
+ * Claim the slot from which the local subprocess runtime reads the assignment resolver, on the root context, once,
+ * before the tree mounts. The resolver there is the launcher's alone: no Context name for a plugin to provide, and
+ * a property no later code can replace. It is installed even though nothing can be granted yet, because a slot
+ * left empty is a slot the first plugin to define the symbol would own; the runtime also refuses a slot that is
+ * not locked. The shipped resolver answers nobody, so a launch in broker mode is denied until a later slice
+ * replaces it here. A second call throws.
+ */
+export function installAssignmentResolver(ctx: Context): void {
+  const root = ctx.root as unknown as object
+  if (Object.hasOwn(root, ASSIGNMENT_RESOLVER_KEY)) throw new Error('dsh: broker assignment resolver is already installed')
+  const resolver = Object.freeze({ resolve: (_sessionId: string): string | undefined => undefined })
+  Object.defineProperty(root, ASSIGNMENT_RESOLVER_KEY, { value: resolver, writable: false, configurable: false, enumerable: false })
 }
 
 function refused(reason: string): BindingRefusal {
@@ -139,26 +161,100 @@ async function workspaceRootIs(ctx: Context, sessionId: string, cwd: string): Pr
 type IncludeClass = new (...args: never[]) => { import(name: string, getOuterStack?: () => string[]): unknown }
 const WRAPPED = new WeakSet<object>()
 
+/** Resolve a module specifier to the file URL the Loader would import it from, or `undefined` when it cannot. */
+export type ModuleResolver = (specifier: string, parentURL: string) => string | undefined
+
+interface InternalResolver {
+  version: string
+  resolveSync: (...args: never[]) => { url: string }
+}
+
+/** The Loader's own resolution, through the same Node internal module loader it imports with. */
+function internalResolver(ctx: Context): ModuleResolver {
+  return (specifier, parentURL) => {
+    const internal = (ctx as unknown as { loader: { internal?: InternalResolver } }).loader.internal
+    if (internal === undefined) return undefined
+    try {
+      const resolve = internal.resolveSync as (...args: unknown[]) => { url: string }
+      const resolved = internal.version === 'v2'
+        ? resolve.call(internal, parentURL, { specifier, attributes: {} })
+        : resolve.call(internal, specifier, parentURL, {})
+      return typeof resolved.url === 'string' ? resolved.url : undefined
+    } catch {
+      return undefined
+    }
+  }
+}
+
+export interface CapabilityPortOptions {
+  /** Defaults to the Loader's own internal resolution. A resolver that finds nothing leaves the module without a port. */
+  readonly resolveModule?: ModuleResolver
+  /** The base bare specifiers resolve from; defaults to `ctx.baseUrl`, which is what the Loader imports from. */
+  readonly parentURL?: string
+}
+
+/** What the launcher keeps after {@link installCapabilityPorts}. */
+export interface CapabilityPorts {
+  /**
+   * Record the file URL each ported specifier resolves to now. Call it once, after the package resolution the
+   * Loader imports through is in place and before any configuration row runs. Until then nothing gets a port; a
+   * second call keeps the first pin. A specifier that does not resolve is left unpinned and so never gets one.
+   */
+  pin(): void
+  /** Close the `builtins.include` override for good. Idempotent; the first write by boot closes it as well. */
+  seal(): void
+}
+
 /**
  * Hand a port to the module the Loader imports under an exact specifier. The root Include (and so every nested
- * Include and group row) is the Loader's `builtins.include`; its class is replaced, once, so each import passes
- * through here. The module's `apply(ctx, config)` is called as `apply(ctx, config, port)`. A module that has no
- * `apply` method, or any other specifier, is returned untouched.
+ * Include and group row) is the Loader's `builtins.include`; its class is replaced, so each import passes through
+ * here. The module's `apply(ctx, config)` is called as `apply(ctx, config, port)`. A module that has no `apply`
+ * method, or any other specifier, is returned untouched.
+ *
+ * Two things keep a plugin from simply taking the port, and neither is a boundary. (1) The override is closed:
+ * `loader.builtins` is replaced by a non-writable property, and `builtins.include` accepts exactly one write, the
+ * root Include that boot assigns right after `prepare` and before any row has run; after that, or after
+ * {@link CapabilityPorts.seal}, assigning it throws and it cannot be redefined or deleted. (2) The module's
+ * identity is pinned: {@link CapabilityPorts.pin} records the file URL each ported specifier resolves to, before the
+ * tree mounts, and an import that later resolves anywhere else is rejected (the row fails to mount) instead of
+ * being handed the port. Until the pin is taken, or when the URL cannot be resolved, that specifier gets no port.
+ *
+ * What this does not stop: Host code in this process can still read the wrapped class from `builtins.include`
+ * and subclass it, import the launcher's source, or replace a file under the pinned URL before the pin is read or
+ * after it is checked. It slows an accident or a lazy plugin; the broker verifying instance, path and `(dev, ino)`
+ * itself is the boundary.
  * @param ctx The root context with the Loader mounted.
  * @param ports Specifier to the closed port for that module.
+ * @param options Resolution overrides, for tests and for a base other than `ctx.baseUrl`.
  */
-export function installCapabilityPorts(ctx: Context, ports: Readonly<Record<string, object>>): void {
-  const builtins = (ctx as unknown as { loader: { builtins: Record<string, unknown> } }).loader.builtins
+export function installCapabilityPorts(
+  ctx: Context,
+  ports: Readonly<Record<string, object>>,
+  options: CapabilityPortOptions = {},
+): CapabilityPorts {
+  const loader = (ctx as unknown as { loader: { builtins: Record<string, unknown> } }).loader
+  const builtins = loader.builtins
   const wrappers = new WeakMap<object, object>()
   const portFor = (name: string): object | undefined => Object.hasOwn(ports, name) ? ports[name] : undefined
+  const resolveModule = options.resolveModule ?? internalResolver(ctx)
+  const baseOf = (included?: { ctx?: { baseUrl?: string } }): string => options.parentURL ?? included?.ctx?.baseUrl ?? ctx.baseUrl ?? ''
+
+  const pinned = new Map<string, string>()
+  let pinDone = false
 
   const wrap = (Base: IncludeClass): IncludeClass => {
     if (WRAPPED.has(Base)) return Base
     const Ported = class extends Base {
       override import(name: string, getOuterStack?: () => string[]): unknown {
-        const loaded = super.import(name, getOuterStack)
         const port = portFor(name)
-        if (port === undefined) return loaded
+        const expected = pinned.get(name)
+        // No port for another specifier, and none for one whose identity could not be pinned.
+        if (port === undefined || expected === undefined) return super.import(name, getOuterStack)
+        const actual = resolveModule(name, baseOf(this as { ctx?: { baseUrl?: string } }))
+        if (actual !== expected) {
+          return Promise.reject(new Error(`dsh: ${name} now resolves to ${actual ?? 'nothing'}, not the file pinned at boot (${expected}); refusing to import it`))
+        }
+        const loaded = super.import(name, getOuterStack)
         return Promise.resolve(loaded).then(namespace => withPort(namespace, port, wrappers))
       }
     }
@@ -166,13 +262,34 @@ export function installCapabilityPorts(ctx: Context, ports: Readonly<Record<stri
     return Ported
   }
 
+  // `loader.builtins` itself must not be swappable for a dictionary this accessor is not on.
+  Object.defineProperty(loader, 'builtins', { value: builtins, writable: false, configurable: false, enumerable: true })
+
   let current = builtins['include'] as IncludeClass | undefined
   if (current !== undefined) current = wrap(current)
+  // An include that is already there leaves nothing for boot to assign.
+  let sealed = current !== undefined
   Object.defineProperty(builtins, 'include', {
     configurable: false,
     enumerable: true,
     get: () => current,
-    set: (value: IncludeClass | undefined) => { current = value === undefined ? value : wrap(value) },
+    set: (value: IncludeClass | undefined) => {
+      if (sealed) throw new TypeError('dsh: builtins.include is sealed in broker mode and cannot be reassigned')
+      // The single write boot makes (`mountRootInclude`), before any configuration row has run.
+      sealed = true
+      current = value === undefined ? value : wrap(value)
+    },
+  })
+  return Object.freeze({
+    pin: () => {
+      if (pinDone) return
+      pinDone = true
+      for (const name of Object.keys(ports)) {
+        const url = resolveModule(name, baseOf())
+        if (url !== undefined) pinned.set(name, url)
+      }
+    },
+    seal: () => { sealed = true },
   })
 }
 

@@ -70,6 +70,31 @@ const ALLOWED_IMPORT_ALIASES: ReadonlySet<string> = new Set()
 /** Tree carriers whose `config` list this guard descends into. */
 const GROUP_NAMES = new Set(['cordis:group', '@deepseek-ai/cordis-plugin-group'])
 
+/**
+ * Rows that carry a second plugin list: `config.plugins` of an agent preset is mounted by the preset registry into
+ * a separate tree (`PresetTree`), which neither `Loader.entries()` nor a walk over `config` as a list ever sees.
+ * Compared case-insensitively like {@link FORBIDDEN_PACKAGES}.
+ */
+const PRESET_PACKAGES = ['@deepseek-ai/dsh-agent-preset'] as const
+
+/**
+ * Whether `name` is `pkg` or a subpath of it, ignoring case. Package names on a case-insensitive filesystem
+ * (macOS, Windows; `apps/desktop-host` runs this launcher) resolve `@DeepSeek-AI/dsh-hmr` to the real package, so a
+ * case-sensitive comparison would let a re-cased name through. A name that differs only by case is never a
+ * legitimate spelling of a package, so refusing it costs nothing.
+ */
+function isPackage(name: string, pkg: string): boolean {
+  const folded = name.toLowerCase()
+  return folded === pkg || folded.startsWith(`${pkg}/`)
+}
+
+/** The entry list an agent preset row mounts, `undefined` when this row is not a preset carrier. */
+function presetPlugins(row: { name?: unknown; config?: unknown }): { plugins: unknown } | undefined {
+  if (typeof row.name !== 'string' || !PRESET_PACKAGES.some(pkg => isPackage(row.name as string, pkg))) return undefined
+  const { config } = row
+  return { plugins: config !== null && typeof config === 'object' ? (config as { plugins?: unknown }).plugins : undefined }
+}
+
 function brokerError(message: string): Error {
   return new Error(`dsh: broker-required startup refused: ${message}`)
 }
@@ -99,7 +124,7 @@ function inadmissibleName(options: { name?: unknown; group?: unknown; config?: u
   if (typeof name !== 'string' || name.length === 0) return 'its module specifier is not a plain string'
   if (GROUP_NAMES.has(name)) return undefined
   for (const pkg of FORBIDDEN_PACKAGES) {
-    if (name === pkg || name.startsWith(`${pkg}/`)) return `${name} is not allowed in broker mode`
+    if (isPackage(name, pkg)) return `${name} is not allowed in broker mode`
   }
   if (name.startsWith('#') && !ALLOWED_IMPORT_ALIASES.has(name)) {
     return `${name} is an import alias this guard cannot resolve`
@@ -109,6 +134,16 @@ function inadmissibleName(options: { name?: unknown; group?: unknown; config?: u
     return `${name} is not a package specifier this guard can identify`
   }
   return undefined
+}
+
+/** Check the `plugins` list of a preset row: absent is a preset that mounts nothing, anything else must be a list. */
+function walkPreset(plugins: unknown, label: string, failures: string[]): void {
+  if (plugins === undefined || plugins === null) return
+  if (!Array.isArray(plugins)) {
+    failures.push(`${label}: agent preset plugins is not a literal entry list`)
+    return
+  }
+  walkComposed(plugins as EntryOptions[], `${label}/`, failures)
 }
 
 function walkComposed(rows: readonly EntryOptions[], trail: string, failures: string[]): void {
@@ -124,6 +159,12 @@ function walkComposed(rows: readonly EntryOptions[], trail: string, failures: st
           : ''
         failures.push(`${label}: ${reason}${dynamic}`)
       }
+    }
+    // A disabled preset stays inspected for the same reason as a disabled group, and so do its nested rows.
+    const preset = presetPlugins(row)
+    if (preset !== undefined) {
+      walkPreset(preset.plugins, label, failures)
+      continue
     }
     // A disabled group stays inspected: refusing a forbidden child costs nothing and a skipped one could mount.
     if (!group) continue
@@ -208,6 +249,9 @@ export function auditBrokerTree(ctx: Context, expected: BrokerConfig): void {
   else {
     for (const entry of loader.entries()) {
       const { options } = entry
+      // A preset's own rows live in a tree the Loader does not list; read them from the row that declares them.
+      const preset = presetPlugins(options)
+      if (preset !== undefined) walkPreset(preset.plugins, entry.id, failures)
       // The launcher's own bootstrap include is the root of the composed tree, not a configured row.
       if (options.id === 'include' && options.name === 'cordis:include' && entry.parent.ctx.fiber.entry === undefined) continue
       const reason = inadmissibleName(options)
