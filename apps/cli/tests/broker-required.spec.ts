@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   assertBrokerBootInputs, assertBrokerTree, auditBrokerTree, BROKER_SOCKET_ENV, readBrokerRequirement,
 } from '../src/broker-required.ts'
+import { assignmentUnavailableClient, createBindingHost, type BindingHost } from '../src/broker-binding.ts'
 import { runProfile } from '../src/profile-boot.ts'
 
 const probe = vi.hoisted(() => ({
@@ -32,6 +33,10 @@ vi.mock('@deepseek-ai/dsh-app-boot', async (importOriginal) => {
   return { ...actual, boot: vi.fn(), installFailLoud: vi.fn() }
 })
 vi.mock('@deepseek-ai/dsh-http-proxy', () => ({ installProxyFromEnvironment: vi.fn() }))
+vi.mock('../src/broker-binding.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/broker-binding.ts')>()
+  return { ...actual, createBindingHost: vi.fn(actual.createBindingHost) }
+})
 // The Loader imports bare specifiers through its own native resolver, which `vi.mock` cannot intercept, so probes
 // are real packages written to a temp directory. They report through this shared object.
 const PROBE_SOURCE = (id: string): string => `
@@ -520,6 +525,49 @@ describe('pre-ready audit (abort after mount only)', () => {
       (hostCtx) => { hostCtx.provide('subprocessBrokerConfig', { socketPath: SOCKET }) })
     try {
       expect(() => auditBrokerTree(ctx, { socketPath: SOCKET })).not.toThrow()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+})
+
+function builtHost(): BindingHost {
+  return vi.mocked(createBindingHost).mock.results[0]!.value as BindingHost
+}
+
+describe('binding host in the launcher', () => {
+  it('is built only under the broker declaration, with the denying client, and armed only after the audit', async () => {
+    await useRealBoot()
+    vi.mocked(createBindingHost).mockClear()
+    const { ctx } = await launch(fixture(probeRows))
+    try {
+      expect(createBindingHost).toHaveBeenCalledTimes(1)
+      const [options] = vi.mocked(createBindingHost).mock.calls[0]!
+      expect(options).toMatchObject({ broker: { socketPath: SOCKET }, client: assignmentUnavailableClient })
+      expect(options.ctx).toBe(ctx)
+      expect(builtHost().gate.isActive()).toBe(true)
+      // Held by the launcher alone: nothing about it is published on the Context.
+      expect(Object.keys(ctx.reflect.props).filter(name => /binding|issuer|assign|resolver/iu.test(name))).toEqual([])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('stays unarmed when the post-mount audit aborts startup', async () => {
+    await useRealBoot()
+    vi.mocked(createBindingHost).mockClear()
+    probe.withdrawConfig = true
+    await expect(launch(fixture(probeRows))).rejects.toThrow(/live tree audit failed after mount/)
+    expect(createBindingHost).toHaveBeenCalledTimes(1)
+    expect(builtHost().gate.isActive()).toBe(false)
+  })
+
+  it('is not built at all without the declaration', async () => {
+    await useRealBoot()
+    vi.mocked(createBindingHost).mockClear()
+    const { ctx } = await launch(fixture(probeRows), launchEnv({}))
+    try {
+      expect(createBindingHost).not.toHaveBeenCalled()
     } finally {
       await ctx.fiber.dispose()
     }

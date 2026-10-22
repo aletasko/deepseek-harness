@@ -40,6 +40,7 @@ import { provideCmdline, type AppReady } from '@deepseek-ai/dsh-cmdline'
 import {
   assertBrokerBootInputs, auditBrokerTree, brokerBootPatches, readBrokerRequirement,
 } from './broker-required.ts'
+import { assignmentUnavailableClient, createBindingHost, type BindingHost } from './broker-binding.ts'
 import { createProcessShutdown, type ProcessShutdown } from './process-shutdown.ts'
 
 const NAME = 'dsh'
@@ -339,11 +340,17 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
       })
       patches = brokerBootPatches(NAME, profileContext, composed.profile)
     }
+    // Held only here and never provided on a Context; armed after the post-mount audit, so nothing but revocation
+    // works before then. The shipped broker client denies everything.
+    let bindingHost: BindingHost | undefined
     const ctx = await boot(NAME, rootConfig, patches, async (hostCtx) => {
       app.current = hostCtx
       // Before PluginPackages and every tree row, so the broker-mode gates in subprocess-local, the Host runner
       // and the plugin manager see the declaration from their constructors on.
-      if (broker !== undefined) hostCtx.provide('subprocessBrokerConfig', broker)
+      if (broker !== undefined) {
+        hostCtx.provide('subprocessBrokerConfig', broker)
+        bindingHost = createBindingHost({ ctx: hostCtx, broker, client: assignmentUnavailableClient })
+      }
       hostCtx.provide('profileContext', profileContext)
       // Before any config-tree entry mounts, so plugins resolve all launch-time
       // environment values from the same immutable launch snapshot.
@@ -364,7 +371,10 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
       && ctx.fiber.state === FiberState.ACTIVE
       && ctx.get('loader') !== undefined) {
       // Secondary abort only: every row has already mounted by now.
-      if (broker !== undefined) auditBrokerTree(ctx, broker)
+      if (broker !== undefined) {
+        auditBrokerTree(ctx, broker)
+        bindingHost?.gate.arm()
+      }
       appReady.commit()
     }
     return { ctx, shutdown }
