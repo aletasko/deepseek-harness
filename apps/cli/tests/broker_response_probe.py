@@ -138,7 +138,10 @@ out["bind refused"] = respond(frames["bind room-seat"], Refused("bind-refused", 
 out["start refused"] = respond(frames["start"], Refused("start-refused", "stdio-unsupported"))
 out["revoke unconfirmed"] = respond(frames["revoke"], Refused("revoke-unconfirmed", "timeout"))
 if "signal" in frames:
-    out["signal refused"] = respond(frames["signal"], Refused("not-found", "unknown-worker"))
+    try:
+        out["signal refused"] = respond(frames["signal"], Refused("not-found", "unknown-worker"))
+    except Exception as error:  # a broker from before contract point 11 does not parse `signal`
+        out["signal refused"] = {"refused-by-parser": type(error).__name__}
 def error(code, reason, request_id):
     """`_error(code, reason, request_id)` since the S6b reasons; `_error(code, request_id, reason)` before."""
     if list(inspect.signature(daemon._error).parameters)[1] == "reason":
