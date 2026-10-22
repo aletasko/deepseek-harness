@@ -2,7 +2,7 @@
  * Opt-in broker-required startup guard. It is deny-only: the declaration is an inherited-environment value any
  * same-user process may omit, so these tests assert refusals and tightening, never a grant.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { PatchOptions } from '@deepseek-ai/cordis-plugin-include'
@@ -15,6 +15,7 @@ import {
   assertBrokerBootInputs, assertBrokerTree, auditBrokerTree, BROKER_SOCKET_ENV, readBrokerRequirement,
 } from '../src/broker-required.ts'
 import { assignmentUnavailableClient, createBindingHost, type BindingHost } from '../src/broker-binding.ts'
+import { LIFECYCLE_HOOK_KEY, ROOM_PLUGIN_SPECIFIER } from '../src/broker-capabilities.ts'
 import { runProfile } from '../src/profile-boot.ts'
 
 const probe = vi.hoisted(() => ({
@@ -26,6 +27,8 @@ const probe = vi.hoisted(() => ({
   ready: [] as string[],
   /** Set by a test to make the probe withdraw the broker config from inside its constructor. */
   withdrawConfig: false,
+  /** What the ROOM-named probe's `apply` received: its argument count and third argument. */
+  applied: [] as { arity: number; third: unknown }[],
 }))
 
 vi.mock('@deepseek-ai/dsh-app-boot', async (importOriginal) => {
@@ -145,6 +148,7 @@ beforeEach(() => {
   probe.disposers.length = 0
   probe.ready.length = 0
   probe.withdrawConfig = false
+  probe.applied.length = 0
   vi.stubEnv('DSH_HOME', mkdtempSync(join(tmpdir(), 'dsh-broker-home-')))
   homes.push(process.env.DSH_HOME!)
   vi.spyOn(process, 'on').mockReturnValue(process)
@@ -535,7 +539,52 @@ function builtHost(): BindingHost {
   return vi.mocked(createBindingHost).mock.results[0]!.value as BindingHost
 }
 
+/** A package under the ROOM specifier whose `apply` reports what it was called with. */
+function addRoomProbe(fx: Fixture): void {
+  const runtime = join(fx.home, 'runtime')
+  const dir = join(runtime, 'node_modules', ...ROOM_PLUGIN_SPECIFIER.split('/'))
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: ROOM_PLUGIN_SPECIFIER, version: '1.0.0', type: 'module', exports: './index.mjs' }))
+  writeFileSync(join(dir, 'index.mjs'), `
+export const name = 'room-probe'
+export function apply(ctx, config, third) { globalThis.__brokerProbe.applied.push({ arity: arguments.length, third }) }
+`)
+  const manifest = JSON.parse(readFileSync(join(runtime, 'package.json'), 'utf8')) as { dependencies: Record<string, string> }
+  manifest.dependencies[ROOM_PLUGIN_SPECIFIER] = '*'
+  writeFileSync(join(runtime, 'package.json'), JSON.stringify(manifest))
+}
+
 describe('binding host in the launcher', () => {
+  it('defines the lifecycle hook and hands ROOM its closed port, only under the declaration', async () => {
+    await useRealBoot()
+    const fx = fixture([...probeRows, { id: 'room', name: ROOM_PLUGIN_SPECIFIER }])
+    addRoomProbe(fx)
+    const { ctx } = await launch(fx)
+    try {
+      expect(probe.applied).toHaveLength(1)
+      expect(probe.applied[0]!.arity).toBe(3)
+      const port = probe.applied[0]!.third as { seat: unknown; revoke: unknown }
+      expect(Object.keys(port).sort()).toEqual(['revoke', 'seat'])
+      expect(Object.isFrozen(port)).toBe(true)
+      expect(Object.getOwnPropertyDescriptor(ctx.root, LIFECYCLE_HOOK_KEY)).toMatchObject({ writable: false, configurable: false })
+      // Nothing about either is a Context name.
+      expect(Object.keys(ctx.reflect.props).filter(name => /hook|lifecycle|room|seat|port/iu.test(name))).toEqual([])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+
+    probe.applied.length = 0
+    const plain = fixture([...probeRows, { id: 'room', name: ROOM_PLUGIN_SPECIFIER }])
+    addRoomProbe(plain)
+    const unguarded = await launch(plain, launchEnv({}))
+    try {
+      expect(probe.applied).toEqual([{ arity: 2, third: undefined }])
+      expect(Object.hasOwn(unguarded.ctx.root, LIFECYCLE_HOOK_KEY)).toBe(false)
+    } finally {
+      await unguarded.ctx.fiber.dispose()
+    }
+  })
+
   it('is built only under the broker declaration, with the denying client, and armed only after the audit', async () => {
     await useRealBoot()
     vi.mocked(createBindingHost).mockClear()

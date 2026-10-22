@@ -1097,9 +1097,11 @@ export class SessionStore extends Service {
    *
    * For an agent whose session must be torn down IN ORDER with its loop (so the
    * loop's final events are published before the store attachment ends), do NOT use this
-   * — fold the session lifecycle into the agent's own effect via
-   * {@link prepare} + {@link enter} + {@link announce} (see
-   * `dsh-agent-loop`'s creation transaction).
+   * — use {@link prepare} + {@link enter} + {@link announce} and keep the detach
+   * disposer inside the agent's own teardown, as `dsh-agent-loop` does: its
+   * `publish()` enters and announces outside any generator effect, and its single
+   * memoized `teardown()` calls the detach last, after the loop is cancelled and
+   * the write handle is drained.
    *
    * @param id - the session id; omitted, the store mints `session-<n>`.
    * @param options - seed events and/or creation metadata for the header.
@@ -1124,10 +1126,10 @@ export class SessionStore extends Service {
   /**
    * Build a session WITHOUT entering it into the store — validate the id/cwd and
    * construct the {@link Session} (with its immutable {@link SessionHeader}).
-   * Pairs with {@link enter} + {@link announce}: a caller that owns a composite
-   * `ctx.effect` (the agent factory) folds the session lifecycle into that ONE
-   * effect so a fiber unload tears the session + agent down as a single ORDERED
-   * chain rather than as racing sibling effects — which would remove the publication hooks
+   * Pairs with {@link enter} + {@link announce}: a caller that owns the ordering
+   * (the agent factory) keeps the detach disposer inside its own single memoized
+   * teardown, so the session + agent come down as one ORDERED chain rather than
+   * as racing sibling effects — which would remove the publication hooks
    * before the driver's closing events commit, dropping them.
    *
    * @param id - the session id; omitted, the store mints `session-<n>`.

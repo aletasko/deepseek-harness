@@ -168,6 +168,10 @@
       "default": "./lib/profile-boot.js"
     },
     "./lib/*": "./lib/*",
+    "./lib/types/broker-binding.js": null,
+    "./lib/types/broker-binding.d.ts": null,
+    "./lib/types/broker-capabilities.js": null,
+    "./lib/types/broker-capabilities.d.ts": null,
     "./package.json": "./package.json"
   }
 }

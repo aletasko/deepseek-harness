@@ -1,8 +1,8 @@
 /**
  * Host-only binding issuer and assignment resolver for a `dsh` started under the broker-required gate.
  *
- * Core attests only the facts it created itself: which session exists, the workspace id minted here, its own
- * process epoch, the binding kind and parent. It never asserts what only Orca or the broker can prove (worktree
+ * Core states only the facts it created itself: which session exists, the workspace id minted here, its own
+ * process epoch, the binding kind and parent. It does not assert what only Orca or the broker can prove (worktree
  * path, `dev`/`ino`, execution host), and it never mints an `assignmentId`; the broker owns the registry, the
  * monotonic revision and every assignment. This module sends requests and relays the broker's answer.
  *
@@ -11,11 +11,15 @@
  * issuance and resolution, and latches off for good the first time it fails. Revocation is deny-only and never
  * needs the gate.
  *
- * Reachability. Nothing here is provided on a Context, registered as a tool, exposed on the event bus, or listed
- * in the package `exports` of `@deepseek-ai/dsh`. The only holder is the launcher (`profile-boot.ts`). The one
- * event this module listens to, `session/disposed`, can only revoke. In-process isolation between trusted Host
- * plugins is not a goal: a plugin that imports the launcher's source is outside this guarantee, and that is why
- * the gate must refuse model-defined code first.
+ * Reachability. Nothing here is provided on a Context, registered as a tool, or exposed on the event bus. The only
+ * holder is the launcher (`profile-boot.ts`). The `./lib/*` pattern of the package `exports` can still name the
+ * emitted file, so the named subpath is blocked there; that is a speed bump, not a boundary. The one event this
+ * module listens to, `session/disposed`, can only revoke. In-process isolation between trusted Host plugins is not
+ * a goal: a plugin that imports the launcher's source is outside this guarantee, and that is why the gate must
+ * refuse model-defined code first. How the agent loop and ROOM reach this module is in `broker-capabilities.ts`.
+ *
+ * Every broker call has a deadline (default 5 s). A broker that does not answer in time gets its control
+ * connection closed, which the broker treats as revoking everything; Core then forgets every binding it held.
  * @module @deepseek-ai/dsh/broker-binding
  */
 
@@ -31,6 +35,9 @@ export type BindingRefusalReason =
   | 'unknown-session'
   | 'already-bound'
   | 'unknown-parent'
+  | 'not-parent-execution'
+  | 'revoking'
+  | 'broker-timeout'
   | 'no-active-execution'
   | 'no-binding'
   | 'revoked'
@@ -206,6 +213,24 @@ interface Entry {
   revocation?: Promise<RevokeOutcome>
 }
 
+/** How long Core waits for the broker before it closes the control connection. */
+export const DEFAULT_BROKER_TIMEOUT_MS = 5000
+
+class BrokerSilence extends Error {}
+
+/** Settle with `run()`, or reject with {@link BrokerSilence} once `ms` pass without an answer. */
+async function withDeadline<T>(ms: number, run: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      run(),
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => { reject(new BrokerSilence('broker did not answer')) }, ms) }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 const KINDS: ReadonlySet<string> = new Set<BindingKind>(['room-seat', 'attach', 'child'])
 
 function nonEmpty(value: unknown): value is string {
@@ -230,10 +255,17 @@ export class BindingIssuer {
     private readonly gate: BrokerGate,
     private readonly client: BindingBrokerClient,
     readonly coreEpoch: string,
+    readonly timeoutMs: number = DEFAULT_BROKER_TIMEOUT_MS,
   ) {}
 
   /**
-   * Ask the broker to bind a live session. Pair it with {@link BindingIssuer.revoker} in the creating effect.
+   * Ask the broker to bind a live session. Revocation needs no pairing by the caller: the agent loop awaits
+   * {@link BindingIssuer.revoke} first thing in an agent's teardown, and `session/disposed` is the backstop.
+   *
+   * A `child` is bound only when all of these hold: the session is live and its header names `parentSessionId` as
+   * its `parentSession`; the parent holds a live granted binding here; and the call runs inside the parent's own
+   * direct tool execution, as attested by the ToolRuntime. A session that merely names someone else as its parent
+   * is therefore never grafted onto that session's binding.
    * @param input Session facts; see {@link IssueInput}.
    * @returns The broker's grant, or a refusal. Never throws.
    */
@@ -246,14 +278,18 @@ export class BindingIssuer {
     if (input.room !== undefined && !validRoom(input.room)) return refusal('invalid-request')
     if ((kind === 'child') !== (input.parentSessionId !== undefined)) return refusal('invalid-request')
     // Only a session that is live in this Core's store can be bound. A forged event cannot create one.
-    const sessions = this.ctx.reflect.get('sessions') as { get(id: string): unknown } | undefined
-    if (sessions?.get(sessionId) === undefined) return refusal('unknown-session')
+    const sessions = this.ctx.reflect.get('sessions') as { get(id: string): { header?: { parentSession?: string } } | undefined } | undefined
+    const session = sessions?.get(sessionId)
+    if (session === undefined) return refusal('unknown-session')
+    // A record stays until its revocation has finished, so a session cannot be re-bound while the old one dies.
     const existing = this.records.get(sessionId)
-    if (existing !== undefined && !existing.revoked) return refusal('already-bound')
+    if (existing !== undefined) return refusal(existing.revoked ? 'revoking' : 'already-bound')
 
     let parentBindingId: string | undefined
     let workspaceId = `workspace-${randomUUID()}`
     if (input.parentSessionId !== undefined) {
+      if (session.header?.parentSession !== input.parentSessionId) return refusal('unknown-parent')
+      if (attestedSessionId(this.ctx) !== input.parentSessionId) return refusal('not-parent-execution')
       const parent = this.records.get(input.parentSessionId)
       if (parent === undefined || parent.revoked || parent.grant === undefined) return refusal('unknown-parent')
       parentBindingId = parent.grant.bindingId
@@ -285,7 +321,7 @@ export class BindingIssuer {
       if (this.records.get(sessionId) === record) this.records.delete(sessionId)
     }
     try {
-      const answer = await this.client.bind(request)
+      const answer = await withDeadline(this.timeoutMs, () => this.client.bind(request))
       if (!isGrant(answer)) {
         forget()
         return isRefusal(answer) ? answer : refusal('broker-malformed')
@@ -293,9 +329,18 @@ export class BindingIssuer {
       // Kept even when a revoke raced the bind, so that revoke can name the binding it must kill.
       record.grant = answer
       if (record.revoked) return refusal('revoked')
+      // The gate may have latched off while the broker was answering: the grant is then undone, not returned.
+      if (!this.gate.isActive()) {
+        void this.revokeRecord(record)
+        return refusal('gate-inactive')
+      }
       return answer
-    } catch {
+    } catch (error) {
       forget()
+      if (error instanceof BrokerSilence) {
+        this.closeControl()
+        return refusal('broker-timeout')
+      }
       return refusal('assignment-unavailable')
     } finally {
       done.resolve()
@@ -303,21 +348,9 @@ export class BindingIssuer {
   }
 
   /**
-   * The disposer the creating effect yields right after it enters the session, so that on disposal the revoke
-   * frame goes out and is acknowledged before the session is detached. Cordis runs the disposers of one
-   * generator effect in reverse, each awaited, which is what orders this ahead of the store's own detach;
-   * separate effects of a fiber dispose concurrently, so a disposer registered through another `ctx.effect`
-   * would carry no such guarantee. The `session/disposed` observer is the backstop for a creator that forgets.
-   * @param sessionId The session to revoke.
-   * @returns A disposer that resolves when the broker has acknowledged, or the control connection is closed.
-   */
-  revoker(sessionId: string): () => Promise<RevokeOutcome> {
-    return () => this.revoke(sessionId)
-  }
-
-  /**
    * Revoke the session's binding and every child bound under it. Needs no gate: it only tightens. The revoke
-   * frame for a granted binding is handed to the broker synchronously, before this method first yields.
+   * frame for a granted binding is handed to the broker synchronously, before this method first yields. A
+   * finished revocation removes the record, so the table does not grow with the process's lifetime.
    * @param sessionId The session whose binding to revoke.
    * @returns Whether the broker acknowledged. When it did not, the control connection has been closed.
    */
@@ -346,7 +379,10 @@ export class BindingIssuer {
 
   private revokeRecord(record: Entry): Promise<RevokeOutcome> {
     record.revoked = true
-    record.revocation ??= this.startRevocation(record)
+    record.revocation ??= this.startRevocation(record).then((outcome) => {
+      if (this.records.get(record.sessionId) === record) this.records.delete(record.sessionId)
+      return outcome
+    })
     return record.revocation
   }
 
@@ -363,14 +399,28 @@ export class BindingIssuer {
 
   private async sendRevoke(sessionId: string, grant: BindingGrant): Promise<RevokeOutcome> {
     try {
-      const answer = await this.client.revoke({ sessionId, bindingId: grant.bindingId, coreEpoch: this.coreEpoch })
+      const frame: RevokeRequest = { sessionId, bindingId: grant.bindingId, coreEpoch: this.coreEpoch }
+      const answer = await withDeadline(this.timeoutMs, () => this.client.revoke(frame))
       if (answer.ok) return { ok: true }
-      this.client.closeControl()
+      this.closeControl()
       return { ok: false, reason: answer.reason, controlClosed: true }
-    } catch {
-      this.client.closeControl()
-      return { ok: false, reason: 'assignment-unavailable', controlClosed: true }
+    } catch (error) {
+      this.closeControl()
+      return { ok: false, reason: error instanceof BrokerSilence ? 'broker-timeout' : 'assignment-unavailable', controlClosed: true }
     }
+  }
+
+  /**
+   * Drop the control connection, which the broker treats as revoking everything, and forget every binding here:
+   * none can be resolved again, and no further frame is sent for them. Idempotent.
+   */
+  closeControl(): void {
+    this.client.closeControl()
+    for (const record of this.records.values()) {
+      record.revoked = true
+      record.revocation ??= Promise.resolve({ ok: true as const })
+    }
+    this.records.clear()
   }
 }
 
@@ -393,6 +443,22 @@ interface ToolAttestor {
 }
 
 /**
+ * The session id the ToolRuntime attests for a direct, live tool execution (`exec.agent.id`), or `undefined`. Only
+ * the execution object is read: no path, cwd, header, alias, prefix or `DSH_SESSION_ID`. Used for the resolver and
+ * for proving that a child is being created by its parent's own tool call.
+ */
+function attestedSessionId(ctx: Context, execution?: unknown): string | undefined {
+  const tools = ctx.reflect.get('tools') as ToolAttestor | undefined
+  try {
+    const active = execution ?? tools?.currentActiveExecution()
+    const attestation = active === undefined || tools === undefined ? undefined : tools.attestActiveExecution(active)
+    return attestation?.direct === true && nonEmpty(attestation.sessionId) ? attestation.sessionId : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Maps the active tool execution to a broker assignment. The only input taken from the call is the execution
  * object, and the only thing read from it is the session id the ToolRuntime attests from `exec.agent.id`. No
  * path, cwd, header, alias, prefix or `DSH_SESSION_ID` is consulted.
@@ -412,27 +478,25 @@ export class BindingResolver {
    */
   async resolve(revision: number, execution?: unknown): Promise<AssignmentGrant | BindingRefusal> {
     if (!this.gate.isActive()) return refusal('gate-inactive')
-    const tools = this.ctx.reflect.get('tools') as ToolAttestor | undefined
-    let sessionId: string | undefined
-    try {
-      const active = execution ?? tools?.currentActiveExecution()
-      const attestation = active === undefined || tools === undefined ? undefined : tools.attestActiveExecution(active)
-      if (attestation?.direct === true) sessionId = attestation.sessionId
-    } catch {
-      return refusal('no-active-execution')
-    }
-    if (!nonEmpty(sessionId)) return refusal('no-active-execution')
+    const sessionId = attestedSessionId(this.ctx, execution)
+    if (sessionId === undefined) return refusal('no-active-execution')
     const binding = this.issuer.lookup(sessionId)
     if (!('bindingId' in binding)) return binding
     if (binding.revision !== revision) return refusal('stale-revision')
     let answer: unknown
     try {
-      answer = await this.client.assign({ sessionId, bindingId: binding.bindingId, revision, coreEpoch: this.issuer.coreEpoch })
-    } catch {
+      const frame: AssignRequest = { sessionId, bindingId: binding.bindingId, revision, coreEpoch: this.issuer.coreEpoch }
+      answer = await withDeadline(this.issuer.timeoutMs, () => this.client.assign(frame))
+    } catch (error) {
+      if (error instanceof BrokerSilence) {
+        this.issuer.closeControl()
+        return refusal('broker-timeout')
+      }
       return refusal('assignment-unavailable')
     }
-    // The binding may have been revoked while the broker was thinking.
+    // The binding may have been revoked, or the gate latched off, while the broker was thinking.
     if (!('bindingId' in this.issuer.lookup(sessionId))) return refusal('revoked')
+    if (!this.gate.isActive()) return refusal('gate-inactive')
     if (isRefusal(answer)) return answer
     if (!isAssignment(answer) || answer.revision !== revision) return refusal('broker-malformed')
     return answer
@@ -463,10 +527,11 @@ export function createBindingHost(options: {
   broker: BrokerConfig
   client: BindingBrokerClient
   coreEpoch?: string
+  timeoutMs?: number
 }): BindingHost {
   const { ctx, broker, client } = options
   const gate = new BrokerGate(ctx, broker)
-  const issuer = new BindingIssuer(ctx, gate, client, options.coreEpoch ?? randomUUID())
+  const issuer = new BindingIssuer(ctx, gate, client, options.coreEpoch ?? randomUUID(), options.timeoutMs)
   const resolver = new BindingResolver(ctx, gate, issuer, client)
   // The only event this module listens to. A forged `session/disposed` can only revoke, never issue.
   ctx.on('session/disposed', (session) => { void issuer.revoke(session.id) })

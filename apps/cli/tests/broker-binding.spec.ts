@@ -15,65 +15,13 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   assignmentUnavailableClient, BindingIssuer, BrokerGate, createBindingHost,
-  type AssignmentGrant, type AssignRequest, type BindingBrokerClient, type BindingGrant, type BindingHost,
-  type BindingRefusal, type BindingRequest, type IssueInput, type RevokeRequest,
+  type AssignmentGrant, type BindingBrokerClient, type BindingGrant, type BindingHost, type IssueInput,
 } from '../src/broker-binding.ts'
 import type { BrokerConfig } from '../src/broker-required.ts'
+import { FakeBroker } from './fake-broker.ts'
 
 const BROKER: BrokerConfig = Object.freeze({ socketPath: '/run/dsh/broker.sock' })
 const signal = new AbortController().signal
-
-/** The root broker, simulated. It owns ids, revisions, epochs and assignments; Core owns none of them. */
-class FakeBroker implements BindingBrokerClient {
-  readonly log: string[] = []
-  readonly binds: BindingRequest[] = []
-  readonly revokes: RevokeRequest[] = []
-  readonly assigns: AssignRequest[] = []
-  readonly issuedAssignments = new Set<string>()
-  closed = 0
-  /** Test hooks. */
-  bindAnswer?: (request: BindingRequest) => Promise<unknown>
-  assignAnswer?: (request: AssignRequest) => Promise<unknown>
-  revokeAnswer?: (request: RevokeRequest) => Promise<unknown>
-  onRevoke?: (request: RevokeRequest) => void
-  private epoch: string | undefined
-  private counter = 0
-  private readonly registry = new Map<string, { bindingId: string; revision: number }>()
-
-  async bind(request: BindingRequest): Promise<BindingGrant | BindingRefusal> {
-    this.log.push(`bind:${request.sessionId}`)
-    this.binds.push(request)
-    if (this.bindAnswer !== undefined) return await this.bindAnswer(request) as BindingGrant
-    // A new Core epoch empties the registry, exactly as the broker's CoreOwner revision change does.
-    if (this.epoch !== request.coreEpoch) { this.registry.clear(); this.epoch = request.coreEpoch }
-    const grant = { bindingId: `binding-${++this.counter}`, revision: this.counter }
-    this.registry.set(request.sessionId, grant)
-    return { ok: true, ...grant }
-  }
-
-  async revoke(request: RevokeRequest): Promise<{ ok: true } | BindingRefusal> {
-    this.log.push(`revoke:${request.sessionId}`)
-    this.revokes.push(request)
-    this.onRevoke?.(request)
-    if (this.revokeAnswer !== undefined) return await this.revokeAnswer(request) as { ok: true }
-    this.registry.delete(request.sessionId)
-    return { ok: true }
-  }
-
-  async assign(request: AssignRequest): Promise<AssignmentGrant | BindingRefusal> {
-    this.log.push(`assign:${request.sessionId}`)
-    this.assigns.push(request)
-    if (this.assignAnswer !== undefined) return await this.assignAnswer(request) as AssignmentGrant
-    const current = this.registry.get(request.sessionId)
-    if (request.coreEpoch !== this.epoch) return { ok: false, reason: 'stale-core-epoch' }
-    if (current?.bindingId !== request.bindingId || current.revision !== request.revision) return { ok: false, reason: 'stale-binding' }
-    const assignmentId = `assignment-${this.issuedAssignments.size + 1}-opaque`
-    this.issuedAssignments.add(assignmentId)
-    return { ok: true, assignmentId, revision: current.revision }
-  }
-
-  closeControl(): void { this.closed += 1; this.log.push('close-control') }
-}
 
 interface Env {
   ctx: Context
@@ -93,6 +41,7 @@ interface EnvironmentOptions {
   broker?: FakeBroker
   coreEpoch?: string
   client?: BindingBrokerClient
+  timeoutMs?: number
 }
 
 async function environment(options: EnvironmentOptions = {}): Promise<Env> {
@@ -112,6 +61,7 @@ async function environment(options: EnvironmentOptions = {}): Promise<Env> {
   const host = createBindingHost({
     ctx, broker: BROKER, client: options.client ?? broker,
     ...options.coreEpoch === undefined ? {} : { coreEpoch: options.coreEpoch },
+    ...options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs },
   })
   if (options.arm !== false) host.gate.arm()
   return {
@@ -128,21 +78,23 @@ async function environment(options: EnvironmentOptions = {}): Promise<Env> {
 }
 
 /**
- * Seat a session and bind it from one composite creation effect, the way the agent factory folds session
- * lifecycle into a single ordered chain: enter, announce, issue, then yield the revoker.
+ * Seat a session in the store and ask for its binding, the way a creator would. Revocation is not paired here:
+ * the agent loop awaits it first in teardown (see `packages/core/agent-loop/tests/session-lifecycle-hook.spec.ts`)
+ * and `session/disposed` is the backstop this file exercises.
  */
-async function bound(env: Env, id: string, input: Partial<IssueInput> = {}) {
+async function bound(env: Env, id: string, input: Partial<IssueInput> = {}, meta?: { parentSession?: string }) {
   let outcome: Awaited<ReturnType<BindingIssuer['issue']>> | undefined
   const fiber = await env.ctx.plugin({
     name: `bound-${id}`,
     inject: ['sessions'],
     apply: async (inner: Context) => {
       await inner.effect(async function* () {
-        const session = inner.sessions.prepare(SessionId(id))
+        const parent = meta?.parentSession
+        const options = parent === undefined ? undefined : { meta: { parentSession: SessionId(parent) } }
+        const session = inner.sessions.prepare(SessionId(id), options)
         yield inner.sessions.enter(session)
         inner.sessions.announce(session)
         outcome = await env.host.issuer.issue({ sessionId: id, kind: 'attach', ...input })
-        yield env.host.issuer.revoker(id)
       }, 'seat')
     },
   })
@@ -164,6 +116,11 @@ async function inTool<T>(env: Env, id: string, body: (exec: ToolRunContext) => P
   }))
   await env.ctx.tools.execute({ signal, callId: ToolCallId(name), name, arguments: args, agent })
   return result as T
+}
+
+/** Create `id` as a child of `parentId` from inside the parent's own direct tool execution, as a subagent tool does. */
+async function boundChild(env: Env, id: string, parentId: string, input: Partial<IssueInput> = {}) {
+  return await inTool(env, parentId, () => bound(env, id, { kind: 'child', parentSessionId: parentId, ...input }, { parentSession: parentId }))
 }
 
 function forbiddenRow(): unknown {
@@ -275,13 +232,13 @@ describe('issuance', () => {
   it('binds a child under a live parent with the parent workspace and the broker-assigned parent id', async () => {
     const env = await environment()
     const parent = await bound(env, 'parent')
-    const child = await bound(env, 'child', { kind: 'child', parentSessionId: 'parent' })
+    const child = await boundChild(env, 'child', 'parent')
     expect(child.outcome).toMatchObject({ ok: true })
     const [parentRequest, childRequest] = env.broker.binds
     expect(childRequest).toMatchObject({ kind: 'child', parentBindingId: (parent.outcome as BindingGrant).bindingId })
     expect(childRequest!.workspaceId).toBe(parentRequest!.workspaceId)
-    expect(await bound(env, 'orphan', { kind: 'child', parentSessionId: 'nobody' }).then(result => result.outcome))
-      .toEqual({ ok: false, reason: 'unknown-parent' })
+    // A parent Core holds no binding for.
+    expect(await boundChild(env, 'orphan', 'nobody').then(result => result.outcome)).toEqual({ ok: false, reason: 'unknown-parent' })
   })
 
   it('relays a broker refusal and treats a malformed or throwing answer as a refusal', async () => {
@@ -343,9 +300,16 @@ describe('resolver', () => {
     const { revision } = outcome as BindingGrant
     expect(await inTool(env, 'session-8', () => env.host.resolver.resolve(1))).toEqual({ ok: false, reason: 'no-binding' })
     expect(await inTool(env, 'session-7', () => env.host.resolver.resolve(revision + 1))).toEqual({ ok: false, reason: 'stale-revision' })
-    await fiber.dispose()
+    const ack = Promise.withResolvers<{ ok: true }>()
+    env.broker.revokeAnswer = () => ack.promise
+    const revoking = env.host.issuer.revoke('session-7')
+    // While the revocation is outstanding the binding is revoked, not merely unknown.
     expect(await inTool(env, 'session-7', () => env.host.resolver.resolve(revision))).toEqual({ ok: false, reason: 'revoked' })
+    ack.resolve({ ok: true })
+    await revoking
+    expect(await inTool(env, 'session-7', () => env.host.resolver.resolve(revision))).toEqual({ ok: false, reason: 'no-binding' })
     expect(env.broker.assigns).toHaveLength(0)
+    await fiber.dispose()
   })
 
   it('never fabricates: a broker refusal or malformed answer yields no assignment id', async () => {
@@ -403,50 +367,40 @@ describe('deny-safe shipped client', () => {
   })
 })
 
-describe('dispose revokes before the session is gone', () => {
-  it('sends the revoke while the session is still in the store and before session/disposed', async () => {
+describe('revocation', () => {
+  it('is the backstop for a session that leaves the store without the agent loop: session/disposed revokes', async () => {
     const env = await environment()
-    const order: string[] = []
-    env.ctx.on('session/disposed', (session) => { order.push(`disposed:${session.id}`) })
-    env.broker.onRevoke = (request) => {
-      order.push(`revoke:${request.sessionId}:inStore=${env.ctx.sessions.get(SessionId(request.sessionId)) !== undefined}`)
-    }
     const { fiber } = await bound(env, 'session-1')
-    expect(env.ctx.sessions.get(SessionId('session-1'))).toBeDefined()
     await fiber.dispose()
-    expect(env.ctx.sessions.get(SessionId('session-1'))).toBeUndefined()
-    expect(order).toEqual(['revoke:session-1:inStore=true', 'disposed:session-1'])
-    expect(env.host.issuer.lookup('session-1')).toEqual({ ok: false, reason: 'revoked' })
+    await vi.waitFor(() => { expect(env.broker.revokes.map(request => request.sessionId)).toEqual(['session-1']) })
+    expect(await env.host.issuer.revoke('session-1')).toEqual({ ok: true })
+    expect(env.broker.revokes).toHaveLength(1)
   })
 
-  it('waits for the broker acknowledgement before the fiber finishes disposing', async () => {
+  it('waits for the broker acknowledgement, and closes the control connection when it does not come', async () => {
     const env = await environment()
+    await bound(env, 'session-1')
     const ack = Promise.withResolvers<{ ok: true }>()
     env.broker.revokeAnswer = () => ack.promise
-    const { fiber } = await bound(env, 'session-1')
-    let finished = false
-    const disposing = fiber.dispose().then(() => { finished = true })
+    let settled = false
+    const revoking = env.host.issuer.revoke('session-1').then((outcome) => { settled = true; return outcome })
     await vi.waitFor(() => { expect(env.broker.revokes).toHaveLength(1) })
     await new Promise(resolve => setTimeout(resolve, 20))
-    expect(finished).toBe(false)
-    expect(env.ctx.sessions.get(SessionId('session-1'))).toBeDefined()
+    expect(settled).toBe(false)
     ack.resolve({ ok: true })
-    await disposing
-    expect(env.ctx.sessions.get(SessionId('session-1'))).toBeUndefined()
-  })
+    expect(await revoking).toEqual({ ok: true })
+    expect(env.broker.closed).toBe(0)
 
-  it('closes the control connection when the broker does not acknowledge', async () => {
-    const env = await environment()
-    const { fiber } = await bound(env, 'session-1')
+    await bound(env, 'session-2')
     env.broker.revokeAnswer = async () => ({ ok: false, reason: 'busy' })
-    await fiber.dispose()
+    expect(await env.host.issuer.revoke('session-2')).toEqual({ ok: false, reason: 'busy', controlClosed: true })
     expect(env.broker.closed).toBe(1)
+
     const throwing = await environment()
-    const second = await bound(throwing, 'session-2')
+    await bound(throwing, 'session-3')
     throwing.broker.revokeAnswer = async () => { throw new Error('socket closed') }
-    await second.fiber.dispose()
+    expect(await throwing.host.issuer.revoke('session-3')).toMatchObject({ ok: false, controlClosed: true })
     expect(throwing.broker.closed).toBe(1)
-    expect(await throwing.host.issuer.revoke('session-2')).toMatchObject({ ok: false, controlClosed: true })
   })
 
   it('sends one revoke frame per binding however many paths revoke it', async () => {
@@ -454,6 +408,7 @@ describe('dispose revokes before the session is gone', () => {
     const { fiber } = await bound(env, 'session-1')
     await Promise.all([env.host.issuer.revoke('session-1'), env.host.issuer.revoke('session-1')])
     await fiber.dispose()
+    await env.host.issuer.revokeAll()
     expect(env.broker.revokes).toHaveLength(1)
   })
 
@@ -474,7 +429,7 @@ describe('dispose revokes before the session is gone', () => {
   it('revokes children before the parent, and revokeAll covers everything at shutdown', async () => {
     const env = await environment()
     await bound(env, 'parent')
-    await bound(env, 'child', { kind: 'child', parentSessionId: 'parent' })
+    await boundChild(env, 'child', 'parent')
     await bound(env, 'other')
     await env.host.issuer.revoke('parent')
     expect(env.broker.log.filter(line => line.startsWith('revoke:'))).toEqual(['revoke:child', 'revoke:parent'])
@@ -489,6 +444,132 @@ describe('dispose revokes before the session is gone', () => {
     expect(env.host.gate.isActive()).toBe(false)
     await env.host.issuer.revoke('session-1')
     expect(env.broker.revokes).toHaveLength(1)
+  })
+
+  it('removes a finished record: a session can bind again, and the new record owns no stale children', async () => {
+    const env = await environment()
+    await bound(env, 'p')
+    await boundChild(env, 'c', 'p')
+    await env.host.issuer.revoke('p')
+    expect(env.host.issuer.lookup('p')).toEqual({ ok: false, reason: 'no-binding' })
+    expect(env.host.issuer.lookup('c')).toEqual({ ok: false, reason: 'no-binding' })
+    const before = env.broker.revokes.length
+    // The ids are bound again from scratch; the old child record does not come back under the new parent.
+    expect(await env.host.issuer.issue({ sessionId: 'p', kind: 'attach' })).toMatchObject({ ok: true })
+    await env.host.issuer.revoke('p')
+    expect(env.broker.revokes.slice(before).map(request => request.sessionId)).toEqual(['p'])
+  })
+
+  it('refuses to bind again while the previous revocation of the same session is still outstanding', async () => {
+    const env = await environment()
+    await bound(env, 'session-1')
+    const ack = Promise.withResolvers<{ ok: true }>()
+    env.broker.revokeAnswer = () => ack.promise
+    const revoking = env.host.issuer.revoke('session-1')
+    expect(await env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach' })).toEqual({ ok: false, reason: 'revoking' })
+    ack.resolve({ ok: true })
+    await revoking
+    expect(await env.host.issuer.issue({ sessionId: 'session-1', kind: 'attach' })).toMatchObject({ ok: true })
+  })
+})
+
+describe('a broker that does not answer', () => {
+  const silent = (): Promise<never> => new Promise(() => {})
+
+  it('gets its control connection closed when a bind is not answered, and nothing is left bound', async () => {
+    const env = await environment({ timeoutMs: 30 })
+    env.broker.bindAnswer = silent
+    const { outcome } = await bound(env, 'session-1')
+    expect(outcome).toEqual({ ok: false, reason: 'broker-timeout' })
+    expect(env.broker.closed).toBe(1)
+    expect(env.host.issuer.lookup('session-1')).toEqual({ ok: false, reason: 'no-binding' })
+  })
+
+  it('does not hold a revocation, and so a dispose, forever', async () => {
+    const env = await environment({ timeoutMs: 30 })
+    await bound(env, 'session-1')
+    await bound(env, 'session-2')
+    env.broker.revokeAnswer = silent
+    const started = Date.now()
+    expect(await env.host.issuer.revoke('session-1')).toEqual({ ok: false, reason: 'broker-timeout', controlClosed: true })
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(env.broker.closed).toBe(1)
+    // Closing the control connection is a revoke of everything: Core forgets all of it and sends nothing more.
+    expect(env.host.issuer.lookup('session-2')).toEqual({ ok: false, reason: 'no-binding' })
+    await env.host.issuer.revokeAll()
+    expect(env.broker.revokes.map(request => request.sessionId)).toEqual(['session-1'])
+  })
+
+  it('refuses an assignment that is not answered, and closes the control connection', async () => {
+    const env = await environment({ timeoutMs: 30 })
+    const { outcome } = await bound(env, 'session-1')
+    env.broker.assignAnswer = silent
+    expect(await inTool(env, 'session-1', () => env.host.resolver.resolve((outcome as BindingGrant).revision)))
+      .toEqual({ ok: false, reason: 'broker-timeout' })
+    expect(env.broker.closed).toBe(1)
+    expect(env.host.issuer.lookup('session-1')).toEqual({ ok: false, reason: 'no-binding' })
+  })
+})
+
+describe('the gate is checked again after the broker answers', () => {
+  it('undoes a grant that arrives after the gate latched off, and returns a refusal', async () => {
+    const env = await environment()
+    env.broker.bindAnswer = async () => {
+      env.ctx.reflect.provide('pluginManager', {})
+      return { ok: true, bindingId: 'binding-late', revision: 1 }
+    }
+    const { outcome } = await bound(env, 'session-1')
+    expect(outcome).toEqual({ ok: false, reason: 'gate-inactive' })
+    await vi.waitFor(() => { expect(env.broker.revokes).toEqual([{ sessionId: 'session-1', bindingId: 'binding-late', coreEpoch: env.host.issuer.coreEpoch }]) })
+    expect(env.host.issuer.lookup('session-1')).toMatchObject({ ok: false })
+  })
+
+  it('does not return an assignment that arrives after the gate latched off', async () => {
+    const env = await environment()
+    const { outcome } = await bound(env, 'session-1')
+    const { revision } = outcome as BindingGrant
+    env.broker.assignAnswer = async () => {
+      env.ctx.reflect.provide('pluginManager', {})
+      return { ok: true, assignmentId: 'late-opaque', revision }
+    }
+    expect(await inTool(env, 'session-1', () => env.host.resolver.resolve(revision))).toEqual({ ok: false, reason: 'gate-inactive' })
+  })
+})
+
+describe('a child is bound only under a parent the caller owns', () => {
+  it('refuses a child whose header does not name the parent, even when that parent is bound', async () => {
+    const env = await environment()
+    await bound(env, 'victim')
+    await bound(env, 'attacker')
+    // The attacker session never recorded the victim as its parent, so no parent id in the request can graft it.
+    const result = await inTool(env, 'victim', () => bound(env, 'adopted', { kind: 'child', parentSessionId: 'victim' }))
+    expect(result.outcome).toEqual({ ok: false, reason: 'unknown-parent' })
+    const wrongParent = await inTool(env, 'victim', () => bound(env, 'adopted-2', { kind: 'child', parentSessionId: 'victim' }, { parentSession: 'attacker' }))
+    expect(wrongParent.outcome).toEqual({ ok: false, reason: 'unknown-parent' })
+    expect(env.broker.binds.map(request => request.sessionId)).toEqual(['victim', 'attacker'])
+  })
+
+  it('refuses a child created outside the parent’s tool call, or from another session’s', async () => {
+    const env = await environment()
+    await bound(env, 'victim')
+    await bound(env, 'other')
+    // Header and parent record are both right; only the caller is wrong.
+    const outside = await bound(env, 'c-outside', { kind: 'child', parentSessionId: 'victim' }, { parentSession: 'victim' })
+    expect(outside.outcome).toEqual({ ok: false, reason: 'not-parent-execution' })
+    const fromOther = await inTool(env, 'other', () => bound(env, 'c-other', { kind: 'child', parentSessionId: 'victim' }, { parentSession: 'victim' }))
+    expect(fromOther.outcome).toEqual({ ok: false, reason: 'not-parent-execution' })
+    expect(env.broker.binds.map(request => request.sessionId)).toEqual(['victim', 'other'])
+    // The parent's own execution is accepted.
+    expect((await boundChild(env, 'c-own', 'victim')).outcome).toMatchObject({ ok: true })
+  })
+
+  it('refuses a child under a parent that is not bound, revoked, or whose bind is still in flight', async () => {
+    const env = await environment()
+    await env.seat('unbound')
+    expect((await boundChild(env, 'c1', 'unbound')).outcome).toEqual({ ok: false, reason: 'unknown-parent' })
+    await bound(env, 'gone')
+    await env.host.issuer.revoke('gone')
+    expect((await boundChild(env, 'c2', 'gone')).outcome).toEqual({ ok: false, reason: 'unknown-parent' })
   })
 })
 
@@ -602,7 +683,7 @@ describe('not reachable from events, tools, plugins or model-defined code', () =
     env.ctx.emit('session/disposed', env.ctx.sessions.get(SessionId('session-1'))!)
     await vi.waitFor(() => { expect(env.broker.revokes).toHaveLength(1) })
     expect(env.broker.binds).toHaveLength(1)
-    expect(env.host.issuer.lookup('session-1')).toEqual({ ok: false, reason: 'revoked' })
+    await vi.waitFor(() => { expect(env.host.issuer.lookup('session-1')).toEqual({ ok: false, reason: 'no-binding' }) })
   })
 
   it('registers nothing on a Context beyond one revoke-only observer, and only the launcher imports it', () => {
@@ -618,11 +699,18 @@ describe('not reachable from events, tools, plugins or model-defined code', () =
       if (/broker-binding/u.test(readFileSync(file, 'utf8'))) importers.push(relative(repoRoot, file))
     })
     expect(importers.sort()).toEqual([
-      'apps/cli/src/profile-boot.ts', 'apps/cli/tests/broker-binding.spec.ts', 'apps/cli/tests/broker-required.spec.ts',
+      'apps/cli/src/broker-capabilities.ts', 'apps/cli/src/profile-boot.ts', 'apps/cli/tests/broker-binding.spec.ts',
+      'apps/cli/tests/broker-capabilities.spec.ts', 'apps/cli/tests/broker-required.spec.ts', 'apps/cli/tests/fake-broker.ts',
     ])
 
+    // The `./lib/*` pattern would otherwise name the emitted file; the named subpaths are mapped to null, which
+    // Node resolves as "not exported" (checked by hand with `import('@deepseek-ai/dsh/lib/types/broker-binding.js')`).
     const manifest = JSON.parse(readFileSync(join(srcDir, '..', 'package.json'), 'utf8')) as { exports: Record<string, unknown> }
-    expect(Object.keys(manifest.exports).filter(key => /binding/u.test(key))).toEqual([])
+    expect(Object.keys(manifest.exports).filter(key => /binding/u.test(key) && manifest.exports[key] !== null)).toEqual([])
+    for (const file of ['broker-binding', 'broker-capabilities']) {
+      expect(manifest.exports[`./lib/types/${file}.js`]).toBeNull()
+      expect(manifest.exports[`./lib/types/${file}.d.ts`]).toBeNull()
+    }
   })
 })
 

@@ -41,6 +41,9 @@ import {
   assertBrokerBootInputs, auditBrokerTree, brokerBootPatches, readBrokerRequirement,
 } from './broker-required.ts'
 import { assignmentUnavailableClient, createBindingHost, type BindingHost } from './broker-binding.ts'
+import {
+  createRoomSeatPort, installCapabilityPorts, installLifecycleHook, ROOM_PLUGIN_SPECIFIER,
+} from './broker-capabilities.ts'
 import { createProcessShutdown, type ProcessShutdown } from './process-shutdown.ts'
 
 const NAME = 'dsh'
@@ -350,6 +353,10 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
       if (broker !== undefined) {
         hostCtx.provide('subprocessBrokerConfig', broker)
         bindingHost = createBindingHost({ ctx: hostCtx, broker, client: assignmentUnavailableClient })
+        // Both before the tree mounts. The agent loop reads the hook from a symbol key on the root; ROOM gets its
+        // closed port as the third `apply` argument. Neither is a Context name, an event or a config value.
+        installLifecycleHook(hostCtx, bindingHost)
+        installCapabilityPorts(hostCtx, { [ROOM_PLUGIN_SPECIFIER]: createRoomSeatPort(hostCtx, bindingHost) })
       }
       hostCtx.provide('profileContext', profileContext)
       // Before any config-tree entry mounts, so plugins resolve all launch-time

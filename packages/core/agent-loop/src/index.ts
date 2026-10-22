@@ -35,6 +35,10 @@ import { ReactLoopAgent } from './agent.ts'
 import { inboxProjectionDefinition } from './inbox.ts'
 import { DEFAULT_MAX_PARALLEL_TOOL_CALLS } from './constants.ts'
 import type {} from './runtime-context.ts'
+import { readSessionLifecycleHook } from './lifecycle-hook.ts'
+
+export { SESSION_LIFECYCLE_HOOK } from './lifecycle-hook.ts'
+export type { PublishedChild, SessionLifecycleHook } from './lifecycle-hook.ts'
 
 /** Fiber states that cannot own or serve a new lifecycle. */
 const INACTIVE_STATES: ReadonlySet<FiberState> = new Set([
@@ -93,6 +97,18 @@ export const turnBoundaryProjectionDefinition = {
     }
   },
 } satisfies ProjectionDefinition<'turnBoundary', TurnBoundaryProjection>
+
+/**
+ * Tell a gating host that a child agent now exists under a live parent. Publication never waits for, or fails
+ * because of, the host: an unbound child simply has no assignment.
+ */
+function announceChildToHost(ctx: Context, sessionId: SessionId, parentSessionId: SessionId): void {
+  try {
+    void readSessionLifecycleHook(ctx)?.childPublished({ sessionId, parentSessionId }).catch(() => {})
+  } catch {
+    // A throwing host hook must not unpublish the child.
+  }
+}
 
 /** Re-throw one collected failure as itself, or several as one `AggregateError`. */
 function throwCollectedFailures(failures: readonly unknown[], message: string): void {
@@ -551,6 +567,17 @@ export class AgentLoop extends Service implements AgentFactory {
       // and ownership cleanup always run to quiescence, then the memoized
       // disposal rejects with what failed so every racing owner observes it.
       const failures: unknown[] = []
+      // A host that gates this process (the broker-required launcher) revokes what it bound to this session
+      // BEFORE anything is cancelled or unwound: while the loop drains, tools stay resolvable, so the revoke
+      // must be acknowledged first. Absent hook: nothing happens, not even an extra tick before the cancel below.
+      const lifecycleHook = readSessionLifecycleHook(loopCtx)
+      if (lifecycleHook !== undefined) {
+        try {
+          await lifecycleHook.revoke(id)
+        } catch (error: unknown) {
+          failures.push(error)
+        }
+      }
       try {
         // Creation listeners retain the session and scope through their awaits.
         if (publication !== undefined) await publication.promise
@@ -655,6 +682,7 @@ export class AgentLoop extends Service implements AgentFactory {
             // The mounted backend routes announced live events into the active
             // write handle by session id; the loop only owns the handle itself.
             detachAgent = loopCtx.agents.enter(agent, parentAgent)
+            if (parentAgent !== undefined) announceChildToHost(loopCtx, id, parentAgent.id)
             agent.ctx.sessions.announce(session)
             assertLive()
             await loopCtx.agents.announce(agent, source, abort.signal)
