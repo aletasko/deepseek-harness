@@ -162,6 +162,23 @@ describe('ui-sidebar-right apply', () => {
     expect(ctx.sidebarRight.mounted.getSnapshot()).toBeUndefined()
   })
 
+  it('lends the existing seat to an external host and restores native presentation on release', async () => {
+    const { ctx, layout, current, seat, injectedOf } = await boot()
+    current.set({ key: SESSION })
+    layout.panelInfo.set({ activePanelId: 'myh.worktree' })
+    const element = {} as HTMLElement
+    const release = ctx.sidebarRight.attachExternalHost(element, SESSION)
+    expect(ctx.sidebarRight.externalHost.getSnapshot()?.element).toBe(element)
+    expect(ctx.sidebarRight.mounted.getSnapshot()).toBe(SESSION)
+    const injected = injectedOf(seat('rightbar.session')) as SidebarRightInjected
+    injected.syncPresentation({ shown: true, track: true, fullscreen: false })
+    expect(layout.closeRightbar).toHaveBeenCalledTimes(2)
+    expect(layout.openRightbar).not.toHaveBeenCalled()
+    release()
+    expect(ctx.sidebarRight.externalHost.getSnapshot()).toBeUndefined()
+    expect(ctx.sidebarRight.mounted.getSnapshot()).toBeUndefined()
+  })
+
   it('hands the panel seat the frame report, the room rule, the opens, the observable registry, and the Tab domain', async () => {
     const { ctx, layout, current, resources, seat, injectedOf } = await boot()
     const injected = injectedOf(seat('rightbar.session')) as SidebarRightInjected

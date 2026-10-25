@@ -111,13 +111,6 @@ export function apply(ctx: ClientContext): void {
   const t = ctx.locale.bind(NS)
   const tabs = new SidebarRightTabRegistry(ctx)
   const views = new SidebarSessionViews(ctx.sessions)
-  ctx.effect(() => {
-    const current = ctx.uiSession.adapter.current
-    const sync = (): void => { views.select(current.getSnapshot().key as SessionId | undefined) }
-    const unsubscribe = current.subscribe(sync)
-    sync()
-    return () => { unsubscribe(); views.dispose() }
-  }, 'ui-sidebar-right: retained Session views')
   const layout: ILayout = ctx.layout
   // The automatic fullscreen rule as the seats last rendered it: the frame
   // hands them its width as owner props, and every seat reports the same rule.
@@ -131,6 +124,16 @@ export function apply(ctx: ClientContext): void {
       closeWithFocus: (sessionId, paneId, close) => { closeWithPaneFocus(document, sessionId, paneId, close) },
     },
   )
+  ctx.effect(() => {
+    const current = ctx.uiSession.adapter.current
+    const sync = (): void => {
+      views.select(controller.externalHost.getSnapshot()?.sessionId ?? (current.getSnapshot().key as SessionId | undefined))
+    }
+    const unsubscribe = current.subscribe(sync)
+    const unsubscribeHost = controller.externalHost.subscribe(sync)
+    sync()
+    return () => { unsubscribe(); unsubscribeHost(); views.dispose() }
+  }, 'ui-sidebar-right: retained Session views')
   // The Session on screen: the selected one while the Conversation fills the
   // main column. Both sources notify before React renders their change, so the
   // service names the arriving Session before any component of that commit
@@ -138,14 +141,18 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => {
     const sync = (): void => {
       const selected = views.source.getSnapshot().find(view => view.selected)
-      show(layout.panelInfo.getSnapshot().activePanelId === null ? selected?.sessionId : undefined)
+      const visible = layout.panelInfo.getSnapshot().activePanelId === null || controller.externalHost.getSnapshot() !== undefined
+      show(visible ? selected?.sessionId : undefined)
+      if (controller.externalHost.getSnapshot() !== undefined) layout.closeRightbar()
     }
     const unsubscribeViews = views.source.subscribe(sync)
     const unsubscribePanel = layout.panelInfo.subscribe(sync)
+    const unsubscribeHost = controller.externalHost.subscribe(sync)
     sync()
     return () => {
       unsubscribeViews()
       unsubscribePanel()
+      unsubscribeHost()
       show(undefined)
     }
   }, 'ui-sidebar-right: on-screen Session')
@@ -189,7 +196,8 @@ export function apply(ctx: ClientContext): void {
     }
     const injected: Omit<SidebarRightInjected, 'keyedHooks' | 'occurrence' | 'closeTab' | 'measureRoom'> = {
       syncPresentation({ shown, track, fullscreen }) {
-        if (shown) layout.openRightbar(track, fullscreen)
+        if (controller.externalHost.getSnapshot() !== undefined) layout.closeRightbar()
+        else if (shown) layout.openRightbar(track, fullscreen)
         else layout.closeRightbar()
       },
       reportAutoFullscreen: (value) => { autoFullscreen = value },
@@ -208,7 +216,7 @@ export function apply(ctx: ClientContext): void {
         name: 'rightbar',
         children: { 'rightbar.session': { kind: 'single', scope: 'session' } },
         inject: (): RightbarRootInjected => ({
-          hooks: { views: views.source },
+          hooks: { views: views.source, externalHost: controller.externalHost },
           mountView: reference => views.mount(reference),
         }),
       }, RightbarRoot)

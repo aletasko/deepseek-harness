@@ -5,6 +5,9 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { SESSION_FORMAT_VERSION, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { DatabaseSync } from 'node:sqlite'
 import { Context, Service, type Fiber } from '@deepseek-ai/cordis'
@@ -84,6 +87,25 @@ export const SESSION_QUERY_SQLITE_SNIPPET_CHARS = 240
 
 // One transient source change gets a retry; repeated churn fails rather than monopolizing the queue.
 const STABLE_OBSERVATION_ATTEMPTS = 2
+const CLAUDE_ARCHIVE_ID_PREFIX = 'myh-claude-archive-'
+
+function loadClaudeArchiveLegacyIds(): ReadonlySet<string> {
+  const path = process.env.DSH_CLAUDE_ARCHIVE_LEGACY_IDS
+    ?? join(homedir(), '.dsh', 'myh-chat-importer', 'archive-legacy-ids.json')
+  let contents: string
+  try {
+    contents = readFileSync(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Set()
+    throw error
+  }
+  const ids: unknown = JSON.parse(contents)
+  if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string')) {
+    throw new Error(`invalid Claude archive legacy ID manifest at "${path}"`)
+  }
+  return new Set(ids as string[])
+}
+
 
 /** SQLite module/handle opening phase; `never` disables full-text search entirely. */
 export type OpenAt = 'startup' | 'first-search' | 'never'
@@ -227,6 +249,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   readonly config: ResolvedConfig
 
   private readonly _instance = randomUUID()
+  private readonly _archiveLegacyIds = loadClaudeArchiveLegacyIds()
   private _ready: Promise<void> | undefined
   private _db: DatabaseSync | undefined
   private _persistenceBinding: PersistenceBinding = { identity: Symbol() }
@@ -492,6 +515,10 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     return observation.persistenceBinding
   }
 
+  private _isClaudeArchive(id: SessionId): boolean {
+    return id.startsWith(CLAUDE_ARCHIVE_ID_PREFIX) || this._archiveLegacyIds.has(id)
+  }
+
   private async _observeStable(
     indexed: ReadonlyMap<SessionId, IndexedPersistedRow>,
     signal: AbortSignal | undefined,
@@ -500,7 +527,8 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       assertNotAborted(signal)
       const persistenceBinding = this._persistenceBinding
       const persistence = persistenceBinding.service
-      const initiallyLive = new Set(this.ctx.sessions.list().map(session => session.id))
+      const initiallyLive = new Set(this.ctx.sessions.list()
+        .filter(session => !this._isClaudeArchive(session.id)).map(session => session.id))
       let persisted = new Map<SessionId, ObservedPersistedSession>()
       if (persistence !== undefined) {
         try {
@@ -509,7 +537,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
           const listOptions = signal === undefined ? undefined : { signal }
           const before = await persistence.list(listOptions)
           assertNotAborted(signal)
-          persisted = materializePersistenceSnapshots(before)
+          persisted = materializePersistenceSnapshots(before.filter(snapshot => !this._isClaudeArchive(snapshot.header.id)))
           for (const entry of persisted.values()) {
             if (canReuseIndexed && indexed.get(entry.header.id)?.revision === entry.revision) continue
             // Skip work already shadowed by a live owner. The cold read is
@@ -527,7 +555,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
           assertNotAborted(signal)
           const afterSnapshots = await persistence.list(listOptions)
           assertNotAborted(signal)
-          const after = materializePersistenceSnapshots(afterSnapshots)
+          const after = materializePersistenceSnapshots(afterSnapshots.filter(snapshot => !this._isClaudeArchive(snapshot.header.id)))
           if (!samePersistenceSnapshots(persisted, after)) continue
           if (this._persistenceBinding !== persistenceBinding) continue
         } catch (error: unknown) {
@@ -547,6 +575,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       }
       const live = new Map<SessionId, ObservedSession>()
       for (const session of this.ctx.sessions.list()) {
+        if (this._isClaudeArchive(session.id)) continue
         const observed = observeLive(session)
         const durable = persisted.get(session.id)
         if (durable !== undefined) assertSessionHeadersCompatible(observed.header, durable.header)

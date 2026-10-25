@@ -184,6 +184,8 @@ export type SidebarRightCloseHandler = (sessionId: SessionId, tab: TabRecord) =>
 
 /** The outward right-Sidebar face (`ctx.sidebarRight`). */
 export interface ISidebarRight {
+  /** Mount the existing Session panel in a host owned by another view. The returned function restores the native seat. */
+  attachExternalHost(element: HTMLElement, sessionId: SessionId): () => void
   /**
    * The Session on screen, or `undefined` while none is (a global panel fills
    * the main column, or no Session is selected). It changes before React
@@ -260,6 +262,15 @@ export interface ISidebarRight {
 
 /** Cross-plugin right-Sidebar face (ctx.sidebarRight). */
 export class SidebarRightController implements ISidebarRight {
+  private readonly externalHostStore = createSnapshotStore<{ element: HTMLElement; sessionId: SessionId } | undefined>(undefined)
+  /** Current external seat, observed by the core root. */
+  readonly externalHost: ObservableSnapshot<{ element: HTMLElement; sessionId: SessionId } | undefined> = this.externalHostStore
+
+  attachExternalHost(element: HTMLElement, sessionId: SessionId): () => void {
+    const host = { element, sessionId }
+    this.externalHostStore.set(host)
+    return () => { if (this.externalHostStore.getSnapshot() === host) this.externalHostStore.set(undefined) }
+  }
   /** Open tab metadata across saved and adopted Sessions, independent of visible seats. */
   readonly openTabs: SidebarTabInventory['source']
   /** The on-screen Session; see {@link ISidebarRight.mounted}. */

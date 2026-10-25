@@ -212,6 +212,37 @@ async function liveContext(config: ConstructorParameters<typeof SqliteSessionQue
 }
 
 describe('SQLite session search', () => {
+  it('keeps imported Claude archive sessions outside the ordinary index', async () => {
+    const manifest = await temporaryPath('archive-legacy-ids.json')
+    await writeFile(manifest, JSON.stringify(['myh-claude-legacy-pilot']))
+    const previousManifest = process.env.DSH_CLAUDE_ARCHIVE_LEGACY_IDS
+    process.env.DSH_CLAUDE_ARCHIVE_LEGACY_IDS = manifest
+    try {
+      const ordinary = header('myh-claude-existing-main')
+      const legacy = header('myh-claude-legacy-pilot')
+      const archive = header('myh-claude-archive-new')
+      TestPersistence.reset([ordinary, legacy, archive].map(meta => ({
+        meta,
+        events: messageEvents('findable historical text'),
+      })))
+      const ctx = new Context()
+      await ctx.plugin(SessionStore)
+      await ctx.plugin(SessionProjectionRegistry)
+      await ctx.plugin(TestPersistence)
+      await ctx.plugin(SqliteSessionQueryEngine, { path: ':memory:' })
+      const result = await ctx.sessionQuery.searchSessions({ query: 'historical' })
+      expect(result.items.map(item => item.header.id)).toEqual([ordinary.id])
+      expect(TestPersistence.reads.get(ordinary.id)).toBe(1)
+      expect(TestPersistence.reads.has(legacy.id)).toBe(false)
+      expect(TestPersistence.reads.has(archive.id)).toBe(false)
+      const db = (ctx.sessionQuery as unknown as { _db: DatabaseSync })._db
+      expect(db.prepare('SELECT COUNT(*) AS count FROM persisted_sessions').get()).toEqual({ count: 1 })
+      expect(db.prepare('SELECT COUNT(*) AS count FROM persisted_docs').get()).toEqual({ count: 1 })
+    } finally {
+      if (previousManifest === undefined) delete process.env.DSH_CLAUDE_ARCHIVE_LEGACY_IDS
+      else process.env.DSH_CLAUDE_ARCHIVE_LEGACY_IDS = previousManifest
+    }
+  })
   it('defaults and validates opening policy and persisted inspection concurrency through its Cordis config', async () => {
     const defaultCtx = await liveContext()
     expect((defaultCtx.sessionQuery as SqliteSessionQueryEngine).config.openAt).toBe('startup')
